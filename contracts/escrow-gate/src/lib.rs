@@ -1,4 +1,6 @@
-#![no_std]
+// Tests link std (needed by proptest and the std::vec::Vec used in the
+// proptest model harness); the actual deployed contract build stays no_std.
+#![cfg_attr(not(test), no_std)]
 // submit()'s 8 scalar args mirror the PRD §8 entrypoint signature (plus the
 // escrow_value this design adds) — a Soroban contract entrypoint, not an
 // internal API a caller would otherwise want bundled into a struct.
