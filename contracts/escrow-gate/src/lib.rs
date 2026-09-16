@@ -1,10 +1,19 @@
 #![no_std]
+// submit()'s 8 scalar args mirror the PRD §8 entrypoint signature (plus the
+// escrow_value this design adds) — a Soroban contract entrypoint, not an
+// internal API a caller would otherwise want bundled into a struct.
+#![allow(clippy::too_many_arguments)]
 
+mod events;
 mod storage;
 
+use events::{
+    ChallengeOpened, ChallengeResolved, Finalized, ReexecutorRegistered,
+    ReexecutorStakeWithdrawn, ReplayAttested, Slashed, SubmissionCreated,
+};
 use soroban_sdk::{contract, contractimpl, vec, Address, Bytes, BytesN, Env, IntoVal, Symbol};
 use verity_common::{
-    events, ChallengeRecord, ConfigRecord, Error, ReexecutorInfo, Resolution, ResolutionMethod,
+    ChallengeRecord, ConfigRecord, Error, ReexecutorInfo, Resolution, ResolutionMethod,
     SubmissionRecord, TaskType, Verdict,
 };
 
@@ -223,7 +232,7 @@ impl EscrowGate {
             mismatch_votes: 0,
             bonded_weight_matched: 0,
             bonded_weight_mismatched: 0,
-            resolution_method: None,
+            resolution_method: ResolutionMethod::None,
             cfg_quorum_min_reexecutors: cfg.quorum_min_reexecutors,
             cfg_quorum_supermajority_bps: cfg.quorum_supermajority_bps,
             cfg_slash_split_challenger_bps: cfg.slash_split_challenger_bps,
@@ -231,10 +240,14 @@ impl EscrowGate {
         };
         storage::set_submission(&e, id, &record);
 
-        e.events().publish(
-            (Symbol::new(&e, events::SUBMISSION_CREATED), id),
-            (agent, escrow_ref, escrow_value, bond),
-        );
+        SubmissionCreated {
+            submission_id: id,
+            agent,
+            escrow_ref,
+            escrow_value,
+            bond,
+        }
+        .publish(&e);
 
         Ok(id)
     }
@@ -267,10 +280,12 @@ impl EscrowGate {
         };
         storage::set_reexecutor(&e, &reexecutor, &info);
 
-        e.events().publish(
-            (Symbol::new(&e, events::REEXECUTOR_REGISTERED), reexecutor),
-            (new_stake, info.active),
-        );
+        ReexecutorRegistered {
+            reexecutor,
+            stake_amount: new_stake,
+            active: info.active,
+        }
+        .publish(&e);
         Ok(())
     }
 
@@ -303,10 +318,7 @@ impl EscrowGate {
         let token = soroban_sdk::token::TokenClient::new(&e, &bond_asset);
         token.transfer(&contract_address, reexecutor.clone(), &amount);
 
-        e.events().publish(
-            (Symbol::new(&e, events::REEXECUTOR_STAKE_WITHDRAWN), reexecutor),
-            new_stake,
-        );
+        ReexecutorStakeWithdrawn { reexecutor, new_stake }.publish(&e);
         Ok(())
     }
 
@@ -360,10 +372,13 @@ impl EscrowGate {
         }
         storage::set_submission(&e, submission_id, &sub);
 
-        e.events().publish(
-            (Symbol::new(&e, events::REPLAY_ATTESTED), submission_id),
-            (reexecutor, output_hash, matched),
-        );
+        ReplayAttested {
+            submission_id,
+            reexecutor,
+            output_hash,
+            matched,
+        }
+        .publish(&e);
         Ok(())
     }
 
@@ -424,15 +439,12 @@ impl EscrowGate {
             challenger: challenger.clone(),
             bond,
             opened_at: now,
-            resolution: None,
-            resolution_method: None,
+            resolution: Resolution::None,
+            resolution_method: ResolutionMethod::None,
         };
         storage::set_challenge(&e, submission_id, &chal);
 
-        e.events().publish(
-            (Symbol::new(&e, events::CHALLENGE_OPENED), submission_id),
-            (challenger, bond),
-        );
+        ChallengeOpened { submission_id, challenger, bond }.publish(&e);
         Ok(())
     }
 
@@ -448,7 +460,7 @@ impl EscrowGate {
     ) -> Result<Verdict, Error> {
         let sub = storage::get_submission(&e, submission_id).ok_or(Error::SubmissionNotFound)?;
         let mut chal = storage::get_challenge(&e, submission_id).ok_or(Error::ChallengeNotFound)?;
-        if chal.resolution.is_some() {
+        if chal.resolution != Resolution::None {
             return Err(Error::ChallengeAlreadyResolved);
         }
 
@@ -487,16 +499,14 @@ impl EscrowGate {
                     Resolution::Rejected
                 }
             }
+            ResolutionMethod::None => return Err(Error::InvalidResolutionMethod),
         };
 
-        chal.resolution = Some(resolution);
-        chal.resolution_method = Some(method);
+        chal.resolution = resolution;
+        chal.resolution_method = method;
         storage::set_challenge(&e, submission_id, &chal);
 
-        e.events().publish(
-            (Symbol::new(&e, events::CHALLENGE_RESOLVED), submission_id),
-            (resolution, method),
-        );
+        ChallengeResolved { submission_id, resolution, method }.publish(&e);
 
         Self::finalize(e, submission_id)
     }
@@ -516,11 +526,8 @@ impl EscrowGate {
         }
 
         if let Some(chal) = storage::get_challenge(&e, submission_id) {
-            let resolution = match chal.resolution {
-                Some(r) => r,
-                None => return Ok(Verdict::Pending),
-            };
-            sub.verdict = match resolution {
+            sub.verdict = match chal.resolution {
+                Resolution::None => return Ok(Verdict::Pending),
                 Resolution::Upheld => Verdict::Slashed,
                 Resolution::Rejected => Verdict::Verified,
             };
@@ -528,10 +535,7 @@ impl EscrowGate {
             sub.resolution_method = chal.resolution_method;
             settle(&e, &sub)?;
             storage::set_submission(&e, submission_id, &sub);
-            e.events().publish(
-                (Symbol::new(&e, events::FINALIZED), submission_id),
-                sub.verdict,
-            );
+            Finalized { submission_id, verdict: sub.verdict }.publish(&e);
             return Ok(sub.verdict);
         }
 
@@ -547,13 +551,10 @@ impl EscrowGate {
 
         sub.verdict = verdict;
         sub.finalized = true;
-        sub.resolution_method = Some(ResolutionMethod::ReexecutionConsensus);
+        sub.resolution_method = ResolutionMethod::ReexecutionConsensus;
         settle(&e, &sub)?;
         storage::set_submission(&e, submission_id, &sub);
-        e.events().publish(
-            (Symbol::new(&e, events::FINALIZED), submission_id),
-            sub.verdict,
-        );
+        Finalized { submission_id, verdict: sub.verdict }.publish(&e);
         Ok(sub.verdict)
     }
 
@@ -621,10 +622,7 @@ impl EscrowGate {
             token.transfer(&contract_address, admin, &amount);
         }
 
-        e.events().publish(
-            (Symbol::new(&e, events::SLASHED), submission_id),
-            (reexecutor, amount),
-        );
+        Slashed { submission_id, reexecutor, amount }.publish(&e);
         Ok(())
     }
 

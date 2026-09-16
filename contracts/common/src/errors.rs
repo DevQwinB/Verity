@@ -35,6 +35,7 @@ pub enum Error {
     AlreadySlashed = 41,
     PartyNotOnWrongSide = 42,
     InsufficientConsensus = 44,
+    InvalidResolutionMethod = 45,
 
     VerifierNotRegistered = 50,
     VerifierAlreadyRegistered = 51,

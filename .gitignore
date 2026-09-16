@@ -1,5 +1,6 @@
 /target
 /contracts/target
+/contracts/*/test_snapshots
 node_modules
 .next
 dist

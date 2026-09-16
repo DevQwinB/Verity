@@ -1,7 +1,10 @@
 #![no_std]
 
+mod events;
+
+use events::{ProofVerified, VerifierDeregistered, VerifierRegistered};
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Bytes, Env, IntoVal, Symbol, Vec};
-use verity_common::{events, Error};
+use verity_common::Error;
 
 #[contracttype]
 #[derive(Clone)]
@@ -55,10 +58,7 @@ impl ZkVerifierRegistry {
         list.push_back(proof_system.clone());
         e.storage().instance().set(&DataKey::VerifierList, &list);
 
-        e.events().publish(
-            (Symbol::new(&e, events::VERIFIER_REGISTERED), proof_system),
-            verifier_contract,
-        );
+        VerifierRegistered { proof_system, verifier_contract }.publish(&e);
         Ok(())
     }
 
@@ -84,10 +84,7 @@ impl ZkVerifierRegistry {
         }
         e.storage().instance().set(&DataKey::VerifierList, &new_list);
 
-        e.events().publish(
-            (Symbol::new(&e, events::VERIFIER_DEREGISTERED), proof_system),
-            (),
-        );
+        VerifierDeregistered { proof_system }.publish(&e);
         Ok(())
     }
 
@@ -122,10 +119,7 @@ impl ZkVerifierRegistry {
         );
 
         if accepted {
-            e.events().publish(
-                (Symbol::new(&e, events::PROOF_VERIFIED), proof_system),
-                submission_id,
-            );
+            ProofVerified { proof_system, submission_id }.publish(&e);
         }
         Ok(accepted)
     }
