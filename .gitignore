@@ -1,0 +1,14 @@
+/target
+/contracts/target
+node_modules
+.next
+dist
+build
+*.log
+.env
+.env.local
+.DS_Store
+/deployments/*.local.json
+/pgdata
+.turbo
+coverage
