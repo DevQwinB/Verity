@@ -1,5 +1,8 @@
 packages:
-  - "backend"
-  - "frontend"
-  - "reexecutor-agent"
-  - "db"
+  - backend
+  - frontend
+  - reexecutor-agent
+  - db
+
+onlyBuiltDependencies:
+  - '@embedded-postgres/linux-x64'

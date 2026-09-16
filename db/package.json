@@ -1,0 +1,24 @@
+{
+  "name": "@verity/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "migrate": "tsx src/migrate.ts",
+    "migrate:down": "tsx src/migrate.ts down",
+    "local-postgres": "tsx src/local-postgres.ts",
+    "seed:testnet-accounts": "tsx seed/bootstrap-testnet-accounts.ts"
+  },
+  "dependencies": {
+    "kysely": "^0.29.6",
+    "pg": "^8.23.0",
+    "embedded-postgres": "18.4.0-beta.17"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3"
+  }
+}
