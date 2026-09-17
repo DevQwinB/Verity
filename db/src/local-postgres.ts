@@ -1,4 +1,6 @@
 import EmbeddedPostgres from "embedded-postgres";
+import { existsSync } from "node:fs";
+import * as path from "node:path";
 
 /**
  * Runs a real Postgres server as a plain user process (no docker, no root)
@@ -14,15 +16,23 @@ export async function startLocalPostgres(opts?: {
   password?: string;
   database?: string;
 }) {
+  const dataDir = opts?.dataDir ?? ".pgdata";
   const pg = new EmbeddedPostgres({
-    databaseDir: opts?.dataDir ?? ".pgdata",
+    databaseDir: dataDir,
     user: opts?.user ?? "verity",
     password: opts?.password ?? "verity",
     port: opts?.port ?? 5433,
     persistent: true,
   });
 
-  await pg.initialise();
+  // A previously-initialised cluster (PG_VERSION present) must be started
+  // as-is, never re-initialised — initdb refuses to run against a non-empty
+  // directory, which otherwise breaks the ordinary "restart with existing
+  // data" workflow every time.
+  const alreadyInitialised = existsSync(path.join(dataDir, "PG_VERSION"));
+  if (!alreadyInitialised) {
+    await pg.initialise();
+  }
   await pg.start();
 
   const dbName = opts?.database ?? "verity";

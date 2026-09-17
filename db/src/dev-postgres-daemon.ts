@@ -1,4 +1,4 @@
-import { startLocalPostgres } from "./local-postgres.ts";
+import { startLocalPostgres } from "./local-postgres.js";
 import { writeFileSync } from "node:fs";
 
 const { connectionString } = await startLocalPostgres({ dataDir: process.argv[2] || ".pgdata", port: 5433 });
