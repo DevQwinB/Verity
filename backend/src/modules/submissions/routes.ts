@@ -22,6 +22,28 @@ const submitBody = z.object({
 });
 
 export async function submissionsRoutes(app: FastifyInstance) {
+  // Read-only list addition (beyond the PRD's literal §9 list, which only
+  // specifies a per-id GET) — the dashboard has nothing to render a
+  // submissions feed from without it, and faking one client-side would
+  // violate the no-mocked-data requirement.
+  app.get("/v1/submissions", async (req) => {
+    const query = z
+      .object({
+        marketplace_id: z.string().uuid().optional(),
+        agent_id: z.string().optional(),
+        status: z
+          .enum(["pending", "verified", "disputed", "slashed", "expired_unverified"])
+          .optional(),
+        limit: z.coerce.number().int().min(1).max(200).optional(),
+      })
+      .parse(req.query);
+    let qb = db.selectFrom("submission").selectAll().orderBy("submitted_at", "desc");
+    if (query.marketplace_id) qb = qb.where("marketplace_id", "=", query.marketplace_id);
+    if (query.agent_id) qb = qb.where("agent_id", "=", query.agent_id);
+    if (query.status) qb = qb.where("status", "=", query.status);
+    return qb.limit(query.limit ?? 50).execute();
+  });
+
   // Build-sign-relay-confirm step 1: create a pending row and hand back
   // unsigned XDR for the agent to sign with their own key. Verity never
   // holds the agent's signing key.
