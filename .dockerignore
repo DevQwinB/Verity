@@ -1,0 +1,12 @@
+**/node_modules
+**/.next
+**/dist
+**/target
+.git
+**/*.tsbuildinfo
+**/.env
+**/.env.local
+.pgdata
+.smoke-pgdata
+backend/.artifacts
+**/test_snapshots

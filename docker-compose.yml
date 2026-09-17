@@ -1,0 +1,73 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: verity
+      POSTGRES_PASSWORD: verity
+      POSTGRES_DB: verity
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verity -d verity"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    working_dir: /app
+    command: ["node_modules/.bin/tsx", "db/src/migrate.ts"]
+    environment:
+      DATABASE_URL: postgres://verity:verity@postgres:5432/verity
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      SOROBAN_RPC_URL: https://soroban-testnet.stellar.org
+      HORIZON_URL: https://horizon-testnet.stellar.org
+      NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+      ESCROW_GATE_CONTRACT_ID: ${ESCROW_GATE_CONTRACT_ID}
+      ZK_VERIFIER_REGISTRY_CONTRACT_ID: ${ZK_VERIFIER_REGISTRY_CONTRACT_ID}
+      BOND_ASSET_CONTRACT_ID: ${BOND_ASSET_CONTRACT_ID}
+      DATABASE_URL: postgres://verity:verity@postgres:5432/verity
+      KEEPER_SECRET_KEY: ${KEEPER_SECRET_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+      WEB_AUTH_DOMAIN: ${WEB_AUTH_DOMAIN:-localhost:3001}
+      HOME_DOMAIN: ${HOME_DOMAIN:-localhost:3001}
+      PORT: 3001
+      ARTIFACT_STORAGE_DIR: /app/backend/.artifacts
+    volumes:
+      - backend_artifacts:/app/backend/.artifacts
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      BACKEND_URL: http://backend:3001
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  backend_artifacts:

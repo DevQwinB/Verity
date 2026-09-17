@@ -1,0 +1,45 @@
+x-reexecutor-base: &reexecutor-base
+  build:
+    context: .
+    dockerfile: reexecutor-agent/Dockerfile
+  restart: unless-stopped
+  depends_on:
+    - backend
+
+x-reexecutor-env: &reexecutor-env
+  BACKEND_URL: http://backend:3001
+  SOROBAN_RPC_URL: https://soroban-testnet.stellar.org
+  NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+  ESCROW_GATE_CONTRACT_ID: ${ESCROW_GATE_CONTRACT_ID}
+  POLL_INTERVAL_MS: 3000
+
+services:
+  reexecutor-1:
+    <<: *reexecutor-base
+    environment:
+      <<: *reexecutor-env
+      REEXECUTOR_SECRET_KEY: ${REX1_SECRET_KEY}
+
+  reexecutor-2:
+    <<: *reexecutor-base
+    environment:
+      <<: *reexecutor-env
+      REEXECUTOR_SECRET_KEY: ${REX2_SECRET_KEY}
+
+  reexecutor-3:
+    <<: *reexecutor-base
+    environment:
+      <<: *reexecutor-env
+      REEXECUTOR_SECRET_KEY: ${REX3_SECRET_KEY}
+
+  reexecutor-4:
+    <<: *reexecutor-base
+    environment:
+      <<: *reexecutor-env
+      REEXECUTOR_SECRET_KEY: ${REX4_SECRET_KEY}
+
+  reexecutor-5:
+    <<: *reexecutor-base
+    environment:
+      <<: *reexecutor-env
+      REEXECUTOR_SECRET_KEY: ${REX5_SECRET_KEY}
