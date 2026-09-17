@@ -65,7 +65,7 @@ export async function up(db: Kysely<any>): Promise<void> {
     .on("challenge")
     .column("submission_id")
     .unique()
-    .where("resolved_at", "is", null)
+    .where(sql.ref("resolved_at"), "is", null)
     .execute();
 
   await db.schema
