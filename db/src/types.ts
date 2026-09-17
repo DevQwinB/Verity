@@ -1,13 +1,18 @@
 import type { ColumnType, Generated } from "kysely";
 
 type Timestamp = ColumnType<Date, Date | string, Date | string>;
+/** Generated<ColumnType<...>> double-wraps and breaks Kysely's
+ * Insertable/Updateable inference (it only unwraps one ColumnType layer), so
+ * defaulted timestamp columns use this single-layer form directly instead
+ * of `GeneratedTimestamp`. */
+type GeneratedTimestamp = ColumnType<Date, Date | string | undefined, Date | string>;
 
 export interface MarketplaceTable {
   id: Generated<string>;
   stellar_account: string;
   name: string;
   webhook_secret: string | null;
-  created_at: Generated<Timestamp>;
+  created_at: GeneratedTimestamp;
 }
 
 export type TaskType = "deterministic" | "retrieval" | "unverifiable";
@@ -32,15 +37,15 @@ export interface SubmissionTable {
   claimed_output_ref: string | null;
   bond_amount: string;
   bond_asset: string;
-  submitted_at: Generated<Timestamp>;
+  submitted_at: GeneratedTimestamp;
   challenge_window_s: number;
   status: Generated<SubmissionStatus>;
   chain_submission_id: string | null;
   chain_tx_hash: string | null;
   idempotency_key: string | null;
   finalize_attempted_at: Timestamp | null;
-  created_at: Generated<Timestamp>;
-  updated_at: Generated<Timestamp>;
+  created_at: GeneratedTimestamp;
+  updated_at: GeneratedTimestamp;
 }
 
 export interface ReexecutorTable {
@@ -53,7 +58,7 @@ export interface ReexecutorTable {
   slashed_count: Generated<number>;
   chain_stake_tx_hash: string | null;
   last_seen_at: Timestamp | null;
-  joined_at: Generated<Timestamp>;
+  joined_at: GeneratedTimestamp;
 }
 
 export type ReplayStatus = "assigned" | "submitted" | "confirmed_onchain";
@@ -69,7 +74,7 @@ export interface ReplayTable {
   latency_ms: number | null;
   cost: string | null;
   tx_hash: string | null;
-  assigned_at: Generated<Timestamp>;
+  assigned_at: GeneratedTimestamp;
   executed_at: Timestamp | null;
 }
 
@@ -79,7 +84,7 @@ export interface SpotCheckTable {
   id: Generated<string>;
   submission_id: string;
   reexecutor_id: string;
-  sampled_at: Generated<Timestamp>;
+  sampled_at: GeneratedTimestamp;
   result: SpotCheckResult | null;
   evidence: unknown | null;
 }
@@ -95,7 +100,7 @@ export interface ChallengeTable {
   submission_id: string;
   challenger_account: string;
   challenger_bond: string;
-  opened_at: Generated<Timestamp>;
+  opened_at: GeneratedTimestamp;
   resolved_at: Timestamp | null;
   resolution: ChallengeResolution | null;
   resolution_method: ChallengeResolutionMethod | null;
@@ -112,7 +117,7 @@ export interface ZkProofTable {
   tx_hash: string | null;
   cost: string | null;
   proving_time_ms: number | null;
-  created_at: Generated<Timestamp>;
+  created_at: GeneratedTimestamp;
 }
 
 export interface AttestationExportTable {
@@ -121,7 +126,7 @@ export interface AttestationExportTable {
   target_registry: Generated<string>;
   payload: unknown;
   signature: string;
-  exported_at: Generated<Timestamp>;
+  exported_at: GeneratedTimestamp;
 }
 
 export interface SlashingEventTable {
@@ -131,7 +136,7 @@ export interface SlashingEventTable {
   amount: string;
   reason: string;
   tx_hash: string | null;
-  created_at: Generated<Timestamp>;
+  created_at: GeneratedTimestamp;
 }
 
 export type ArtifactKind = "input" | "function" | "output" | "request_spec";
@@ -144,7 +149,7 @@ export interface SubmissionArtifactTable {
   storage_ref: string;
   content_type: string | null;
   size_bytes: number | null;
-  created_at: Generated<Timestamp>;
+  created_at: GeneratedTimestamp;
 }
 
 export interface WebhookSubscriptionTable {
@@ -154,7 +159,7 @@ export interface WebhookSubscriptionTable {
   secret: string;
   events: string[];
   active: Generated<boolean>;
-  created_at: Generated<Timestamp>;
+  created_at: GeneratedTimestamp;
 }
 
 export type WebhookDeliveryStatus = "pending" | "delivered" | "failed";
@@ -168,14 +173,14 @@ export interface WebhookDeliveryTable {
   attempts: Generated<number>;
   last_attempt_at: Timestamp | null;
   response_code: number | null;
-  created_at: Generated<Timestamp>;
+  created_at: GeneratedTimestamp;
 }
 
 export interface ChainCursorTable {
   contract_id: string;
-  last_ledger: Generated<string>;
+  last_ledger: ColumnType<string, string | number, string | number>;
   last_paging_token: string | null;
-  updated_at: Generated<Timestamp>;
+  updated_at: GeneratedTimestamp;
 }
 
 export interface Database {
