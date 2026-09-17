@@ -1,5 +1,6 @@
 packages:
   - backend
+  - backend/src/chain/generated/*
   - frontend
   - reexecutor-agent
   - db
