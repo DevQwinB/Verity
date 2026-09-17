@@ -1,0 +1,32 @@
+{
+  "name": "@verity/backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "smoke": "tsx src/smoke/run.ts"
+  },
+  "dependencies": {
+    "@verity/db": "workspace:*",
+    "kysely": "^0.29.6",
+    "escrow-gate": "workspace:*",
+    "zk-verifier-registry": "workspace:*",
+    "@stellar/stellar-sdk": "^17.1.0",
+    "fastify": "^5.12.5",
+    "@fastify/cookie": "^11.1.2",
+    "pg-boss": "^12.33.0",
+    "zod": "^4.6.5",
+    "pino": "^10.3.1",
+    "jsonwebtoken": "^9.0.3",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.20.3",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3"
+  }
+}
