@@ -2,7 +2,7 @@ import { scValToNative } from "@stellar/stellar-sdk";
 import { db } from "../db.js";
 import { server } from "../chain/rpc.js";
 import { env } from "../config/env.js";
-import { fromChainVerdict } from "../chain/mappers.js";
+import { fromChainVerdict, fromChainResolution, fromChainResolutionMethod } from "../chain/mappers.js";
 import { assignReplayJobs } from "../modules/reexecutors/assignment.js";
 import { escrowGateAsKeeper } from "../chain/clients.js";
 import { exportAttestation } from "../modules/attestations/export.js";
@@ -181,7 +181,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
 
     case "challenge_resolved": {
       const chainSubmissionId = String(topic[1]);
-      const v = value as { resolution: { tag: string }; method: { tag: string } };
+      const v = value as { resolution: unknown; method: unknown };
       const sub = await db
         .selectFrom("submission")
         .selectAll()
@@ -191,9 +191,8 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
         await db
           .updateTable("challenge")
           .set({
-            resolution: v.resolution.tag === "Upheld" ? "upheld" : "rejected",
-            resolution_method:
-              v.method.tag === "ZkProof" ? "zk_proof" : "reexecution_consensus",
+            resolution: fromChainResolution(v.resolution),
+            resolution_method: fromChainResolutionMethod(v.method),
             resolved_at: new Date(),
           })
           .where("submission_id", "=", sub.id)
@@ -204,7 +203,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
 
     case "finalized": {
       const chainSubmissionId = String(topic[1]);
-      const v = value as { verdict: { tag: string } };
+      const v = value as { verdict: unknown };
       const status = fromChainVerdict(v.verdict);
       const sub = await db
         .updateTable("submission")
