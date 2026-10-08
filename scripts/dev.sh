@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# Runs the whole Verity stack locally against the real, already-deployed
+# Stellar testnet contracts — no Docker needed:
+#
+#   Postgres (embedded) -> migrations -> backend (API + indexer + keeper)
+#   -> one reexecutor-agent per bootstrap identity -> frontend
+#
+# Secrets are read from your stellar-cli identities at start-up and handed to
+# each process through its environment; this script never writes a secret key
+# to disk except the keeper key + JWT secret in backend/.env (gitignored),
+# and only when that file does not exist yet.
+#
+#   VERITY_API_PORT (3001)  VERITY_WEB_PORT (3000)  VERITY_PG_PORT (5433)
+#   VERITY_REEXECUTORS ("rex1 rex2 rex3 rex4 rex5")   stellar-cli aliases
+#   --no-web / --no-agents                            skip those processes
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+API_PORT="${VERITY_API_PORT:-3001}"
+WEB_PORT="${VERITY_WEB_PORT:-3000}"
+PG_PORT="${VERITY_PG_PORT:-5433}"
+REEXECUTORS="${VERITY_REEXECUTORS:-rex1 rex2 rex3 rex4 rex5}"
+RUN_WEB=1
+RUN_AGENTS=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-web) RUN_WEB=0 ;;
+    --no-agents) RUN_AGENTS=0 ;;
+    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+  esac
+done
+
+DEPLOY_JSON="$ROOT_DIR/deployments/testnet.json"
+json_field() { grep -o "\"$1\": *\"[^\"]*\"" "$DEPLOY_JSON" | cut -d'"' -f4; }
+GATE_ID="$(json_field escrow_gate_contract_id)"
+REGISTRY_ID="$(json_field zk_verifier_registry_contract_id)"
+BOND_ASSET_ID="$(json_field native_xlm_sac_address)"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+DATABASE_URL="postgres://verity:verity@127.0.0.1:${PG_PORT}/verity"
+
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+for port in "$API_PORT" $([ "$RUN_WEB" = 1 ] && echo "$WEB_PORT"); do
+  if port_open "$port"; then
+    echo "FATAL: port $port is already in use. Pick another with VERITY_API_PORT / VERITY_WEB_PORT." >&2
+    exit 1
+  fi
+done
+
+if [ ! -d node_modules ]; then
+  echo "==> Installing dependencies"
+  pnpm install
+fi
+if [ ! -f backend/src/chain/generated/escrow-gate/dist/index.js ]; then
+  echo "==> Building contract bindings"
+  pnpm --filter escrow-gate --filter zk-verifier-registry build
+fi
+
+if [ ! -f backend/.env ]; then
+  echo "==> Creating backend/.env (gitignored)"
+  if ! stellar keys address keeper >/dev/null 2>&1; then
+    stellar keys generate keeper --network testnet --fund
+  fi
+  cat > backend/.env <<ENV
+SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
+HORIZON_URL=https://horizon-testnet.stellar.org
+NETWORK_PASSPHRASE="$NETWORK_PASSPHRASE"
+ESCROW_GATE_CONTRACT_ID=$GATE_ID
+ZK_VERIFIER_REGISTRY_CONTRACT_ID=$REGISTRY_ID
+BOND_ASSET_CONTRACT_ID=$BOND_ASSET_ID
+DATABASE_URL=$DATABASE_URL
+WEB_AUTH_DOMAIN=localhost:$API_PORT
+HOME_DOMAIN=localhost:$API_PORT
+PORT=$API_PORT
+ARTIFACT_STORAGE_DIR=./.artifacts
+KEEPER_SECRET_KEY=$(stellar keys secret keeper)
+JWT_SECRET=$(openssl rand -hex 32)
+ENV
+  chmod 600 backend/.env
+fi
+
+PIDS=()
+cleanup() {
+  trap - EXIT INT TERM
+  echo
+  echo "==> Stopping Verity"
+  for pid in "${PIDS[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
+  wait 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+# Each service runs in its own process group (so the whole tree — tsx, node,
+# postgres — can be stopped together) with its output prefixed by name.
+start() {
+  local name="$1" dir="$2"; shift 2
+  (cd "$dir" && exec setsid "$@") > >(sed -u "s/^/[$name] /") 2>&1 &
+  PIDS+=("$!")
+}
+
+wait_for() {
+  local what="$1" check="$2" tries=0
+  until eval "$check" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 180 ]; then echo "FATAL: timed out waiting for $what" >&2; exit 1; fi
+    sleep 1
+  done
+}
+
+TSX="$ROOT_DIR/db/node_modules/.bin/tsx"
+
+if port_open "$PG_PORT"; then
+  echo "==> Postgres already listening on :$PG_PORT, reusing it"
+else
+  echo "==> Starting Postgres on :$PG_PORT (data in .pgdata/)"
+  start postgres db "$TSX" src/dev-postgres-daemon.ts "$ROOT_DIR/.pgdata" "" "$PG_PORT"
+  wait_for "Postgres" "port_open $PG_PORT"
+fi
+
+echo "==> Running migrations"
+(cd db && DATABASE_URL="$DATABASE_URL" "$TSX" src/migrate.ts)
+
+echo "==> Starting backend on :$API_PORT"
+export SOROBAN_RPC_URL="https://soroban-testnet.stellar.org" NETWORK_PASSPHRASE
+export ESCROW_GATE_CONTRACT_ID="$GATE_ID" ZK_VERIFIER_REGISTRY_CONTRACT_ID="$REGISTRY_ID" BOND_ASSET_CONTRACT_ID="$BOND_ASSET_ID"
+start backend backend env \
+  DATABASE_URL="$DATABASE_URL" PORT="$API_PORT" \
+  WEB_AUTH_DOMAIN="localhost:$API_PORT" HOME_DOMAIN="localhost:$API_PORT" \
+  "$ROOT_DIR/backend/node_modules/.bin/tsx" src/index.ts
+wait_for "backend" "curl -fs http://127.0.0.1:$API_PORT/health"
+
+if [ "$RUN_AGENTS" = 1 ]; then
+  for alias in $REEXECUTORS; do
+    if ! secret="$(stellar keys secret "$alias" 2>/dev/null)"; then
+      echo "WARN: no stellar-cli identity '$alias' — run scripts/deploy_testnet.sh + scripts/bootstrap_reexecutors.sh, skipping" >&2
+      continue
+    fi
+    echo "==> Starting re-executor agent $alias"
+    start "$alias" reexecutor-agent env \
+      BACKEND_URL="http://127.0.0.1:$API_PORT" REEXECUTOR_SECRET_KEY="$secret" \
+      "$ROOT_DIR/reexecutor-agent/node_modules/.bin/tsx" src/index.ts
+  done
+  unset secret
+fi
+
+if [ "$RUN_WEB" = 1 ]; then
+  echo "==> Starting frontend on :$WEB_PORT"
+  start frontend frontend env \
+    BACKEND_URL="http://127.0.0.1:$API_PORT" NEXT_PUBLIC_NETWORK_PASSPHRASE="$NETWORK_PASSPHRASE" \
+    "$ROOT_DIR/frontend/node_modules/.bin/next" dev --turbopack -p "$WEB_PORT"
+fi
+
+echo
+echo "Verity is up (Ctrl+C stops everything):"
+echo "  API       http://localhost:$API_PORT"
+[ "$RUN_WEB" = 1 ] && echo "  Dashboard http://localhost:$WEB_PORT"
+echo "  EscrowGate $GATE_ID (testnet)"
+echo "  End-to-end check, in another terminal:  VERITY_API_PORT=$API_PORT pnpm smoke"
+echo
+wait

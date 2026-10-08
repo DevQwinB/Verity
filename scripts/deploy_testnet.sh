@@ -106,6 +106,7 @@ cat > "$DEPLOY_JSON" <<EOF
   "zk_verifier_registry_contract_id": "$REGISTRY_ID",
   "native_xlm_sac_address": "$NATIVE_SAC",
   "deployer_public_key": "$DEPLOYER_ADDR",
+  "challenger_public_key": "$(stellar keys address "$CHALLENGER")",
   "bootstrap_reexecutors": $BOOTSTRAP_JSON,
   "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
@@ -114,4 +115,9 @@ echo "==> Wrote $DEPLOY_JSON"
 echo ""
 echo "Secret keys for all generated identities live in ~/.config/stellar/identity/*.toml"
 echo "(never committed; deployments/testnet.json only ever holds public keys/contract IDs)."
+echo ""
+echo "Next:"
+echo "  scripts/bootstrap_reexecutors.sh   # stake rex1..rex5 into the new EscrowGate"
+echo "  pnpm db:reset                      # a new contract restarts submission ids at 0;"
+echo "                                     # the local DB still holds the old contract's rows"
 echo "Done."

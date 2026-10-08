@@ -7,8 +7,12 @@
     "node": ">=20"
   },
   "scripts": {
+    "dev": "bash scripts/dev.sh",
+    "smoke": "bash scripts/smoke.sh",
+    "db:migrate": "pnpm --filter @verity/db migrate",
+    "test:contracts": "cd contracts && cargo test",
     "build": "pnpm -r build",
-    "test": "pnpm -r test",
-    "lint": "pnpm -r lint"
+    "typecheck": "pnpm -r exec tsc --noEmit",
+    "db:reset": "pnpm --filter @verity/db reset"
   }
 }
