@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useId, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useWallet } from "../../../components/wallet-provider";
 import { Card, CardBody, CardHeader } from "../../../components/ui/card";
@@ -8,6 +8,7 @@ import { Button } from "../../../components/ui/button";
 import { uploadArtifact, createSubmission, relaySubmission } from "../../../lib/client-api";
 import { signXdr } from "../../../lib/wallet";
 import { NETWORK_PASSPHRASE } from "../../../lib/config";
+import { canonicalJson, parseJsonOrText } from "../../../lib/canonical";
 import type { TaskType } from "../../../lib/types";
 
 function textToBase64(text: string): string {
@@ -38,16 +39,44 @@ export default function NewSubmissionPage() {
     return String(BigInt(Math.round(Number(xlm) * 10_000_000)));
   }
 
+  /** Re-executors parse the input as JSON and hash their output in
+   * canonical JSON, so both are normalised here before they are hashed —
+   * otherwise a stray space or a different key order reads as a mismatch
+   * and costs the agent their bond. */
+  function prepareArtifacts(): { input: string; output: string } {
+    let inputValue: unknown;
+    try {
+      inputValue = JSON.parse(inputContent);
+    } catch {
+      throw new Error(
+        taskType === "retrieval"
+          ? 'The request spec must be valid JSON, e.g. {"url": "https://...", "pointer": "/field"}.'
+          : "The input must be valid JSON. It is passed to your function as `input`."
+      );
+    }
+    if (taskType === "retrieval") {
+      const url = (inputValue as { url?: unknown } | null)?.url;
+      if (typeof url !== "string" || !/^https?:\/\//.test(url)) {
+        throw new Error('The request spec needs a "url" starting with http:// or https://.');
+      }
+    }
+    if (taskType === "deterministic" && !functionContent.trim()) {
+      throw new Error("A deterministic task needs the function re-executors will replay.");
+    }
+    return { input: canonicalJson(inputValue), output: canonicalJson(parseJsonOrText(outputContent)) };
+  }
+
   async function handleSubmit() {
     if (!account) return;
     setError(null);
     try {
+      const artifacts = prepareArtifacts();
       setStep("uploading");
-      const input = await uploadArtifact(textToBase64(inputContent), "text/plain");
-      const output = await uploadArtifact(textToBase64(outputContent), "text/plain");
+      const input = await uploadArtifact(textToBase64(artifacts.input), "application/json");
+      const output = await uploadArtifact(textToBase64(artifacts.output), "application/json");
       const fn =
-        taskType === "deterministic" && functionContent
-          ? await uploadArtifact(textToBase64(functionContent), "text/plain")
+        taskType === "deterministic"
+          ? await uploadArtifact(textToBase64(functionContent), "text/javascript")
           : null;
 
       setStep("building");
@@ -145,36 +174,63 @@ export default function NewSubmissionPage() {
           <span className="font-medium">Content-addressed artifacts</span>
         </CardHeader>
         <CardBody className="space-y-4">
-          <Field label="Input">
+          <Field
+            label={taskType === "retrieval" ? "Request spec (JSON)" : "Input (JSON)"}
+            helper={
+              taskType === "retrieval"
+                ? "The public URL you fetched, plus an optional JSON pointer to the value you extracted. A sampled re-executor re-fetches it."
+                : "Passed to your function as `input`."
+            }
+          >
             <textarea
               value={inputContent}
               onChange={(e) => setInputContent(e.target.value)}
               rows={3}
-              className={inputClass}
+              spellCheck={false}
+              placeholder={
+                taskType === "retrieval"
+                  ? '{"url": "https://horizon-testnet.stellar.org/", "pointer": "/network_passphrase"}'
+                  : '{"n": 21}'
+              }
+              className={cnMono}
             />
           </Field>
           {taskType === "deterministic" && (
-            <Field label="Deterministic function (script)" helper="Hashed and stored; re-executors run this exact artifact.">
+            <Field
+              label="Function body (JavaScript)"
+              helper="The body of a pure function of `input` that returns the result. Hashed and stored; re-executors run this exact artifact in a sandbox with no network access."
+            >
               <textarea
                 value={functionContent}
                 onChange={(e) => setFunctionContent(e.target.value)}
                 rows={4}
+                spellCheck={false}
+                placeholder="return { doubled: input.n * 2 };"
                 className={cnMono}
               />
             </Field>
           )}
-          <Field label="Claimed output">
+          <Field
+            label="Claimed output"
+            helper="JSON or plain text. Normalised to canonical JSON before hashing, so key order and whitespace do not matter."
+          >
             <textarea
               value={outputContent}
               onChange={(e) => setOutputContent(e.target.value)}
               rows={3}
-              className={inputClass}
+              spellCheck={false}
+              placeholder={taskType === "retrieval" ? "Test SDF Network ; September 2015" : '{"doubled": 42}'}
+              className={cnMono}
             />
           </Field>
         </CardBody>
       </Card>
 
-      {error && <p className="text-sm text-status-slashed">{error}</p>}
+      {error && (
+        <p role="alert" className="text-sm text-status-slashed">
+          {error}
+        </p>
+      )}
 
       {account ? (
         <Button onClick={handleSubmit} disabled={busy || !escrowRef || !inputContent || !outputContent}>
@@ -210,11 +266,18 @@ function Field({
   helper?: string;
   children: React.ReactNode;
 }) {
+  // A wrapping <label> ties the caption to the control without threading ids
+  // through every call site; the helper is linked for screen readers.
+  const helperId = useId();
   return (
-    <div className="space-y-2">
-      <label className="text-sm text-text-secondary">{label}</label>
+    <label className="block space-y-2" aria-describedby={helper ? helperId : undefined}>
+      <span className="block text-sm text-text-secondary">{label}</span>
       {children}
-      {helper && <p className="text-xs text-text-tertiary">{helper}</p>}
-    </div>
+      {helper && (
+        <span id={helperId} className="block max-w-[65ch] text-xs text-text-tertiary">
+          {helper}
+        </span>
+      )}
+    </label>
   );
 }
