@@ -24,11 +24,11 @@ fi
 GATE_ID=$(json_field escrow_gate_contract_id)
 DEPLOYER_ADDR=$(stellar keys address "$DEPLOYER")
 
-# A bool contract argument is a bare flag on the CLI: present means true.
+# A bool contract argument is a flag on the CLI: bare means true.
 APPROVED_FLAG=(--approved)
 VERB="Approving"
 if [ "$MODE" = "--revoke" ]; then
-  APPROVED_FLAG=()
+  APPROVED_FLAG=(--approved false)
   VERB="Revoking"
 fi
 
