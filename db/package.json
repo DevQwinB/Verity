@@ -9,7 +9,7 @@
     "migrate": "tsx src/migrate.ts",
     "migrate:down": "tsx src/migrate.ts down",
     "local-postgres": "tsx src/local-postgres.ts",
-    "seed:testnet-accounts": "tsx seed/bootstrap-testnet-accounts.ts"
+    "reset": "tsx src/reset.ts"
   },
   "dependencies": {
     "kysely": "^0.29.6",

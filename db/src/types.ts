@@ -44,6 +44,7 @@ export interface SubmissionTable {
   chain_tx_hash: string | null;
   idempotency_key: string | null;
   finalize_attempted_at: Timestamp | null;
+  settled_at: Timestamp | null;
   created_at: GeneratedTimestamp;
   updated_at: GeneratedTimestamp;
 }
@@ -74,6 +75,8 @@ export interface ReplayTable {
   latency_ms: number | null;
   cost: string | null;
   tx_hash: string | null;
+  slash_tx_hash: string | null;
+  lock_released_at: Timestamp | null;
   assigned_at: GeneratedTimestamp;
   executed_at: Timestamp | null;
 }
