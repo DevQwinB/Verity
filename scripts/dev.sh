@@ -11,17 +11,22 @@
 # and only when that file does not exist yet.
 #
 #   VERITY_API_PORT (3001)  VERITY_WEB_PORT (3000)  VERITY_PG_PORT (5433)
+#   VERITY_DEPLOYMENT (testnet)                       which deployments/<name>.json
 #   VERITY_REEXECUTORS ("rex1 rex2 rex3 rex4 rex5")   stellar-cli aliases
 #   --no-web / --no-agents                            skip those processes
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+# shellcheck source=scripts/_deployment.sh
+source "$ROOT_DIR/scripts/_deployment.sh"
+require_deployment
+refuse_public_deployment "pnpm dev is the local development runner; a public deployment runs from the container stack (docs/DEPLOY.md)."
 
 API_PORT="${VERITY_API_PORT:-3001}"
 WEB_PORT="${VERITY_WEB_PORT:-3000}"
 PG_PORT="${VERITY_PG_PORT:-5433}"
-REEXECUTORS="${VERITY_REEXECUTORS:-rex1 rex2 rex3 rex4 rex5}"
+REEXECUTORS="${VERITY_REEXECUTORS:-${BOOTSTRAP_REEXECUTORS[*]}}"
 RUN_WEB=1
 RUN_AGENTS=1
 for arg in "$@"; do
@@ -32,12 +37,9 @@ for arg in "$@"; do
   esac
 done
 
-DEPLOY_JSON="$ROOT_DIR/deployments/testnet.json"
-json_field() { grep -o "\"$1\": *\"[^\"]*\"" "$DEPLOY_JSON" | cut -d'"' -f4; }
 GATE_ID="$(json_field escrow_gate_contract_id)"
 REGISTRY_ID="$(json_field zk_verifier_registry_contract_id)"
 BOND_ASSET_ID="$(json_field native_xlm_sac_address)"
-NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 DATABASE_URL="postgres://verity:verity@127.0.0.1:${PG_PORT}/verity"
 
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
@@ -58,13 +60,15 @@ if [ ! -f backend/src/chain/generated/escrow-gate/dist/index.js ]; then
   pnpm --filter escrow-gate --filter zk-verifier-registry build
 fi
 
+if ! stellar keys address "$KEEPER" >/dev/null 2>&1; then
+  echo "==> Creating and funding keeper identity '$KEEPER'"
+  stellar keys generate "$KEEPER" --network "$NETWORK" --fund
+fi
+
 if [ ! -f backend/.env ]; then
   echo "==> Creating backend/.env (gitignored)"
-  if ! stellar keys address keeper >/dev/null 2>&1; then
-    stellar keys generate keeper --network testnet --fund
-  fi
   cat > backend/.env <<ENV
-SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
+SOROBAN_RPC_URL=$SOROBAN_RPC_URL
 HORIZON_URL=https://horizon-testnet.stellar.org
 NETWORK_PASSPHRASE="$NETWORK_PASSPHRASE"
 ESCROW_GATE_CONTRACT_ID=$GATE_ID
@@ -75,7 +79,7 @@ WEB_AUTH_DOMAIN=localhost:$API_PORT
 HOME_DOMAIN=localhost:$API_PORT
 PORT=$API_PORT
 ARTIFACT_STORAGE_DIR=./.artifacts
-KEEPER_SECRET_KEY=$(stellar keys secret keeper)
+KEEPER_SECRET_KEY=$(stellar keys secret "$KEEPER")
 JWT_SECRET=$(openssl rand -hex 32)
 ENV
   chmod 600 backend/.env
@@ -122,11 +126,14 @@ echo "==> Running migrations"
 (cd db && DATABASE_URL="$DATABASE_URL" "$TSX" src/migrate.ts)
 
 echo "==> Starting backend on :$API_PORT"
-export SOROBAN_RPC_URL="https://soroban-testnet.stellar.org" NETWORK_PASSPHRASE
+export SOROBAN_RPC_URL NETWORK_PASSPHRASE
 export ESCROW_GATE_CONTRACT_ID="$GATE_ID" ZK_VERIFIER_REGISTRY_CONTRACT_ID="$REGISTRY_ID" BOND_ASSET_CONTRACT_ID="$BOND_ASSET_ID"
+# The keeper key comes from the keystore on every start, so backend/.env going
+# stale after a redeploy or a deployment switch can never sign with the wrong one.
 start backend backend env \
   DATABASE_URL="$DATABASE_URL" PORT="$API_PORT" \
   WEB_AUTH_DOMAIN="localhost:$API_PORT" HOME_DOMAIN="localhost:$API_PORT" \
+  DEPLOYMENT_NAME="$DEPLOYMENT" KEEPER_SECRET_KEY="$(stellar keys secret "$KEEPER")" \
   "$ROOT_DIR/backend/node_modules/.bin/tsx" src/index.ts
 wait_for "backend" "curl -fs http://127.0.0.1:$API_PORT/health"
 
@@ -155,7 +162,7 @@ echo
 echo "Verity is up (Ctrl+C stops everything):"
 echo "  API       http://localhost:$API_PORT"
 [ "$RUN_WEB" = 1 ] && echo "  Dashboard http://localhost:$WEB_PORT"
-echo "  EscrowGate $GATE_ID (testnet)"
+echo "  EscrowGate $GATE_ID (deployment '$DEPLOYMENT', testnet)"
 echo "  End-to-end check, in another terminal:  VERITY_API_PORT=$API_PORT pnpm smoke"
 echo
 wait

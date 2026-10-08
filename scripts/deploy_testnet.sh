@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
-# Deploys EscrowGate and ZKVerifierRegistry to Stellar testnet for real, wires
-# them together, and asserts the registry starts genuinely empty. Idempotent:
-# re-running skips steps whose artifacts already exist under deployments/.
+# Deploys a fresh EscrowGate and ZKVerifierRegistry to Stellar testnet and
+# records them in deployments/<name>.json. Each contract is deployed and
+# configured in one transaction (constructor args), so there is never a
+# deployed-but-unclaimed contract somebody else could initialise.
+#
+# This always creates NEW contracts — EscrowGate has no upgrade entrypoint —
+# so it refuses to replace an existing deployment record unless --force is
+# given. After a redeploy the re-executors must be staked and approved again
+# (scripts/bootstrap_reexecutors.sh) and the database reset.
+#
+#   VERITY_DEPLOYMENT   deployment name (default: testnet, the dev deployment)
+#   --public            mark the deployment as one real users are on; the dev
+#                       runner and smoke test will refuse to touch it
+#   --force             replace an existing deployments/<name>.json
+#   VERITY_GATE_CONFIG  full EscrowGate ConfigRecord JSON, to override defaults
 #
 # Network calls in this repo's dev sandbox require disabling the default
 # command sandbox (DNS is blocked otherwise) — outside that sandbox this
@@ -10,16 +22,54 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTRACTS_DIR="$ROOT_DIR/contracts"
-DEPLOY_JSON="$ROOT_DIR/deployments/testnet.json"
-NETWORK=testnet
-NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+# shellcheck source=scripts/_deployment.sh
+source "$ROOT_DIR/scripts/_deployment.sh"
 
-DEPLOYER=deployer
-BOOTSTRAP_REEXECUTORS=(rex1 rex2 rex3 rex4 rex5)
-CHALLENGER=challenger1
+PUBLIC=false
+FORCE=0
+for arg in "$@"; do
+  case "$arg" in
+    --public) PUBLIC=true ;;
+    --force) FORCE=1 ;;
+    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+  esac
+done
 
+if [ -f "$DEPLOY_JSON" ] && [ "$FORCE" != 1 ]; then
+  echo "FATAL: $DEPLOY_JSON already exists." >&2
+  echo "       Deploying again creates new contracts and orphans every stake and" >&2
+  echo "       submission on the current ones. Re-run with --force if that is intended." >&2
+  exit 1
+fi
+
+# Windows are the on-chain minimum (10 minutes) on a dev deployment so the
+# window-elapsed paths can be exercised in one sitting; a public deployment
+# gets the real 1h / 24h tiers. Everything else is the v1 default: quorum of
+# 3, 66% bonded supermajority, 5% agent and challenger bonds, small tier under
+# 100,000 XLM of escrow value, 20% of a slash to a prevailing challenger, 10%
+# of stake forfeited by a wrong-side re-executor, and an admin-approved voter
+# set (stake is free on testnet, so an open one could be captured for nothing).
+if [ "$PUBLIC" = true ]; then
+  WINDOW_SMALL_S=3600
+  WINDOW_LARGE_S=86400
+else
+  WINDOW_SMALL_S=600
+  WINDOW_LARGE_S=600
+fi
+GATE_CONFIG="${VERITY_GATE_CONFIG:-}"
+if [ -z "$GATE_CONFIG" ]; then
+  GATE_CONFIG='{"min_stake_floor":"5000000000","quorum_min_reexecutors":3,"quorum_supermajority_bps":6600,"agent_bond_min_bps":500,"challenger_bond_min_bps":500,"window_tier_small_ceiling":"1000000000000","window_tier_small_s":'"$WINDOW_SMALL_S"',"window_tier_large_s":'"$WINDOW_LARGE_S"',"slash_split_challenger_bps":2000,"reexecutor_slash_bps":1000,"reexecutor_allowlist":true}'
+fi
+
+# The dev deployment also needs a challenger for the smoke test.
+IDENTITIES=("$DEPLOYER" "$KEEPER" "${BOOTSTRAP_REEXECUTORS[@]}")
+if [ "$DEPLOYMENT" = testnet ]; then
+  IDENTITIES+=(challenger1)
+fi
+
+echo "==> Deployment '$DEPLOYMENT' (public: $PUBLIC)"
 echo "==> Ensuring identities exist and are funded"
-for name in "$DEPLOYER" "${BOOTSTRAP_REEXECUTORS[@]}" "$CHALLENGER"; do
+for name in "${IDENTITIES[@]}"; do
   if ! stellar keys address "$name" >/dev/null 2>&1; then
     stellar keys generate "$name" --network "$NETWORK" --fund
   else
@@ -28,7 +78,7 @@ for name in "$DEPLOYER" "${BOOTSTRAP_REEXECUTORS[@]}" "$CHALLENGER"; do
 done
 
 DEPLOYER_ADDR=$(stellar keys address "$DEPLOYER")
-echo "==> Deployer: $DEPLOYER_ADDR"
+echo "==> Deployer / admin: $DEPLOYER_ADDR"
 
 echo "==> Resolving native XLM Stellar Asset Contract address"
 NATIVE_SAC=$(stellar contract id asset --asset native --network "$NETWORK")
@@ -47,38 +97,22 @@ GATE_ID=$(stellar contract deploy \
   --wasm "$GATE_WASM" \
   --source "$DEPLOYER" \
   --network "$NETWORK" \
-  -- )
+  -- \
+  --admin "$DEPLOYER_ADDR" \
+  --bond_asset "$NATIVE_SAC" \
+  --config "$GATE_CONFIG")
 echo "EscrowGate contract id: $GATE_ID"
 
+# EscrowGate does not consult the registry in Phase 1 (resolve_challenge
+# rejects ZkProof); it is deployed as the anchor Phase 2 verifiers register in.
 echo "==> Deploying ZKVerifierRegistry"
 REGISTRY_ID=$(stellar contract deploy \
   --wasm "$REGISTRY_WASM" \
   --source "$DEPLOYER" \
   --network "$NETWORK" \
-  -- )
+  -- \
+  --admin "$DEPLOYER_ADDR")
 echo "ZKVerifierRegistry contract id: $REGISTRY_ID"
-
-echo "==> Initializing ZKVerifierRegistry"
-stellar contract invoke \
-  --id "$REGISTRY_ID" --source "$DEPLOYER" --network "$NETWORK" \
-  -- initialize --admin "$DEPLOYER_ADDR"
-
-echo "==> Initializing EscrowGate with default Phase-1 config"
-# Config values are v1 defaults (ASSUMPTIONs from the PRD, tunable later via
-# update_config): 1% min supermajority above the 51% floor, quorum of 3,
-# 5% agent bond / 5% challenger bond, 1h window under 100 XLM escrow value
-# else 24h, 20% of a slashed pool goes to the prevailing challenger.
-stellar contract invoke \
-  --id "$GATE_ID" --source "$DEPLOYER" --network "$NETWORK" \
-  -- initialize \
-  --admin "$DEPLOYER_ADDR" \
-  --bond_asset "$NATIVE_SAC" \
-  --config '{"min_stake_floor":"5000000000","quorum_min_reexecutors":3,"quorum_supermajority_bps":6600,"agent_bond_min_bps":500,"challenger_bond_min_bps":500,"window_tier_small_ceiling":"1000000000000","window_tier_small_s":3600,"window_tier_large_s":86400,"slash_split_challenger_bps":2000}'
-
-echo "==> Wiring ZKVerifierRegistry into EscrowGate"
-stellar contract invoke \
-  --id "$GATE_ID" --source "$DEPLOYER" --network "$NETWORK" \
-  -- set_zk_registry --admin "$DEPLOYER_ADDR" --registry "$REGISTRY_ID"
 
 echo "==> Asserting ZKVerifierRegistry is genuinely empty (Phase 1 requirement)"
 LIST_OUT=$(stellar contract invoke \
@@ -90,7 +124,7 @@ if [ "$LIST_OUT" != "[]" ]; then
 fi
 echo "==> Confirmed empty: $LIST_OUT"
 
-echo "==> Writing deployments/testnet.json"
+echo "==> Writing $DEPLOY_JSON"
 BOOTSTRAP_JSON="["
 for name in "${BOOTSTRAP_REEXECUTORS[@]}"; do
   addr=$(stellar keys address "$name")
@@ -98,26 +132,34 @@ for name in "${BOOTSTRAP_REEXECUTORS[@]}"; do
 done
 BOOTSTRAP_JSON="${BOOTSTRAP_JSON%,}]"
 
+CHALLENGER_JSON=""
+if [ "$DEPLOYMENT" = testnet ]; then
+  CHALLENGER_JSON="  \"challenger_public_key\": \"$(stellar keys address challenger1)\","$'\n'
+fi
+
 cat > "$DEPLOY_JSON" <<EOF
 {
+  "deployment": "$DEPLOYMENT",
+  "public": $PUBLIC,
   "network": "$NETWORK",
   "network_passphrase": "$NETWORK_PASSPHRASE",
   "escrow_gate_contract_id": "$GATE_ID",
   "zk_verifier_registry_contract_id": "$REGISTRY_ID",
   "native_xlm_sac_address": "$NATIVE_SAC",
   "deployer_public_key": "$DEPLOYER_ADDR",
-  "challenger_public_key": "$(stellar keys address "$CHALLENGER")",
-  "bootstrap_reexecutors": $BOOTSTRAP_JSON,
+  "keeper_public_key": "$(stellar keys address "$KEEPER")",
+${CHALLENGER_JSON}  "bootstrap_reexecutors": $BOOTSTRAP_JSON,
   "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
 echo "==> Wrote $DEPLOY_JSON"
 echo ""
 echo "Secret keys for all generated identities live in ~/.config/stellar/identity/*.toml"
-echo "(never committed; deployments/testnet.json only ever holds public keys/contract IDs)."
+echo "(never committed; deployments/*.json only ever holds public keys/contract IDs)."
 echo ""
 echo "Next:"
-echo "  scripts/bootstrap_reexecutors.sh   # stake rex1..rex5 into the new EscrowGate"
+echo "  scripts/bootstrap_reexecutors.sh   # stake and approve the re-executor fleet"
+echo "  scripts/generate_bindings.sh       # only if the contract interface changed"
 echo "  pnpm db:reset                      # a new contract restarts submission ids at 0;"
-echo "                                     # the local DB still holds the old contract's rows"
+echo "                                     # a database still holding the old contract's rows is wrong"
 echo "Done."

@@ -4,16 +4,23 @@
 # your stellar-cli keystore; the re-executor agents started by `pnpm dev` do
 # the actual replaying and on-chain attesting.
 #
+# Smoke submissions are real on-chain records, so this only ever runs against
+# a local backend on a deployment that is not marked public.
+#
 #   SMOKE_AGENT_ALIAS (agent1)  SMOKE_CHALLENGER_ALIAS (challenger1)
 #   VERITY_API_PORT (3001)      SMOKE_ONLY=honest-deterministic,...
+#   VERITY_DEPLOYMENT (testnet)
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/_deployment.sh
+source "$ROOT_DIR/scripts/_deployment.sh"
+require_deployment
+refuse_public_deployment "The smoke test writes real test submissions on-chain and must never run against it."
+
 API_PORT="${VERITY_API_PORT:-3001}"
 AGENT_ALIAS="${SMOKE_AGENT_ALIAS:-agent1}"
 CHALLENGER_ALIAS="${SMOKE_CHALLENGER_ALIAS:-challenger1}"
-DEPLOY_JSON="$ROOT_DIR/deployments/testnet.json"
-json_field() { grep -o "\"$1\": *\"[^\"]*\"" "$DEPLOY_JSON" | cut -d'"' -f4; }
 
 for alias in "$AGENT_ALIAS" "$CHALLENGER_ALIAS"; do
   if ! stellar keys address "$alias" >/dev/null 2>&1; then
