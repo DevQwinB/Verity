@@ -204,12 +204,22 @@ export async function settleOnce(): Promise<number> {
       }
 
       // Assignments nobody completed can no longer be attested (the contract
-      // rejects votes on a finalized submission). They are kept, marked
-      // missed: that a re-executor was asked and did not answer is part of
-      // its record, and agents are only ever handed 'assigned' rows.
+      // rejects votes on a finalized submission). One that had real time to
+      // answer and did not is kept, marked missed: that is part of the
+      // re-executor's record. One that was simply overtaken — a spare
+      // assignee whose turn came seconds before a fast consensus finalized
+      // the submission — did nothing wrong and is dropped without a mark.
+      const finalizedAt = new Date(sub.updated_at);
+      const hadTimeBefore = new Date(finalizedAt.getTime() - env.REPLAY_REASSIGN_AFTER_S * 1000);
       await db
         .updateTable("replay")
         .set({ status: "missed" })
+        .where("submission_id", "=", sub.id)
+        .where("status", "=", "assigned")
+        .where("assigned_at", "<=", hadTimeBefore)
+        .execute();
+      await db
+        .deleteFrom("replay")
         .where("submission_id", "=", sub.id)
         .where("status", "=", "assigned")
         .execute();
