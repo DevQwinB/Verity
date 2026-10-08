@@ -401,12 +401,13 @@ fn challenge_upheld_slashes_agent_bond_and_pays_challenger() {
     let verdict = w.client.resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus);
     assert_eq!(verdict, Verdict::Slashed);
 
-    // challenger gets 20% of the 50 XLM forfeited agent bond = 10 XLM, plus
-    // their own 50 XLM challenge bond back... actually the challenge bond
-    // itself is not auto-refunded by settle() (only the agent's submission
-    // bond is split) — assert the documented split share landed.
-    assert_eq!(w.token.balance(&challenger), 1000 * XLM - 50 * XLM + 10 * XLM);
+    // The prevailing challenger gets their own 50 XLM bond back plus 20% of
+    // the 50 XLM forfeited agent bond (10 XLM); the other 40 XLM goes to the
+    // treasury. Nothing is left in the contract for this submission.
+    assert_eq!(w.token.balance(&challenger), 1000 * XLM + 10 * XLM);
     assert_eq!(w.token.balance(&w.admin), 40 * XLM);
+    assert_eq!(w.token.balance(&agent), 950 * XLM);
+    assert_eq!(w.token.balance(&w.client.address), 3 * 600 * XLM); // only re-executor stake remains
 }
 
 #[test]
@@ -430,7 +431,74 @@ fn challenge_rejected_verifies_agent() {
 
     let verdict = w.client.resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus);
     assert_eq!(verdict, Verdict::Verified);
+    // The agent gets their bond back plus the losing challenger's forfeited
+    // 50 XLM bond; the challenger is out exactly that bond.
+    assert_eq!(w.token.balance(&agent), 1000 * XLM + 50 * XLM);
+    assert_eq!(w.token.balance(&challenger), 950 * XLM);
+    assert_eq!(w.token.balance(&w.client.address), 3 * 600 * XLM);
+}
+
+#[test]
+fn unresolvable_challenge_expires_and_returns_both_bonds() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    w.client.open_challenge(&challenger, &id, &(50 * XLM));
+
+    // One lone vote: below quorum, so no consensus can ever form.
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex);
+    w.client.attest_replay(&rex, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+
+    // Still inside the post-challenge window: nothing may move yet.
+    e.ledger().with_mut(|l| l.timestamp += 3599);
+    assert_eq!(w.client.finalize(&id), Verdict::Pending);
+    assert_eq!(w.token.balance(&agent), 950 * XLM);
+
+    e.ledger().with_mut(|l| l.timestamp += 1);
+    assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
     assert_eq!(w.token.balance(&agent), 1000 * XLM);
+    assert_eq!(w.token.balance(&challenger), 1000 * XLM);
+    assert_eq!(w.token.balance(&w.client.address), 600 * XLM);
+
+    // Terminal and idempotent like every other verdict; nobody is slashable.
+    assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+    assert_eq!(
+        w.client.try_slash(&w.admin, &rex, &id, &(10 * XLM)),
+        Err(Ok(Error::NotUpheldResolution))
+    );
+}
+
+#[test]
+fn challenge_with_consensus_cannot_be_expired_around() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    w.client.open_challenge(&challenger, &id, &(50 * XLM));
+
+    for _ in 0..3 {
+        let r = Address::generate(&e);
+        register_rex(&w, &r);
+        w.client.attest_replay(&r, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    }
+
+    // A mismatch consensus exists. Waiting out the window must not let the
+    // agent escape the slash via the expiry path — only resolve_challenge()
+    // may settle it.
+    e.ledger().with_mut(|l| l.timestamp += 10 * 3600);
+    assert_eq!(w.client.finalize(&id), Verdict::Pending);
+    assert_eq!(
+        w.client.resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+        Verdict::Slashed
+    );
 }
 
 // ---- withdraw / release_attestation_lock bookkeeping ----

@@ -91,36 +91,58 @@ fn consensus_outcome(sub: &SubmissionRecord) -> Result<Option<Verdict>, Error> {
     Ok(None)
 }
 
+/// Moves every bond this submission holds to where the terminal verdict says
+/// it belongs. After this runs the contract custodies nothing for the
+/// submission: both the agent's bond and (if a challenge was opened) the
+/// challenger's bond have been paid out.
+///
+/// - Verified: the agent's bond is returned. A challenger who disputed it
+///   and lost forfeits their bond to the agent they wrongly accused — that
+///   forfeit is what makes a frivolous challenge cost something.
+/// - Slashed: the agent's bond is forfeited. A prevailing challenger gets
+///   their own bond back plus slash_split_challenger_bps of the agent's; the
+///   rest (or all of it, absent a challenger) goes to the admin/treasury.
+/// - ExpiredUnverified: the challenge could not be resolved either way, so
+///   nobody was proven wrong and both bonds go back to their owners.
 fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(), Error> {
     let bond_asset = storage::get_bond_asset(e).ok_or(Error::NotInitialized)?;
     let token = soroban_sdk::token::TokenClient::new(e, &bond_asset);
     let contract_address = e.current_contract_address();
+    let challenge = storage::get_challenge(e, sub.id);
+    let pay = |to: &Address, amount: i128| {
+        if amount > 0 {
+            token.transfer(&contract_address, to.clone(), &amount);
+        }
+    };
     match sub.verdict {
         Verdict::Verified => {
-            if sub.bond_amount > 0 {
-                token.transfer(&contract_address, sub.agent.clone(), &sub.bond_amount);
-            }
+            let forfeited = challenge.as_ref().map(|c| c.bond).unwrap_or(0);
+            let total = sub.bond_amount.checked_add(forfeited).ok_or(Error::Overflow)?;
+            pay(&sub.agent, total);
         }
         Verdict::Slashed => {
             let admin = storage::get_admin(e).ok_or(Error::NotInitialized)?;
-            if let Some(chal) = storage::get_challenge(e, sub.id) {
+            if let Some(chal) = challenge {
                 let challenger_share =
                     checked_bps(sub.bond_amount, sub.cfg_slash_split_challenger_bps)?;
                 let remainder = sub
                     .bond_amount
                     .checked_sub(challenger_share)
                     .ok_or(Error::Overflow)?;
-                if challenger_share > 0 {
-                    token.transfer(&contract_address, chal.challenger.clone(), &challenger_share);
-                }
-                if remainder > 0 {
-                    token.transfer(&contract_address, admin, &remainder);
-                }
-            } else if sub.bond_amount > 0 {
+                let to_challenger = chal.bond.checked_add(challenger_share).ok_or(Error::Overflow)?;
+                pay(&chal.challenger, to_challenger);
+                pay(&admin, remainder);
+            } else {
                 // Pure replay-consensus slash: no challenger exists to reward,
                 // so the forfeited agent bond routes to the admin/treasury
                 // account configured at initialize().
-                token.transfer(&contract_address, admin, &sub.bond_amount);
+                pay(&admin, sub.bond_amount);
+            }
+        }
+        Verdict::ExpiredUnverified => {
+            pay(&sub.agent, sub.bond_amount);
+            if let Some(chal) = challenge {
+                pay(&chal.challenger, chal.bond);
             }
         }
         _ => {}
@@ -521,6 +543,12 @@ impl EscrowGate {
     /// (invariant 1); absent both a challenge and an early consensus, a
     /// window-elapsed submission defaults to Verified per the PRD's
     /// optimistic-verification design (no challenge => no proof of fraud).
+    ///
+    /// A challenge that nobody can resolve — re-executors never reached a
+    /// bonded consensus within one further challenge window of it being
+    /// opened — expires as ExpiredUnverified and releases both bonds, rather
+    /// than freezing the agent's and challenger's funds forever. While a
+    /// consensus does exist, the only way out is resolve_challenge().
     pub fn finalize(e: Env, submission_id: u64) -> Result<Verdict, Error> {
         let mut sub = storage::get_submission(&e, submission_id).ok_or(Error::SubmissionNotFound)?;
         if sub.finalized {
@@ -529,7 +557,13 @@ impl EscrowGate {
 
         if let Some(chal) = storage::get_challenge(&e, submission_id) {
             sub.verdict = match chal.resolution {
-                Resolution::None => return Ok(Verdict::Pending),
+                Resolution::None => {
+                    let deadline = chal.opened_at.saturating_add(sub.challenge_window_s);
+                    if e.ledger().timestamp() < deadline || consensus_outcome(&sub)?.is_some() {
+                        return Ok(Verdict::Pending);
+                    }
+                    Verdict::ExpiredUnverified
+                }
                 Resolution::Upheld => Verdict::Slashed,
                 Resolution::Rejected => Verdict::Verified,
             };
