@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    name: Contracts (cargo test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain and wasm target are pinned in contracts/rust-toolchain.toml.
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts
+      - run: cargo test
+
+  typescript:
+    name: TypeScript (typecheck, lint, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # The backend and the re-executor import the contract bindings' build output.
+      - run: pnpm --filter escrow-gate --filter zk-verifier-registry build
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm --filter @verity/frontend build
+
+  images:
+    name: Container images build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f backend/Dockerfile -t verity-backend .
+      - run: docker build -f reexecutor-agent/Dockerfile -t verity-reexecutor .
+      - run: docker build -f frontend/Dockerfile -t verity-frontend .
