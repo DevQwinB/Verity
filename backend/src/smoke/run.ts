@@ -201,7 +201,11 @@ function expectNobodySlashed(d: any) {
 
 const DOUBLE = "return { doubled: input.n * 2, source: 'replay' };";
 
-type Scenario = (ctx: { agent: Actor; challenger: Actor; rogue: Actor | null }) => Promise<void>;
+/** A scenario does its on-chain work (sequentially: every transaction it
+ * signs shares an account sequence with the others) and may return the part
+ * that only waits and checks. Those parts run together afterwards, so three
+ * scenarios that each wait out a challenge window take one window, not three. */
+type Scenario = (ctx: { agent: Actor; challenger: Actor; rogue: Actor | null }) => Promise<void | (() => Promise<void>)>;
 
 /** Runs with at least a quorum of re-executors online. */
 const quorumScenarios: Record<string, Scenario> = {
@@ -391,9 +395,11 @@ const underQuorumScenarios: Record<string, Scenario> = {
       input: { n: 3 },
       claimedOutput: { doubled: 6, source: "replay" },
     });
-    console.log(`  waiting out the ${cfg.window_tier_small_s}s challenge window with no quorum…`);
+    console.log(`  submitted; its ${cfg.window_tier_small_s}s challenge window has to close with no quorum`);
     // Verified by default, and said to be exactly that — not a consensus.
-    expectNobodySlashed(await expectVerdict(id, "verified", "window_elapsed", cfg.window_tier_small_s + 180));
+    return async () => {
+      expectNobodySlashed(await expectVerdict(id, "verified", "window_elapsed", cfg.window_tier_small_s + 300));
+    };
   },
 
   async "contested-without-quorum-expires"({ agent }) {
@@ -403,10 +409,16 @@ const underQuorumScenarios: Record<string, Scenario> = {
       input: { n: 3 },
       claimedOutput: { doubled: 999, source: "replay" },
     });
-    console.log(`  waiting out the ${cfg.window_tier_small_s}s challenge window with mismatch votes but no quorum…`);
+    console.log(`  submitted; its ${cfg.window_tier_small_s}s window has to close with mismatch votes but no quorum`);
     // Re-executors reported a mismatch but could not reach quorum: the work
     // is neither verified nor slashed, and the honest voters keep their stake.
-    expectNobodySlashed(await expectVerdict(id, "expired_unverified", "window_elapsed", cfg.window_tier_small_s + 180));
+    return async () => {
+      const d = await expectVerdict(id, "expired_unverified", "window_elapsed", cfg.window_tier_small_s + 300);
+      expectNobodySlashed(d);
+      if (!d.replays.some((r: any) => r.status === "confirmed_onchain" && r.match === false)) {
+        throw new Error("expected at least one on-chain mismatch vote behind the expiry");
+      }
+    };
   },
 
   async "unresolved-challenge-expires"({ agent, challenger }) {
@@ -425,12 +437,14 @@ const underQuorumScenarios: Record<string, Scenario> = {
       body: { signed_transaction_xdr: sign(built.unsigned_transaction_xdr, challenger.keypair) },
     });
     await waitFor("indexer to record the challenge", 60, async () => (await detail(id)).challenge);
-    console.log(`  challenge open; waiting ${cfg.window_tier_small_s}s for it to expire unresolved…`);
-    const d = await expectVerdict(id, "expired_unverified", "window_elapsed", cfg.window_tier_small_s + 240);
-    expectNobodySlashed(d);
-    if (!d.challenge.resolved_at || d.challenge.resolution) {
-      throw new Error("expected the challenge to be closed with no resolution");
-    }
+    console.log(`  challenge open; it has to expire unresolved ${cfg.window_tier_small_s}s after it was opened`);
+    return async () => {
+      const d = await expectVerdict(id, "expired_unverified", "window_elapsed", cfg.window_tier_small_s + 360);
+      expectNobodySlashed(d);
+      if (!d.challenge.resolved_at || d.challenge.resolution) {
+        throw new Error("expected the challenge to be closed with no resolution");
+      }
+    };
   },
 };
 
@@ -489,17 +503,37 @@ async function main() {
 
   const only = (process.env.SMOKE_ONLY ?? "").split(",").filter(Boolean);
   const results: Array<{ name: string; ok: boolean; error?: string }> = [];
+  const waiting: Array<{ name: string; finish: () => Promise<void> }> = [];
   for (const [name, run] of Object.entries(scenarios)) {
     if (only.length > 0 && !only.includes(name)) continue;
     console.log(`\n[smoke] scenario: ${name}`);
     try {
-      await run({ agent, challenger, rogue });
+      const finish = await run({ agent, challenger, rogue });
+      if (finish) {
+        waiting.push({ name, finish });
+        continue;
+      }
       results.push({ name, ok: true });
       console.log("  PASS");
     } catch (err) {
       results.push({ name, ok: false, error: (err as Error).message });
       console.error(`  FAIL: ${(err as Error).message}`);
     }
+  }
+  if (waiting.length > 0) {
+    console.log(`\n[smoke] waiting on ${waiting.length} scenario(s) whose challenge windows have to close…`);
+    await Promise.all(
+      waiting.map(async ({ name, finish }) => {
+        try {
+          await finish();
+          results.push({ name, ok: true });
+          console.log(`  PASS  ${name}`);
+        } catch (err) {
+          results.push({ name, ok: false, error: (err as Error).message });
+          console.error(`  FAIL  ${name}: ${(err as Error).message}`);
+        }
+      })
+    );
   }
 
   console.log("\n=== SMOKE TEST RESULT ===");

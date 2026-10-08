@@ -1,6 +1,6 @@
 import { headers } from "next/headers";
 import { unstable_rethrow } from "next/navigation";
-import { BACKEND_URL } from "./config";
+import { BACKEND_READ_TIMEOUT_MS, BACKEND_URL } from "./config";
 
 /** The backend rate-limits per client address. Every server-rendered read
  * comes from this one server, so the browser's own address is passed along
@@ -30,7 +30,13 @@ async function get(path: string): Promise<Response> {
   // route is dynamic, and that signal must reach the framework untouched.
   const forwarded = await forwardedFor();
   try {
-    return await fetch(`${BACKEND_URL}${path}`, { cache: "no-store", headers: forwarded });
+    return await fetch(`${BACKEND_URL}${path}`, {
+      cache: "no-store",
+      headers: forwarded,
+      // A backend that accepts the connection but never answers must end in
+      // the error state too, not in a page that loads forever.
+      signal: AbortSignal.timeout(BACKEND_READ_TIMEOUT_MS),
+    });
   } catch (err) {
     unstable_rethrow(err);
     throw new BackendError(path, null, err instanceof Error ? err.message : String(err));

@@ -72,7 +72,7 @@ export default async function HomePage() {
                         {s.task_type}, {formatRelativeTime(s.submitted_at)}, agent {truncateMiddle(s.agent_id, 4, 4)}
                       </p>
                     </div>
-                    <VerdictBadge status={s.status} resolutionMethod={s.resolution_method} />
+                    <VerdictBadge status={s.status} resolutionMethod={s.resolution_method} compact align="end" />
                   </Link>
                 </li>
               ))}

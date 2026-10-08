@@ -18,12 +18,22 @@ export function describeVerdict(
   status: SubmissionStatus,
   method: SubmissionResolutionMethod | null | undefined,
   hasChallenge: boolean
-): { label: string; tone: Tone; mechanism: string } {
+): { label: string; tone: Tone; mechanism: string; short: string } {
   switch (status) {
     case "pending":
-      return { label: "Pending", tone: "pending", mechanism: "Awaiting replay consensus or the end of its challenge window" };
+      return {
+        label: "Pending",
+        tone: "pending",
+        mechanism: "Awaiting replay consensus or the end of its challenge window",
+        short: "Awaiting consensus",
+      };
     case "disputed":
-      return { label: "Disputed", tone: "disputed", mechanism: "Challenge open, awaiting replay consensus" };
+      return {
+        label: "Disputed",
+        tone: "disputed",
+        mechanism: "Challenge open, awaiting replay consensus",
+        short: "Challenge open",
+      };
     case "expired_unverified":
       return {
         label: "Expired, unverified",
@@ -31,6 +41,7 @@ export function describeVerdict(
         mechanism: hasChallenge
           ? "Challenge expired without a replay consensus. Both bonds returned."
           : "Window closed with a mismatch reported but no quorum. Bond returned.",
+        short: "No consensus reached",
       };
     case "verified":
       if (method === "window_elapsed") {
@@ -38,6 +49,7 @@ export function describeVerdict(
           label: "Verified by default",
           tone: "neutral",
           mechanism: "Unchallenged when its window closed. Not replayed to quorum.",
+          short: "Window elapsed, not replayed",
         };
       }
       break;
@@ -46,29 +58,42 @@ export function describeVerdict(
   }
   const label = status === "verified" ? "Verified" : "Slashed";
   const tone: Tone = status === "verified" ? "verified" : "slashed";
-  if (method === "zk_proof") return { label, tone, mechanism: "Cryptographic ZK proof" };
+  if (method === "zk_proof") return { label, tone, mechanism: "Cryptographic ZK proof", short: "ZK proof" };
   if (method === "reexecution_consensus") {
-    return { label, tone, mechanism: "Bonded re-execution consensus, not a cryptographic proof" };
+    return {
+      label,
+      tone,
+      mechanism: "Bonded re-execution consensus, not a cryptographic proof",
+      short: "Re-execution consensus",
+    };
   }
   // Finalized on-chain, but the method has not been mirrored from the
   // contract yet. Say nothing rather than guess.
-  return { label, tone, mechanism: "Finalized on-chain" };
+  return { label, tone, mechanism: "Finalized on-chain", short: "Finalized on-chain" };
 }
 
+/** `compact` is for rows in a list: the same verdict and the same method,
+ * in a few words. The full sentence belongs on the submission's own page. */
 export function VerdictBadge({
   status,
   resolutionMethod,
   hasChallenge = false,
+  compact = false,
+  align = "start",
 }: {
   status: SubmissionStatus;
   resolutionMethod?: SubmissionResolutionMethod | null;
   hasChallenge?: boolean;
+  compact?: boolean;
+  align?: "start" | "end";
 }) {
-  const { label, tone, mechanism } = describeVerdict(status, resolutionMethod, hasChallenge);
+  const { label, tone, mechanism, short } = describeVerdict(status, resolutionMethod, hasChallenge);
   return (
-    <div className="inline-flex flex-col gap-1">
+    <div className={`inline-flex flex-col gap-1 ${align === "end" ? "items-end text-right" : "items-start"}`}>
       <Badge tone={tone}>{label}</Badge>
-      <span className="max-w-xs text-xs text-text-tertiary">{mechanism}</span>
+      <span className={`text-xs text-text-tertiary ${compact ? "whitespace-nowrap" : "max-w-xs"}`}>
+        {compact ? short : mechanism}
+      </span>
     </div>
   );
 }

@@ -9,6 +9,11 @@ export const TESTNET_EXPLORER_ACCOUNT = (account: string) =>
   `https://stellar.expert/explorer/testnet/account/${account}`;
 export const TESTNET_EXPLORER_CONTRACT = (id: string) =>
   `https://stellar.expert/explorer/testnet/contract/${id}`;
+/** How long a server-side call to the backend may take before the page gives
+ * up and shows its error state. Transaction relays wait for confirmation
+ * on-chain (up to ~45s in the backend), so actions get longer than reads. */
+export const BACKEND_READ_TIMEOUT_MS = 20_000;
+export const BACKEND_ACTION_TIMEOUT_MS = 90_000;
 export const FREIGHTER_INSTALL_URL = "https://www.freighter.app/";
 /** Testnet faucet. Server-side only: /api/friendbot calls it for the
  * signed-in account. */

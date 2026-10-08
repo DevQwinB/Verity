@@ -125,7 +125,7 @@ export default async function SubmissionsPage({
                     </div>
                     <div className="flex items-center gap-6">
                       <p className="font-mono text-sm">{stroopsToXlm(s.bond_amount)} XLM bond</p>
-                      <VerdictBadge status={s.status} resolutionMethod={s.resolution_method} />
+                      <VerdictBadge status={s.status} resolutionMethod={s.resolution_method} compact align="end" />
                     </div>
                   </CardBody>
                 </Card>

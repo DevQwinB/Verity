@@ -66,6 +66,7 @@ export default async function SubmissionDetailPage({
           status={submission.status}
           resolutionMethod={submission.resolution_method}
           hasChallenge={challenge !== null}
+          align="end"
         />
       </div>
 
