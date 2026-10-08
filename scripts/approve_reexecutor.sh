@@ -13,6 +13,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/_deployment.sh
 source "$ROOT_DIR/scripts/_deployment.sh"
 require_deployment
+assert_identities_match
 
 ACCOUNT="${1:-}"
 MODE="${2:-}"

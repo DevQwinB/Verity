@@ -30,8 +30,8 @@ VERITY_DEPLOYMENT=public scripts/bootstrap_reexecutors.sh
 
 The first command deploys a fresh EscrowGate and ZKVerifierRegistry, each
 configured in the same transaction that creates it, and writes
-`deployments/public.json`. It creates the identities `public-deployer` (the
-contract admin), `public-keeper` and `public-rex1..5`. The second stakes the
+`deployments/public.json`. It creates the identities `verity-public-deployer` (the
+contract admin), `verity-public-keeper` and `verity-public-rex1..5`. The second stakes the
 five re-executors and approves them as voters.
 
 `--public` marks the deployment so that `pnpm dev` and `pnpm smoke` refuse to
@@ -58,16 +58,16 @@ Fill it in from `deployments/public.json` and your keystore:
 | `WEB_AUTH_DOMAIN`, `HOME_DOMAIN` | The public host of the **API**, e.g. `api.verity.example` |
 | `POSTGRES_PASSWORD` | `openssl rand -hex 24` |
 | `JWT_SECRET` | `openssl rand -hex 32` |
-| `KEEPER_SECRET_KEY` | `stellar keys secret public-keeper` |
-| `SEP10_SIGNING_SECRET` | `stellar keys generate public-sep10 && stellar keys secret public-sep10` |
-| `REX1..5_SECRET_KEY` | `stellar keys secret public-rex1` … `public-rex5` |
+| `KEEPER_SECRET_KEY` | `stellar keys secret verity-public-keeper` |
+| `SEP10_SIGNING_SECRET` | `stellar keys generate verity-public-sep10 && stellar keys secret verity-public-sep10` |
+| `REX1..5_SECRET_KEY` | `stellar keys secret verity-public-rex1` … `verity-public-rex5` |
 
-The **admin key (`public-deployer`) does not go on the server.** It is only
+The **admin key (`verity-public-deployer`) does not go on the server.** It is only
 used from your own machine, to approve re-executors and change contract
 configuration.
 
 Keep the keeper account funded: it pays the fee for every finalize, challenge
-resolution and lock release. `stellar keys fund public-keeper --network testnet`
+resolution and lock release. `stellar keys fund verity-public-keeper --network testnet`
 tops it up.
 
 ## 3. Start it
@@ -139,7 +139,7 @@ state-changing call extends them, so a deployment in use looks after itself.
 After a long idle spell, extend them explicitly:
 
 ```bash
-stellar contract extend --id <ESCROW_GATE_CONTRACT_ID> --source public-keeper \
+stellar contract extend --id <ESCROW_GATE_CONTRACT_ID> --source verity-public-keeper \
   --network testnet --durability persistent --ledgers-to-extend 500000
 ```
 

@@ -4,8 +4,16 @@
 #                                        smoke deployment, identities deployer,
 #                                        keeper, rex1..rex5
 #   VERITY_DEPLOYMENT=<name>             deployments/<name>.json, identities
-#                                        <name>-deployer, <name>-keeper,
-#                                        <name>-rex1..rex5
+#                                        verity-<name>-deployer,
+#                                        verity-<name>-keeper,
+#                                        verity-<name>-rex1..rex5
+#
+# The stellar-cli keystore is one flat namespace shared by every project on
+# the machine, and another project that generates an identity called "keeper"
+# or "deployer" silently replaces yours. Named deployments are therefore
+# prefixed with "verity-"; the dev deployment keeps its short historical
+# aliases, and every script checks them against the deployment record (see
+# assert_identities_match) so a replaced key is reported, not used.
 #
 # Every deployment lives on Stellar testnet; the name separates contracts and
 # keys, not networks. A deployment whose file says "public": true is one real
@@ -21,7 +29,7 @@ fi
 if [ "$DEPLOYMENT" = testnet ]; then
   ALIAS_PREFIX=""
 else
-  ALIAS_PREFIX="$DEPLOYMENT-"
+  ALIAS_PREFIX="verity-$DEPLOYMENT-"
 fi
 
 NETWORK=testnet
@@ -41,6 +49,41 @@ require_deployment() {
   if [ ! -f "$DEPLOY_JSON" ]; then
     echo "FATAL: $DEPLOY_JSON not found — run scripts/deploy_testnet.sh first" >&2
     exit 1
+  fi
+}
+
+# Fails if the deployer or a fleet re-executor in the keystore is no longer
+# the account the deployment record names: the deployer is the contract's
+# admin and each re-executor holds a stake, so a different key under the same
+# alias cannot stand in for them. The keeper is different — it has no
+# authority on-chain and any funded account can do its job — so a changed
+# keeper is reported and the keystore's current one is used.
+assert_identities_match() {
+  local problems=0 recorded current alias
+  recorded="$(json_field deployer_public_key)"
+  current="$(stellar keys address "$DEPLOYER" 2>/dev/null || true)"
+  if [ -n "$recorded" ] && [ "$recorded" != "$current" ]; then
+    echo "FATAL: keystore identity '$DEPLOYER' is ${current:-missing}, but the admin of deployment '$DEPLOYMENT' is $recorded." >&2
+    problems=1
+  fi
+  for alias in "${BOOTSTRAP_REEXECUTORS[@]}"; do
+    recorded="$(grep -o "{\"alias\":\"$alias\",\"public_key\":\"[^\"]*\"" "$DEPLOY_JSON" | cut -d'"' -f8)"
+    current="$(stellar keys address "$alias" 2>/dev/null || true)"
+    if [ -n "$recorded" ] && [ -n "$current" ] && [ "$recorded" != "$current" ]; then
+      echo "FATAL: keystore identity '$alias' is $current, but deployment '$DEPLOYMENT' staked $recorded under that name." >&2
+      problems=1
+    fi
+  done
+  if [ "$problems" = 1 ]; then
+    echo "       Another project has probably generated an identity with the same name. Restore the" >&2
+    echo "       original key into the keystore, or redeploy (scripts/deploy_testnet.sh --force)." >&2
+    exit 1
+  fi
+  recorded="$(json_field keeper_public_key)"
+  current="$(stellar keys address "$KEEPER" 2>/dev/null || true)"
+  if [ -n "$recorded" ] && [ -n "$current" ] && [ "$recorded" != "$current" ]; then
+    echo "WARN: keystore identity '$KEEPER' is $current, not the $recorded recorded at deploy time." >&2
+    echo "      The keeper needs no authority on-chain, so this one is used; verdict attestations will be signed by it." >&2
   fi
 }
 

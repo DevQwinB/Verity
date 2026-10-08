@@ -112,6 +112,14 @@ windows, used by `pnpm dev` and `pnpm smoke`. A deployment for other people is
 separate, with its own contracts and keys — see [`docs/DEPLOY.md`](docs/DEPLOY.md).
 `VERITY_DEPLOYMENT=<name>` selects `deployments/<name>.json` in every script.
 
+The stellar-cli keystore is one flat namespace shared by every project on your
+machine. The dev deployment uses the short aliases `deployer`, `keeper` and
+`rex1`…`rex5`; if another project generates an identity under one of those
+names, it replaces yours. The scripts compare the keystore with
+`deployments/testnet.json` and stop if the admin or a staked re-executor is no
+longer the recorded account (a replaced keeper is only reported: it holds no
+authority on-chain). Named deployments use `verity-<name>-…` aliases.
+
 Secrets stay in your stellar-cli keystore. `pnpm dev` reads them at start-up
 and passes them to each process through its environment. The only secrets it
 writes to disk are in `backend/.env` (gitignored), and only if that file does
@@ -245,3 +253,8 @@ Webhooks (HMAC-SHA256 in `x-verity-signature`): `submission.verified`,
 - **False-accept rate** needs a manual audit sample and is reported as `null`.
 - **One backend instance** runs the indexer and keeper; artifacts are on its
   local disk; webhooks are delivered once with no retry.
+- **Containers.** The three images build, and the full stack has been run
+  from them (Postgres, migrations, backend, three re-executors, dashboard)
+  and passed the smoke test, using podman with the services started one by
+  one. `docker-compose.yml` describes the same services but has not itself
+  been executed: the machine this was developed on has no compose provider.

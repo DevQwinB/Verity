@@ -22,6 +22,7 @@ cd "$ROOT_DIR"
 source "$ROOT_DIR/scripts/_deployment.sh"
 require_deployment
 refuse_public_deployment "pnpm dev is the local development runner; a public deployment runs from the container stack (docs/DEPLOY.md)."
+assert_identities_match
 
 API_PORT="${VERITY_API_PORT:-3001}"
 WEB_PORT="${VERITY_WEB_PORT:-3000}"

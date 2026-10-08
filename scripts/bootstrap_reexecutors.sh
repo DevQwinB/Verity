@@ -14,6 +14,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/_deployment.sh
 source "$ROOT_DIR/scripts/_deployment.sh"
 require_deployment
+assert_identities_match
 
 STAKE_AMOUNT=10000000000 # 1,000 XLM in stroops — comfortably above min_stake_floor
 
