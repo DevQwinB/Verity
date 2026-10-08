@@ -14,26 +14,33 @@ enum DataKey {
     VerifierList,
 }
 
+// All registry state lives in instance storage; keep it (and the code) from
+// being archived while the registry is in use.
+const BUMP_THRESHOLD: u32 = 100_000;
+const BUMP_TO: u32 = 500_000;
+
+fn bump_instance(e: &Env) {
+    e.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+}
+
 #[contract]
 pub struct ZkVerifierRegistry;
 
 #[contractimpl]
 impl ZkVerifierRegistry {
-    pub fn initialize(e: Env, admin: Address) -> Result<(), Error> {
-        if e.storage().instance().has(&DataKey::Admin) {
-            return Err(Error::AlreadyInitialized);
-        }
-        admin.require_auth();
+    /// Runs once, atomically with deployment, so nobody but the deployer can
+    /// ever claim the admin role.
+    pub fn __constructor(e: Env, admin: Address) {
         e.storage().instance().set(&DataKey::Admin, &admin);
         e.storage()
             .instance()
             .set(&DataKey::VerifierList, &Vec::<Symbol>::new(&e));
-        Ok(())
     }
 
     /// Additive-only, admin-gated capability grant: which proof systems
-    /// *exist*, never a per-dispute verdict override (that authority lives
-    /// entirely in EscrowGate and never touches this contract's admin).
+    /// *exist*. EscrowGate does not consult this registry in Phase 1 — its
+    /// resolve_challenge rejects ZkProof outright — so registering a verifier
+    /// here cannot decide a dispute.
     pub fn register_verifier(
         e: Env,
         admin: Address,
@@ -57,6 +64,7 @@ impl ZkVerifierRegistry {
             .unwrap_or(Vec::new(&e));
         list.push_back(proof_system.clone());
         e.storage().instance().set(&DataKey::VerifierList, &list);
+        bump_instance(&e);
 
         VerifierRegistered { proof_system, verifier_contract }.publish(&e);
         Ok(())
@@ -83,6 +91,7 @@ impl ZkVerifierRegistry {
             }
         }
         e.storage().instance().set(&DataKey::VerifierList, &new_list);
+        bump_instance(&e);
 
         VerifierDeregistered { proof_system }.publish(&e);
         Ok(())
@@ -91,10 +100,10 @@ impl ZkVerifierRegistry {
     /// There is no code path here that returns `true` for an unregistered
     /// proof system, for any input, including empty/garbage/malformed proof
     /// bytes, or bytes valid for a different registered system — this is the
-    /// concrete mechanism behind invariant 4. If registered (Phase 2 only,
-    /// never true in this deployment — see list_verifiers), this performs a
-    /// real cross-contract call into the registered verifier and returns its
-    /// boolean unmodified; the registry never fabricates a result itself.
+    /// concrete mechanism behind invariant 4. If registered (Phase 2 only),
+    /// this performs a real cross-contract call into the registered verifier
+    /// and returns its boolean unmodified; the registry never fabricates a
+    /// result itself.
     pub fn verify_proof(
         e: Env,
         proof_system: Symbol,
@@ -108,10 +117,7 @@ impl ZkVerifierRegistry {
             .ok_or(Error::VerifierNotRegistered)?;
 
         // Convention for a registered Phase-2 verifier contract: a `verify`
-        // function taking (submission_id, proof) and returning bool. No such
-        // contract is registered in this deployment, so this call is never
-        // reached on testnet today; it exists so integrating a real verifier
-        // later is a config change (register_verifier), not a redeploy.
+        // function taking (submission_id, proof) and returning bool.
         let accepted: bool = e.invoke_contract(
             &verifier,
             &Symbol::new(&e, "verify"),

@@ -27,6 +27,15 @@ pub struct ReexecutorStakeWithdrawn {
     #[topic]
     pub reexecutor: Address,
     pub new_stake: i128,
+    pub active: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReexecutorApprovalChanged {
+    #[topic]
+    pub reexecutor: Address,
+    pub approved: bool,
 }
 
 #[contractevent]

@@ -776,7 +776,6 @@ dependencies = [
  "proptest",
  "soroban-sdk",
  "verity-common",
- "zk-verifier-registry",
 ]
 
 [[package]]

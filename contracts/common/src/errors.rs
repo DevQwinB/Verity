@@ -23,6 +23,7 @@ pub enum Error {
     ReexecutorAlreadyRegistered = 24,
     AttestationAlreadyReleased = 25,
     SubmissionNotFinalized = 26,
+    ReexecutorNotApproved = 27,
 
     ChallengeAlreadyOpen = 30,
     ChallengeNotFound = 31,
@@ -36,6 +37,7 @@ pub enum Error {
     PartyNotOnWrongSide = 42,
     InsufficientConsensus = 44,
     InvalidResolutionMethod = 45,
+    NotSlashable = 46,
 
     VerifierNotRegistered = 50,
     VerifierAlreadyRegistered = 51,

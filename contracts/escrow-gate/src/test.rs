@@ -5,8 +5,7 @@ use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token, Address, BytesN, Env,
 };
-use verity_common::{ConfigRecord, Error, ResolutionMethod, TaskType, Verdict};
-use zk_verifier_registry::{ZkVerifierRegistry, ZkVerifierRegistryClient};
+use verity_common::{ConfigRecord, Error, Resolution, ResolutionMethod, TaskType, Verdict};
 
 const STROOP: i128 = 1;
 const XLM: i128 = 10_000_000 * STROOP;
@@ -22,6 +21,8 @@ fn default_config() -> ConfigRecord {
         window_tier_small_s: 3600,
         window_tier_large_s: 86_400,
         slash_split_challenger_bps: 2000,
+        reexecutor_slash_bps: 1000,
+        reexecutor_allowlist: false,
     }
 }
 
@@ -34,15 +35,18 @@ struct World<'a> {
 }
 
 fn setup(e: &Env) -> World<'_> {
+    setup_with(e, default_config())
+}
+
+fn setup_with(e: &Env, config: ConfigRecord) -> World<'_> {
     e.mock_all_auths();
     let admin = Address::generate(e);
     let sac = e.register_stellar_asset_contract_v2(admin.clone());
     let token = token::Client::new(e, &sac.address());
     let token_admin = token::StellarAssetClient::new(e, &sac.address());
 
-    let id = e.register(EscrowGate, ());
+    let id = e.register(EscrowGate, (admin.clone(), sac.address(), config));
     let client = EscrowGateClient::new(e, &id);
-    client.initialize(&admin, &sac.address(), &default_config());
 
     World { e: e.clone(), client, admin, token, token_admin }
 }
@@ -201,6 +205,39 @@ fn window_elapsed_with_no_consensus_and_no_challenge_defaults_verified() {
     let verdict = w.client.finalize(&id);
     assert_eq!(verdict, Verdict::Verified);
     assert_eq!(w.token.balance(&agent), 1000 * XLM);
+
+    // Nobody replayed this to quorum, and the record must say so.
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!(sub.resolution_method, ResolutionMethod::WindowElapsed);
+    // A default verdict proves nobody wrong.
+    assert_eq!(w.client.try_slash(&rex1, &id), Err(Ok(Error::NotSlashable)));
+}
+
+#[test]
+fn window_elapsed_with_a_mismatch_vote_expires_unverified_and_slashes_nobody() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    // One re-executor reports a mismatch; quorum is never reached.
+    let rex1 = Address::generate(&e);
+    register_rex(&w, &rex1);
+    w.client.attest_replay(&rex1, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+
+    e.ledger().set_timestamp(e.ledger().timestamp() + 3601);
+    // Contested but unsettled: not Verified, and not Slashed either.
+    assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!(sub.resolution_method, ResolutionMethod::WindowElapsed);
+    assert_eq!(w.token.balance(&agent), 1000 * XLM); // bond returned, nothing forfeited
+
+    // The lone honest voter keeps every stroop, by either route.
+    assert_eq!(w.client.try_slash(&rex1, &id), Err(Ok(Error::NotSlashable)));
+    w.client.release_attestation_lock(&id, &rex1);
+    let info = w.client.reexecutor_info(&rex1).unwrap();
+    assert_eq!(info.stake_amount, 600 * XLM);
+    assert_eq!(info.open_attestations, 0);
 }
 
 // ---- invariant 3: finalize is idempotent and irreversible ----
@@ -241,16 +278,16 @@ fn open_challenge_after_finalize_is_rejected() {
 // ---- invariant 2: slash derives authority only from already-committed state ----
 
 #[test]
-fn slash_called_by_admin_has_no_special_power() {
+fn slash_before_finalize_is_rejected() {
     let e = Env::default();
     let w = setup(&e);
     let agent = Address::generate(&e);
     let id = submit_default(&w, &agent);
 
-    // Not finalized yet — even the admin cannot slash.
+    // Not finalized yet — nobody can slash, whoever sends the transaction.
     let rex1 = Address::generate(&e);
     register_rex(&w, &rex1);
-    let res = w.client.try_slash(&w.admin, &rex1, &id, &XLM);
+    let res = w.client.try_slash(&rex1, &id);
     assert!(matches!(res, Err(Ok(Error::SubmissionNotFinalized))));
 }
 
@@ -273,9 +310,8 @@ fn slash_requires_the_target_to_actually_be_on_the_wrong_side() {
     assert_eq!(verdict, Verdict::Verified);
 
     // rex1 voted "matched" (the correct side, since verdict is Verified) —
-    // slashing them must fail regardless of who calls it, including admin.
-    let random_caller = Address::generate(&e);
-    let res = w.client.try_slash(&random_caller, &rex1, &id, &XLM);
+    // slashing them must fail regardless of who calls it.
+    let res = w.client.try_slash(&rex1, &id);
     assert!(matches!(res, Err(Ok(Error::PartyNotOnWrongSide)))); // never on-chain state says otherwise
 }
 
@@ -299,14 +335,114 @@ fn slash_succeeds_against_a_provably_wrong_voter_after_mismatch_consensus() {
     let verdict = w.client.finalize(&id);
     assert_eq!(verdict, Verdict::Slashed);
 
-    let any_random_keeper = Address::generate(&e);
-    w.client.slash(&any_random_keeper, &rex1, &id, &(100 * XLM));
+    // The amount is the configured 10% of stake — the caller has no say in
+    // it, so a wrong-side voter cannot slash themselves for a token amount
+    // and walk away immune.
+    let admin_before = w.token.balance(&w.admin);
+    assert_eq!(w.client.slash(&rex1, &id), 60 * XLM);
     let info = w.client.reexecutor_info(&rex1).unwrap();
-    assert_eq!(info.stake_amount, 500 * XLM); // 600 - 100
+    assert_eq!(info.stake_amount, 540 * XLM); // 600 - 10%
+    assert_eq!(w.token.balance(&w.admin), admin_before + 60 * XLM); // no challenger to share with
 
     // Cannot slash the same party twice for the same submission.
-    let res = w.client.try_slash(&any_random_keeper, &rex1, &id, &XLM);
+    let res = w.client.try_slash(&rex1, &id);
     assert!(matches!(res, Err(Ok(Error::AlreadySlashed))));
+}
+
+#[test]
+fn releasing_the_lock_slashes_a_wrong_voter_first() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let wrong = Address::generate(&e);
+    let right1 = Address::generate(&e);
+    let right2 = Address::generate(&e);
+    for r in [&wrong, &right1, &right2] {
+        register_rex(&w, r);
+    }
+    w.client.attest_replay(&wrong, &id, &BytesN::from_array(&e, &[9u8; 32]), &true);
+    w.client.attest_replay(&right1, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    w.client.attest_replay(&right2, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+
+    // The wrong voter races to unlock and withdraw before anyone slashes
+    // them. Unlocking is the only way out, and it takes the slash with it.
+    w.client.release_attestation_lock(&id, &wrong);
+    let info = w.client.reexecutor_info(&wrong).unwrap();
+    assert_eq!(info.stake_amount, 540 * XLM);
+    assert_eq!(info.open_attestations, 0);
+    // The pre-slash balance is gone; only what is left can leave.
+    assert_eq!(
+        w.client.try_withdraw_stake(&wrong, &(600 * XLM)),
+        Err(Ok(Error::InvalidAmount))
+    );
+    w.client.withdraw_stake(&wrong, &(540 * XLM));
+    assert_eq!(w.client.try_slash(&wrong, &id), Err(Ok(Error::AlreadySlashed)));
+
+    // A voter on the right side unlocks with their stake intact.
+    w.client.release_attestation_lock(&id, &right1);
+    assert_eq!(w.client.reexecutor_info(&right1).unwrap().stake_amount, 600 * XLM);
+}
+
+#[test]
+fn reexecutor_slash_pays_only_a_challenger_who_won() {
+    // Upheld challenge: the prevailing challenger shares in the stake of a
+    // re-executor who backed the bad submission.
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    w.client.open_challenge(&challenger, &id, &(50 * XLM));
+
+    let backer = Address::generate(&e);
+    register_rex(&w, &backer);
+    w.client.attest_replay(&backer, &id, &BytesN::from_array(&e, &[9u8; 32]), &true);
+    for _ in 0..3 {
+        let r = Address::generate(&e);
+        register_rex(&w, &r);
+        w.client.attest_replay(&r, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    }
+    assert_eq!(
+        w.client.resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+        Verdict::Slashed
+    );
+    let challenger_before = w.token.balance(&challenger);
+    let admin_before = w.token.balance(&w.admin);
+    assert_eq!(w.client.slash(&backer, &id), 60 * XLM);
+    assert_eq!(w.token.balance(&challenger), challenger_before + 12 * XLM); // 20% of 60
+    assert_eq!(w.token.balance(&w.admin), admin_before + 48 * XLM);
+
+    // Rejected challenge: the challenger lost, so the stake of a re-executor
+    // who happened to agree with them goes to the treasury alone.
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    w.client.open_challenge(&challenger, &id, &(50 * XLM));
+
+    let dissenter = Address::generate(&e);
+    register_rex(&w, &dissenter);
+    w.client.attest_replay(&dissenter, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    for _ in 0..3 {
+        let r = Address::generate(&e);
+        register_rex(&w, &r);
+        w.client.attest_replay(&r, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+    }
+    assert_eq!(
+        w.client.resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+        Verdict::Verified
+    );
+    let challenger_before = w.token.balance(&challenger);
+    let admin_before = w.token.balance(&w.admin);
+    assert_eq!(w.client.slash(&dissenter, &id), 60 * XLM);
+    assert_eq!(w.token.balance(&challenger), challenger_before);
+    assert_eq!(w.token.balance(&w.admin), admin_before + 60 * XLM);
 }
 
 // ---- invariant 5: bond proportionality holds across the i128 range without wrapping ----
@@ -350,31 +486,44 @@ fn bond_math_does_not_wrap_at_i128_extremes() {
     assert!(matches!(res_overflow, Err(Ok(Error::Overflow))), "expected a clean Overflow error, got {:?}", res_overflow);
 }
 
-// ---- invariant 4: ZKVerifierRegistry never default-accepts ----
+// ---- invariant 4: no path reports a ZK-verified result in Phase 1 ----
 
 #[test]
-#[should_panic]
-fn resolve_challenge_via_zk_proof_traps_against_empty_registry() {
+fn resolve_challenge_rejects_the_zk_proof_method() {
     let e = Env::default();
     let w = setup(&e);
     let agent = Address::generate(&e);
     let id = submit_default(&w, &agent);
 
-    let registry_id = e.register(ZkVerifierRegistry, ());
-    let registry_client = ZkVerifierRegistryClient::new(&e, &registry_id);
-    registry_client.initialize(&w.admin);
-    assert_eq!(registry_client.list_verifiers().len(), 0);
-    w.client.set_zk_registry(&w.admin, &registry_id);
-
     let challenger = Address::generate(&e);
     fund(&w, &challenger, 1000 * XLM);
     w.client.open_challenge(&challenger, &id, &(50 * XLM));
+    for _ in 0..3 {
+        let r = Address::generate(&e);
+        register_rex(&w, &r);
+        w.client.attest_replay(&r, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    }
 
-    // The registry has zero registered verifiers, so this must trap rather
-    // than fabricate a ZK-verified result — that is the whole point of
-    // invariant 4, and #[should_panic] is how a cross-contract trap surfaces
-    // in a test.
-    w.client.resolve_challenge(&id, &ResolutionMethod::ZkProof);
+    // resolve_challenge carries no proof, so there is nothing a ZK path could
+    // check. It must refuse rather than take anyone's word for one — and
+    // leave the challenge exactly as it was.
+    assert_eq!(
+        w.client.try_resolve_challenge(&id, &ResolutionMethod::ZkProof),
+        Err(Ok(Error::InvalidResolutionMethod))
+    );
+    assert_eq!(
+        w.client.try_resolve_challenge(&id, &ResolutionMethod::WindowElapsed),
+        Err(Ok(Error::InvalidResolutionMethod))
+    );
+    let chal = w.client.get_challenge(&id).unwrap();
+    assert_eq!(chal.resolution, Resolution::None);
+    assert!(!w.client.get_submission(&id).unwrap().finalized);
+
+    // The real path still works afterwards.
+    assert_eq!(
+        w.client.resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+        Verdict::Slashed
+    );
 }
 
 // ---- challenge flow end to end ----
@@ -468,9 +617,10 @@ fn unresolvable_challenge_expires_and_returns_both_bonds() {
     // Terminal and idempotent like every other verdict; nobody is slashable.
     assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
     assert_eq!(
-        w.client.try_slash(&w.admin, &rex, &id, &(10 * XLM)),
-        Err(Ok(Error::NotUpheldResolution))
+        w.client.get_submission(&id).unwrap().resolution_method,
+        ResolutionMethod::WindowElapsed
     );
+    assert_eq!(w.client.try_slash(&rex, &id), Err(Ok(Error::NotSlashable)));
 }
 
 #[test]
@@ -530,6 +680,116 @@ fn withdraw_is_blocked_below_floor_while_attestation_is_open_then_unlocks_after_
     w.client.withdraw_stake(&rex1, &(500 * XLM));
     let info = w.client.reexecutor_info(&rex1).unwrap();
     assert_eq!(info.stake_amount, 0);
+}
+
+// ---- voter allow-list ----
+
+#[test]
+fn allowlist_gates_who_may_attest() {
+    let e = Env::default();
+    let w = setup_with(&e, ConfigRecord { reexecutor_allowlist: true, ..default_config() });
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    let vote = BytesN::from_array(&e, &[3u8; 32]);
+
+    let rex = Address::generate(&e);
+    // Approval is a property of a registered re-executor.
+    assert_eq!(
+        w.client.try_set_reexecutor_approved(&w.admin, &rex, &true),
+        Err(Ok(Error::ReexecutorNotActive))
+    );
+    register_rex(&w, &rex);
+    assert!(!w.client.reexecutor_info(&rex).unwrap().approved);
+
+    // Staked and active, but not approved: no vote.
+    assert_eq!(
+        w.client.try_attest_replay(&rex, &id, &vote, &true),
+        Err(Ok(Error::ReexecutorNotApproved))
+    );
+
+    // Only the admin can approve.
+    let stranger = Address::generate(&e);
+    assert_eq!(
+        w.client.try_set_reexecutor_approved(&stranger, &rex, &true),
+        Err(Ok(Error::NotAdmin))
+    );
+    w.client.set_reexecutor_approved(&w.admin, &rex, &true);
+    w.client.attest_replay(&rex, &id, &vote, &true);
+
+    // Approval survives a stake top-up, and revoking it stops further votes.
+    w.client.register_reexecutor(&rex, &(100 * XLM));
+    assert!(w.client.reexecutor_info(&rex).unwrap().approved);
+    w.client.set_reexecutor_approved(&w.admin, &rex, &false);
+    let id2 = submit_default(&w, &agent);
+    assert_eq!(
+        w.client.try_attest_replay(&rex, &id2, &vote, &true),
+        Err(Ok(Error::ReexecutorNotApproved))
+    );
+}
+
+#[test]
+fn allowlist_off_lets_any_active_staker_attest() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex);
+    assert!(!w.client.reexecutor_info(&rex).unwrap().approved);
+    w.client.attest_replay(&rex, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+}
+
+// ---- deployment and input guards ----
+
+#[test]
+fn submit_rejects_a_zero_bond_even_when_the_proportional_minimum_rounds_to_zero() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    fund(&w, &agent, 1000 * XLM);
+
+    // 5% of 10 stroops rounds down to 0, so the proportional check alone
+    // would wave a bond of nothing through.
+    let res = w.client.try_submit(
+        &agent,
+        &BytesN::from_array(&e, &[1u8; 32]),
+        &10,
+        &TaskType::Deterministic,
+        &BytesN::from_array(&e, &[2u8; 32]),
+        &BytesN::from_array(&e, &[3u8; 32]),
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::BondTooLow)));
+}
+
+#[test]
+#[should_panic]
+fn constructor_rejects_an_invalid_config() {
+    let e = Env::default();
+    setup_with(&e, ConfigRecord { reexecutor_slash_bps: 10_001, ..default_config() });
+}
+
+#[test]
+fn zero_slash_bps_disables_reexecutor_slashing() {
+    let e = Env::default();
+    let w = setup_with(&e, ConfigRecord { reexecutor_slash_bps: 0, ..default_config() });
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let wrong = Address::generate(&e);
+    register_rex(&w, &wrong);
+    w.client.attest_replay(&wrong, &id, &BytesN::from_array(&e, &[9u8; 32]), &true);
+    for _ in 0..2 {
+        let r = Address::generate(&e);
+        register_rex(&w, &r);
+        w.client.attest_replay(&r, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    }
+    assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+
+    assert_eq!(w.client.try_slash(&wrong, &id), Err(Ok(Error::NotSlashable)));
+    w.client.release_attestation_lock(&id, &wrong);
+    assert_eq!(w.client.reexecutor_info(&wrong).unwrap().stake_amount, 600 * XLM);
 }
 
 mod proptest_model;
