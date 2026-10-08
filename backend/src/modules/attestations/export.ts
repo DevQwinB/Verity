@@ -9,13 +9,20 @@ import { keeperKeypair } from "../../chain/keeper.js";
  * fabricated "successfully pushed to 8004" claim, since no real 8004
  * attestor registration exists yet for this deployment.
  */
-export async function exportAttestation(submissionId: string) {
+export async function exportAttestation(submissionId: string): Promise<boolean> {
   const submission = await db
     .selectFrom("submission")
     .selectAll()
     .where("id", "=", submissionId)
     .executeTakeFirstOrThrow();
-  if (submission.status !== "verified" && submission.status !== "slashed") return;
+  if (submission.status !== "verified" && submission.status !== "slashed") return false;
+
+  const challenge = await db
+    .selectFrom("challenge")
+    .select(["resolution_method"])
+    .where("submission_id", "=", submissionId)
+    .where("resolved_at", "is not", null)
+    .executeTakeFirst();
 
   const replays = await db
     .selectFrom("replay")
@@ -35,7 +42,7 @@ export async function exportAttestation(submissionId: string) {
     claim: {
       task_type: submission.task_type,
       verdict: submission.status,
-      resolution_method: "reexecution_consensus",
+      resolution_method: challenge?.resolution_method ?? "reexecution_consensus",
       evidence_refs: replays.map((r) => `replay:${r.id}`),
     },
     issued_at: new Date().toISOString(),
@@ -45,13 +52,17 @@ export async function exportAttestation(submissionId: string) {
   const canonical = JSON.stringify(payload);
   const signature = Buffer.from(keeperKeypair.sign(Buffer.from(canonical))).toString("base64");
 
-  await db
+  // One attestation per submission: returns false when one already exists.
+  const inserted = await db
     .insertInto("attestation_export")
     .values({
       submission_id: submissionId,
       target_registry: "stellar-8004",
-      payload,
+      payload: canonical,
       signature,
     })
-    .execute();
+    .onConflict((oc) => oc.doNothing())
+    .returning("id")
+    .executeTakeFirst();
+  return Boolean(inserted);
 }

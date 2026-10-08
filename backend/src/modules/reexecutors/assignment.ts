@@ -17,6 +17,10 @@ export async function assignReplayJobs(params: {
   submissionId: string;
   chainSubmissionId: string;
   taskType: "deterministic" | "retrieval" | "unverifiable";
+  /** Force a full replay quorum even for a retrieval task — used when a
+   * spot-check mismatches or a challenge is opened, where a single sampled
+   * vote can never reach on-chain consensus on its own. */
+  fullQuorum?: boolean;
 }) {
   if (params.taskType === "unverifiable") return;
 
@@ -43,7 +47,7 @@ export async function assignReplayJobs(params: {
     .sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : 0))
     .slice(0, Math.min(quorum, active.length));
 
-  if (params.taskType === "deterministic") {
+  if (params.taskType === "deterministic" || params.fullQuorum) {
     for (const { r } of ranked) {
       await db
         .insertInto("replay")
@@ -62,5 +66,39 @@ export async function assignReplayJobs(params: {
         .onConflict((oc) => oc.columns(["submission_id", "reexecutor_id"]).doNothing())
         .execute();
     }
+  }
+}
+
+/** Escalates a submission to a full replay quorum. Idempotent: re-executors
+ * that already hold a replay row (assigned or attested) are left untouched. */
+export async function escalateToFullReplay(submissionId: string) {
+  const sub = await db
+    .selectFrom("submission")
+    .selectAll()
+    .where("id", "=", submissionId)
+    .executeTakeFirst();
+  if (!sub?.chain_submission_id) return;
+  await assignReplayJobs({
+    submissionId: sub.id,
+    chainSubmissionId: sub.chain_submission_id,
+    taskType: sub.task_type,
+    fullQuorum: true,
+  });
+}
+
+/** PRD §5: a spot-check mismatch "flags every other unverified submission
+ * from that agent for review" — here, review means a full replay quorum
+ * instead of the sampled spot-check they would otherwise have received. */
+export async function escalateAgentPendingSubmissions(agentId: string, exceptSubmissionId: string) {
+  const others = await db
+    .selectFrom("submission")
+    .select(["id"])
+    .where("agent_id", "=", agentId)
+    .where("status", "=", "pending")
+    .where("chain_submission_id", "is not", null)
+    .where("id", "!=", exceptSubmissionId)
+    .execute();
+  for (const other of others) {
+    await escalateToFullReplay(other.id);
   }
 }

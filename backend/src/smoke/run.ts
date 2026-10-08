@@ -1,184 +1,258 @@
 import "dotenv/config";
 import { createHash } from "node:crypto";
 import { Keypair, TransactionBuilder } from "@stellar/stellar-sdk";
-import { basicNodeSigner } from "@stellar/stellar-sdk/contract";
-import { Client as EscrowGateClient } from "escrow-gate";
 import { env } from "../config/env.js";
 
 /**
- * Real, end-to-end proof that the system works: SEP-10 login, a real
- * submit() on testnet, real bootstrap re-executors replaying and
- * attesting on-chain, the indexer reconciling it, and finalize() producing
- * a real Verified/Slashed verdict backed by real tx hashes. No step here
- * is mocked — every "real" claim below is checked, not assumed.
+ * Real, end-to-end proof that the whole system works against Stellar
+ * testnet: SEP-10 login, artifact upload, a real submit(), real
+ * reexecutor-agent processes replaying and attesting on-chain, the indexer
+ * reconciling it, the keeper finalizing/resolving/settling. Nothing here is
+ * mocked, and this script never attests on a re-executor's behalf — it only
+ * plays the agent and the challenger, then watches what the system does.
+ *
+ * Prerequisite: the stack is running with re-executor agents
+ * (`pnpm dev`), i.e. at least quorum_min_reexecutors staked agents polling.
+ *
+ *   SMOKE_AGENT_SECRET       funded testnet account that submits work
+ *   SMOKE_CHALLENGER_SECRET  funded testnet account that opens a challenge
+ *   SMOKE_ONLY               optional comma-separated scenario names
  */
 
-const BASE = `http://localhost:${env.PORT}`;
+const BASE = process.env.SMOKE_BACKEND_URL ?? `http://127.0.0.1:${env.PORT}`;
+const XLM = 10_000_000n;
+
+function canonicalJson(value: unknown): string {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).filter((k) => obj[k] !== undefined).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(",")}}`;
+}
+const sha256 = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function call<T = any>(path: string, opts: { token?: string; body?: unknown; method?: string } = {}): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: opts.method ?? (opts.body !== undefined ? "POST" : "GET"),
+    headers: {
+      ...(opts.body !== undefined ? { "content-type": "application/json" } : {}),
+      ...(opts.token ? { authorization: `Bearer ${opts.token}` } : {}),
+    },
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`${path} -> ${res.status}: ${JSON.stringify(data)}`);
+  return data as T;
+}
 
 async function login(keypair: Keypair): Promise<string> {
-  const pub = keypair.publicKey();
-  const challengeRes = await fetch(`${BASE}/auth?account=${pub}`);
-  const { transaction } = (await challengeRes.json()) as { transaction: string };
+  const { transaction } = await call(`/auth?account=${keypair.publicKey()}`);
   const tx = TransactionBuilder.fromXDR(transaction, env.NETWORK_PASSPHRASE);
   tx.sign(keypair);
-  const verifyRes = await fetch(`${BASE}/auth`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ transaction: tx.toXDR() }),
-  });
-  const body = await verifyRes.json();
-  if (!body.token) throw new Error(`SEP-10 login failed for ${pub}: ${JSON.stringify(body)}`);
-  return body.token as string;
+  const { token } = await call("/auth", { body: { transaction: tx.toXDR() } });
+  return token;
 }
 
-async function uploadArtifact(token: string, content: Buffer): Promise<string> {
-  const res = await fetch(`${BASE}/v1/artifacts`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-    body: JSON.stringify({ content_base64: content.toString("base64") }),
-  });
-  const body = await res.json();
-  if (!res.ok) throw new Error(`artifact upload failed: ${JSON.stringify(body)}`);
-  return body.content_hash as string;
+function sign(unsignedXdr: string, keypair: Keypair): string {
+  const tx = TransactionBuilder.fromXDR(unsignedXdr, env.NETWORK_PASSPHRASE);
+  tx.sign(keypair);
+  return tx.toXDR();
 }
 
-async function relay(path: string, token: string, signedXdr: string) {
-  const res = await fetch(`${BASE}${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-    body: JSON.stringify({ signed_transaction_xdr: signedXdr }),
-  });
-  const body = await res.json();
-  if (!res.ok) throw new Error(`relay ${path} failed: ${JSON.stringify(body)}`);
-  return body;
+async function upload(token: string, content: string): Promise<{ content_hash: string; storage_ref: string }> {
+  return call("/v1/artifacts", { token, body: { content_base64: Buffer.from(content).toString("base64") } });
 }
+
+interface Actor {
+  keypair: Keypair;
+  token: string;
+}
+
+async function submit(
+  agent: Actor,
+  name: string,
+  task:
+    | { type: "deterministic"; functionSource: string; input: unknown; claimedOutput: unknown }
+    | { type: "retrieval"; spec: { url: string; pointer?: string }; claimedOutput: unknown }
+): Promise<string> {
+  const inputJson = canonicalJson(task.type === "deterministic" ? task.input : task.spec);
+  const input = await upload(agent.token, inputJson);
+  const outputJson = canonicalJson(task.claimedOutput);
+  const output = await upload(agent.token, outputJson);
+  const fn = task.type === "deterministic" ? await upload(agent.token, task.functionSource) : null;
+
+  const key = `smoke-${name}-${Date.now()}`;
+  const created = await call("/v1/submissions", {
+    token: agent.token,
+    body: {
+      escrow_ref: key,
+      task_type: task.type,
+      input_hash: input.content_hash,
+      input_ref: input.storage_ref,
+      claimed_output_hash: output.content_hash,
+      claimed_output_ref: output.storage_ref,
+      function_hash: fn?.content_hash,
+      function_ref: fn?.storage_ref,
+      escrow_value: String(100n * XLM),
+      bond_amount: String(5n * XLM),
+      idempotency_key: key,
+    },
+  });
+  const relayed = await call(`/v1/submissions/${created.submission.id}/relay`, {
+    token: agent.token,
+    body: { signed_transaction_xdr: sign(created.unsigned_transaction_xdr, agent.keypair) },
+  });
+  console.log(`  submit() tx ${relayed.tx_hash} -> on-chain submission #${relayed.submission.chain_submission_id}`);
+  return created.submission.id as string;
+}
+
+async function waitFor<T>(what: string, timeoutS: number, probe: () => Promise<T | null | undefined | false>): Promise<T> {
+  const deadline = Date.now() + timeoutS * 1000;
+  while (Date.now() < deadline) {
+    const value = await probe();
+    if (value) return value;
+    await sleep(3000);
+  }
+  throw new Error(`timed out after ${timeoutS}s waiting for: ${what}`);
+}
+
+const detail = (id: string) => call(`/v1/submissions/${id}`);
+
+async function expectVerdict(id: string, expected: "verified" | "slashed") {
+  const d = await waitFor(`terminal verdict on ${id}`, 180, async () => {
+    const cur = await detail(id);
+    return cur.submission.status === "verified" || cur.submission.status === "slashed" ? cur : null;
+  });
+  if (d.submission.status !== expected) throw new Error(`expected ${expected}, got ${d.submission.status}`);
+  // Settlement waits for the indexer to have recorded every on-chain vote,
+  // so the tally printed here is the complete one.
+  const settled = await waitFor(`settlement (attestation locks released) on ${id}`, 180, async () => {
+    const cur = await detail(id);
+    return cur.submission.settled_at ? cur : null;
+  });
+  const votes = settled.replays.filter((r: any) => r.status === "confirmed_onchain");
+  console.log(`  verdict=${expected} from ${votes.length} on-chain attestation(s): ${votes.map((r: any) => (r.match ? "match" : "mismatch")).join(", ")}`);
+  console.log("  settled: re-executor attestation locks released on-chain");
+  return settled;
+}
+
+const DOUBLE = "return { doubled: input.n * 2, source: 'replay' };";
+
+const scenarios: Record<string, (agent: Actor, challenger: Actor) => Promise<void>> = {
+  async "honest-deterministic"(agent) {
+    const id = await submit(agent, "honest", {
+      type: "deterministic",
+      functionSource: DOUBLE,
+      input: { n: 21 },
+      // Key order deliberately differs from the function's — canonical
+      // hashing must make that irrelevant.
+      claimedOutput: { source: "replay", doubled: 42 },
+    });
+    await expectVerdict(id, "verified");
+  },
+
+  async "dishonest-deterministic"(agent) {
+    const id = await submit(agent, "dishonest", {
+      type: "deterministic",
+      functionSource: DOUBLE,
+      input: { n: 21 },
+      claimedOutput: { source: "replay", doubled: 9000 },
+    });
+    await expectVerdict(id, "slashed");
+  },
+
+  async "challenged-honest"(agent, challenger) {
+    const id = await submit(agent, "challenged", {
+      type: "deterministic",
+      functionSource: DOUBLE,
+      input: { n: 4 },
+      claimedOutput: { doubled: 8, source: "replay" },
+    });
+    const built = await call(`/v1/submissions/${id}/challenge`, {
+      token: challenger.token,
+      body: { bond: String(5n * XLM) },
+    });
+    const relayed = await call(`/v1/submissions/${id}/challenge/relay`, {
+      token: challenger.token,
+      body: { signed_transaction_xdr: sign(built.unsigned_transaction_xdr, challenger.keypair) },
+    });
+    console.log(`  open_challenge() tx ${relayed.tx_hash}`);
+    await waitFor("indexer to record the challenge", 60, async () => (await detail(id)).challenge);
+    const d = await expectVerdict(id, "verified");
+    const challenge = (await detail(id)).challenge;
+    console.log(`  challenge resolution=${challenge.resolution} via ${challenge.resolution_method}`);
+    if (challenge.resolution !== "rejected") throw new Error(`expected challenge rejected, got ${challenge.resolution}`);
+    void d;
+  },
+
+  async "honest-retrieval"(agent) {
+    const id = await submit(agent, "retrieval-ok", {
+      type: "retrieval",
+      spec: { url: "https://horizon-testnet.stellar.org/", pointer: "/network_passphrase" },
+      claimedOutput: env.NETWORK_PASSPHRASE,
+    });
+    const check = await waitFor("spot-check result", 120, async () => {
+      const d = await detail(id);
+      return d.spot_checks.find((s: any) => s.result) ?? null;
+    });
+    console.log(`  spot-check result=${check.result} (sampled re-executor re-fetched the endpoint and attested on-chain)`);
+    if (check.result !== "match") throw new Error(`expected spot-check match, got ${check.result}`);
+    const d = await detail(id);
+    console.log(`  status=${d.submission.status} — optimistic: auto-verifies when its ${d.submission.challenge_window_s}s challenge window closes`);
+    if (d.submission.status !== "pending") throw new Error(`expected pending, got ${d.submission.status}`);
+  },
+
+  async "dishonest-retrieval"(agent) {
+    const id = await submit(agent, "retrieval-bad", {
+      type: "retrieval",
+      spec: { url: "https://horizon-testnet.stellar.org/", pointer: "/network_passphrase" },
+      claimedOutput: "a fabricated answer the agent never retrieved",
+    });
+    const d = await expectVerdict(id, "slashed");
+    const check = d.spot_checks.find((s: any) => s.result);
+    console.log(`  spot-check result=${check?.result} -> escalated to a full replay quorum`);
+    if (check?.result !== "mismatch") throw new Error("expected a spot-check mismatch to have triggered the escalation");
+  },
+};
 
 async function main() {
-  const txHashes: Record<string, string> = {};
-
-  const agent = Keypair.fromSecret(process.env.SMOKE_AGENT_SECRET!);
-  const rexSecrets = (process.env.SMOKE_REEXECUTOR_SECRETS ?? "").split(",").filter(Boolean);
-  const rexKeypairs = rexSecrets.map((s) => Keypair.fromSecret(s));
-
-  console.log(`[smoke] agent = ${agent.publicKey()}`);
-  console.log(`[smoke] ${rexKeypairs.length} candidate re-executors`);
-
-  const agentToken = await login(agent);
-  console.log("[smoke] agent SEP-10 login OK (real signature-verified JWT)");
-
-  // Re-register each candidate re-executor's backend Postgres row (idempotent
-  // additive stake top-up on-chain — real tx, harmless if already active).
-  for (const kp of rexKeypairs) {
-    const token = await login(kp);
-    const res = await fetch(`${BASE}/v1/reexecutors`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ stake_amount: "10000000" }),
-    });
-    const { reexecutor, unsigned_transaction_xdr } = await res.json();
-    const tx = TransactionBuilder.fromXDR(unsigned_transaction_xdr, env.NETWORK_PASSPHRASE);
-    tx.sign(kp);
-    const relayed = await relay(`/v1/reexecutors/${reexecutor.id}/relay`, token, tx.toXDR());
-    txHashes[`register_${kp.publicKey().slice(0, 6)}`] = relayed.tx_hash;
-    console.log(`[smoke] re-executor ${kp.publicKey()} registered/topped-up, tx=${relayed.tx_hash}`);
+  const agentSecret = process.env.SMOKE_AGENT_SECRET;
+  const challengerSecret = process.env.SMOKE_CHALLENGER_SECRET;
+  if (!agentSecret || !challengerSecret) {
+    throw new Error("SMOKE_AGENT_SECRET and SMOKE_CHALLENGER_SECRET are required (scripts/smoke.sh sets them from your stellar-cli identities)");
   }
+  const agentKp = Keypair.fromSecret(agentSecret);
+  const challengerKp = Keypair.fromSecret(challengerSecret);
+  const agent: Actor = { keypair: agentKp, token: await login(agentKp) };
+  const challenger: Actor = { keypair: challengerKp, token: await login(challengerKp) };
+  console.log(`[smoke] backend    ${BASE}`);
+  console.log(`[smoke] agent      ${agentKp.publicKey()}`);
+  console.log(`[smoke] challenger ${challengerKp.publicKey()}`);
 
-  // A trivial but real deterministic function + input, content-addressed.
-  const functionSource = "return { doubled: input.n * 2 };";
-  const input = { n: 21 };
-  const expectedOutput = { doubled: 42 };
-  const functionHash = await uploadArtifact(agentToken, Buffer.from(functionSource));
-  const inputHash = await uploadArtifact(agentToken, Buffer.from(JSON.stringify(input)));
-  const claimedOutputHash = createHash("sha256").update(JSON.stringify(expectedOutput)).digest("hex");
-  console.log(`[smoke] uploaded real artifacts: function=${functionHash} input=${inputHash}`);
+  const active = ((await call("/v1/reexecutors")) as any[]).filter((r) => r.active);
+  console.log(`[smoke] ${active.length} active re-executor(s) registered`);
+  if (active.length < 3) throw new Error("need at least 3 active re-executors — is `pnpm dev` running with its agents?");
 
-  const idempotencyKey = `smoke-${Date.now()}`;
-  const submitRes = await fetch(`${BASE}/v1/submissions`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${agentToken}` },
-    body: JSON.stringify({
-      escrow_ref: `smoke-escrow-${idempotencyKey}`,
-      task_type: "deterministic",
-      input_hash: createHash("sha256").update(JSON.stringify(input)).digest("hex"),
-      claimed_output_hash: claimedOutputHash,
-      function_ref: `.artifacts/${functionHash}`,
-      input_ref: `.artifacts/${inputHash}`,
-      escrow_value: "1000000000",
-      bond_amount: "50000000",
-      idempotency_key: idempotencyKey,
-    }),
-  });
-  const submitBody = await submitRes.json();
-  if (!submitRes.ok) throw new Error(`submission create failed: ${JSON.stringify(submitBody)}`);
-  const submissionRowId = submitBody.submission.id as string;
-  const submitTx = TransactionBuilder.fromXDR(submitBody.unsigned_transaction_xdr, env.NETWORK_PASSPHRASE);
-  submitTx.sign(agent);
-  const relayed = await relay(`/v1/submissions/${submissionRowId}/relay`, agentToken, submitTx.toXDR());
-  txHashes.submit = relayed.tx_hash;
-  console.log(`[smoke] real submit() on testnet: submission row=${submissionRowId} tx=${relayed.tx_hash}`);
-  console.log(`[smoke] chain_submission_id=${relayed.submission.chain_submission_id}`);
-
-  // Give the indexer a moment to observe submission_created and assign jobs.
-  await sleep(6000);
-
-  const assignmentsRes = await fetch(`${BASE}/v1/submissions/${submissionRowId}`);
-  const { submission, replays } = await assignmentsRes.json();
-  console.log(`[smoke] ${replays.length} replay row(s) assigned by the scheduler`);
-
-  // Each assigned re-executor (a real Client bound to its own real key)
-  // independently replays the function and submits a real attest_replay.
-  for (const replayRow of replays) {
-    const assignedAccountRes = await fetch(`${BASE}/v1/reexecutors/${replayRow.reexecutor_id}`);
-    const { reexecutor } = await assignedAccountRes.json();
-    const kp = rexKeypairs.find((k) => k.publicKey() === reexecutor.stellar_account);
-    if (!kp) {
-      console.warn(`[smoke] no local keypair for assigned reexecutor ${reexecutor.stellar_account}, skipping`);
-      continue;
-    }
-    const outputHash = createHash("sha256").update(JSON.stringify(expectedOutput)).digest("hex");
-    const client = new EscrowGateClient({
-      contractId: env.ESCROW_GATE_CONTRACT_ID,
-      networkPassphrase: env.NETWORK_PASSPHRASE,
-      rpcUrl: env.SOROBAN_RPC_URL,
-      publicKey: kp.publicKey(),
-      ...basicNodeSigner(kp, env.NETWORK_PASSPHRASE),
-    });
-    const tx = await client.attest_replay({
-      reexecutor: kp.publicKey(),
-      submission_id: BigInt(submission.chain_submission_id),
-      output_hash: Buffer.from(outputHash, "hex"),
-      matched: true,
-    });
-    const sent = await tx.signAndSend();
-    txHashes[`attest_${kp.publicKey().slice(0, 6)}`] = sent.sendTransactionResponse?.hash ?? "(unknown)";
-    console.log(`[smoke] real attest_replay by ${kp.publicKey()} matched=true`);
-  }
-
-  console.log("[smoke] waiting for indexer to reconcile attestations and trigger early finalize...");
-  let finalStatus = submission.status;
-  for (let i = 0; i < 20; i++) {
-    await sleep(3000);
-    const res = await fetch(`${BASE}/v1/submissions/${submissionRowId}`);
-    const body = await res.json();
-    finalStatus = body.submission.status;
-    console.log(`[smoke] poll ${i}: status=${finalStatus}`);
-    if (finalStatus === "verified" || finalStatus === "slashed") {
-      txHashes.finalize_visible_tx = body.submission.chain_tx_hash;
-      break;
+  const only = (process.env.SMOKE_ONLY ?? "").split(",").filter(Boolean);
+  const results: Array<{ name: string; ok: boolean; error?: string }> = [];
+  for (const [name, run] of Object.entries(scenarios)) {
+    if (only.length > 0 && !only.includes(name)) continue;
+    console.log(`\n[smoke] scenario: ${name}`);
+    try {
+      await run(agent, challenger);
+      results.push({ name, ok: true });
+      console.log("  PASS");
+    } catch (err) {
+      results.push({ name, ok: false, error: (err as Error).message });
+      console.error(`  FAIL: ${(err as Error).message}`);
     }
   }
 
   console.log("\n=== SMOKE TEST RESULT ===");
-  console.log(`submission row: ${submissionRowId}`);
-  console.log(`final status: ${finalStatus}`);
-  console.log(`tx hashes:`, txHashes);
-  if (finalStatus !== "verified" && finalStatus !== "slashed") {
-    throw new Error(`Smoke test did not reach a terminal verdict within the timeout (got: ${finalStatus})`);
-  }
-}
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+  for (const r of results) console.log(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.error ? `  — ${r.error}` : ""}`);
+  if (results.some((r) => !r.ok)) process.exit(1);
 }
 
 main().catch((err) => {

@@ -40,7 +40,7 @@ export async function challengesRoutes(app: FastifyInstance) {
 
   app.post("/v1/submissions/:id/challenge", { preHandler: requireAuth }, async (req, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
-    const body = z.object({ bond: z.string() }).parse(req.body);
+    const body = z.object({ bond: z.string().regex(/^[1-9]\d*$/, "must be a positive integer amount in stroops") }).parse(req.body);
     const challenger = req.stellarAccount!;
 
     const submission = await db

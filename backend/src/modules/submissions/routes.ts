@@ -2,22 +2,29 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { requireAuth } from "../../auth/plugin.js";
 import { db } from "../../db.js";
-import { escrowGateFor, escrowGateAsKeeper } from "../../chain/clients.js";
+import { escrowGateFor } from "../../chain/clients.js";
+import { readSubmission } from "../../chain/actions.js";
+import { env } from "../../config/env.js";
 import { relaySignedXdr } from "../../chain/rpc.js";
 import { bufFromHex, sha256Bytes, toChainTaskType } from "../../chain/mappers.js";
 import { findOrCreateMarketplaceForAccount } from "../marketplaces/routes.js";
 
+const sha256Hex = z.string().regex(/^[0-9a-f]{64}$/, "must be a lowercase hex sha256 digest");
+const stroops = z.string().regex(/^\d+$/, "must be an integer amount in stroops");
+
 const submitBody = z.object({
   escrow_ref: z.string().min(1),
-  task_type: z.enum(["deterministic", "retrieval", "unverifiable"]),
-  input_hash: z.string().length(64),
-  claimed_output_hash: z.string().length(64),
+  // "unverifiable" is in the taxonomy but has no on-chain path in Phase 1 —
+  // the contract rejects it, so it is rejected here with a clear message.
+  task_type: z.enum(["deterministic", "retrieval"]),
+  input_hash: sha256Hex,
+  claimed_output_hash: sha256Hex,
   input_ref: z.string().optional(),
   function_hash: z.string().optional(),
   function_ref: z.string().optional(),
   claimed_output_ref: z.string().optional(),
-  escrow_value: z.string(),
-  bond_amount: z.string(),
+  escrow_value: stroops,
+  bond_amount: stroops,
   idempotency_key: z.string().min(1),
 });
 
@@ -35,9 +42,13 @@ export async function submissionsRoutes(app: FastifyInstance) {
           .enum(["pending", "verified", "disputed", "slashed", "expired_unverified"])
           .optional(),
         limit: z.coerce.number().int().min(1).max(200).optional(),
+        include_drafts: z.enum(["true", "false"]).optional(),
       })
       .parse(req.query);
     let qb = db.selectFrom("submission").selectAll().orderBy("submitted_at", "desc");
+    // A draft is a row whose submit() transaction was built but never signed
+    // and relayed — it does not exist on-chain, so it is not listed by default.
+    if (query.include_drafts !== "true") qb = qb.where("chain_submission_id", "is not", null);
     if (query.marketplace_id) qb = qb.where("marketplace_id", "=", query.marketplace_id);
     if (query.agent_id) qb = qb.where("agent_id", "=", query.agent_id);
     if (query.status) qb = qb.where("status", "=", query.status);
@@ -62,6 +73,30 @@ export async function submissionsRoutes(app: FastifyInstance) {
       return existing;
     }
 
+    if (body.task_type === "deterministic" && (!body.function_ref || !body.input_ref)) {
+      reply.code(400);
+      return { error: "deterministic submissions need function_ref and input_ref artifacts for re-executors to replay" };
+    }
+    if (body.task_type === "retrieval" && !body.input_ref) {
+      reply.code(400);
+      return { error: "retrieval submissions need an input_ref artifact holding the request spec" };
+    }
+
+    // Build (and simulate) first: a submission the contract would reject —
+    // bond too low, insufficient balance — fails here with the contract's own
+    // error and never leaves an orphan row behind.
+    const client = escrowGateFor(agent);
+    const assembled = await client.submit({
+      agent,
+      escrow_ref: sha256Bytes(body.escrow_ref),
+      escrow_value: BigInt(body.escrow_value),
+      task_type: toChainTaskType(body.task_type),
+      input_hash: bufFromHex(body.input_hash),
+      output_hash: bufFromHex(body.claimed_output_hash),
+      bond: BigInt(body.bond_amount),
+    });
+    const unsignedXdr = assembled.toXDR();
+
     const row = await db
       .insertInto("submission")
       .values({
@@ -78,27 +113,20 @@ export async function submissionsRoutes(app: FastifyInstance) {
         bond_amount: body.bond_amount,
         bond_asset: "native",
         challenge_window_s: 0, // set by the contract at submit() time; filled in on relay confirm
+        // A transaction's hash does not cover its signatures, so the hash of
+        // what we just built is the hash it will have on-chain. The indexer
+        // uses it to tie the SubmissionCreated event back to this exact row.
+        chain_tx_hash: Buffer.from(assembled.built!.hash()).toString("hex"),
         idempotency_key: body.idempotency_key,
       })
       .returningAll()
       .executeTakeFirstOrThrow();
 
-    const client = escrowGateFor(agent);
-    const assembled = await client.submit({
-      agent,
-      escrow_ref: sha256Bytes(body.escrow_ref),
-      escrow_value: BigInt(body.escrow_value),
-      task_type: toChainTaskType(body.task_type),
-      input_hash: bufFromHex(body.input_hash),
-      output_hash: bufFromHex(body.claimed_output_hash),
-      bond: BigInt(body.bond_amount),
-    });
-
     reply.code(201);
     return {
       submission: row,
-      unsigned_transaction_xdr: assembled.toXDR(),
-      network_passphrase: process.env.NETWORK_PASSPHRASE,
+      unsigned_transaction_xdr: unsignedXdr,
+      network_passphrase: env.NETWORK_PASSPHRASE,
     };
   });
 
@@ -109,11 +137,24 @@ export async function submissionsRoutes(app: FastifyInstance) {
   app.post("/v1/submissions/:id/relay", { preHandler: requireAuth }, async (req, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
     const body = z.object({ signed_transaction_xdr: z.string().min(1) }).parse(req.body);
-    const { hash, returnValue } = await relaySignedXdr(body.signed_transaction_xdr);
-    const chainSubmissionId = String(returnValue);
+    const draft = await db.selectFrom("submission").selectAll().where("id", "=", params.id).executeTakeFirst();
+    if (!draft) {
+      reply.code(404);
+      return { error: "not found" };
+    }
+    if (draft.agent_id !== req.stellarAccount) {
+      reply.code(403);
+      return { error: "only the submitting agent can relay this submission" };
+    }
+    if (draft.chain_submission_id) return { submission: draft, tx_hash: draft.chain_tx_hash };
 
-    const assembled = await escrowGateAsKeeper.get_submission({ id: BigInt(chainSubmissionId) });
-    const onChain = assembled.result;
+    const { hash, returnValue } = await relaySignedXdr(body.signed_transaction_xdr);
+    if (hash !== draft.chain_tx_hash) {
+      reply.code(400);
+      return { error: "signed transaction is not the one built for this submission" };
+    }
+    const chainSubmissionId = String(returnValue);
+    const onChain = await readSubmission(chainSubmissionId);
 
     const row = await db
       .updateTable("submission")
@@ -121,6 +162,7 @@ export async function submissionsRoutes(app: FastifyInstance) {
         chain_submission_id: chainSubmissionId,
         chain_tx_hash: hash,
         challenge_window_s: onChain ? Number(onChain.challenge_window_s) : 0,
+        submitted_at: onChain ? new Date(Number(onChain.submitted_at) * 1000) : undefined,
         updated_at: new Date(),
       })
       .where("id", "=", params.id)

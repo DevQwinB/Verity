@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "./net.js";
 import { z } from "zod";
 
 const schema = z.object({
@@ -15,6 +16,10 @@ const schema = z.object({
   HOME_DOMAIN: z.string().min(1),
   PORT: z.coerce.number().default(3001),
   ARTIFACT_STORAGE_DIR: z.string().default("./.artifacts"),
+  // Share of a wrong-side re-executor's stake the keeper slashes after a
+  // finalized verdict proves their attestation wrong. The contract only
+  // bounds this by the stake itself, so the policy lives here.
+  REEXECUTOR_SLASH_BPS: z.coerce.number().int().min(0).max(10000).default(1000),
 });
 
 export const env = schema.parse(process.env);
