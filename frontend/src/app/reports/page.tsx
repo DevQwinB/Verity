@@ -1,7 +1,19 @@
+import type { Metadata } from "next";
 import { backendGet } from "../../lib/server-api";
 import type { VerificationRatesReport } from "../../lib/types";
 import { Card, CardBody, CardHeader } from "../../components/ui/card";
 import { Badge } from "../../components/ui/badge";
+import { truncateMiddle } from "../../lib/format";
+
+export const metadata: Metadata = { title: "Reports" };
+
+const STATUS_LABEL: Record<string, string> = {
+  pending: "Pending",
+  verified: "Verified",
+  disputed: "Disputed",
+  slashed: "Slashed",
+  expired_unverified: "Expired, unverified",
+};
 
 export default async function ReportsPage() {
   const report = await backendGet<VerificationRatesReport>("/v1/reports/verification-rates");
@@ -16,7 +28,8 @@ export default async function ReportsPage() {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Verification rates</h1>
         <p className="mt-1 max-w-2xl text-sm text-text-secondary">
-          Computed live from real submission and slashing records. Phase 1 metrics only.
+          Counted live from the submissions and slashes this deployment has on-chain. Unsigned
+          drafts are not submissions and are not counted.
         </p>
       </div>
 
@@ -53,15 +66,15 @@ export default async function ReportsPage() {
 
       <Card>
         <CardHeader>
-          <span className="font-medium">By marketplace, task type, and status</span>
+          <h2 className="font-medium">By marketplace, task type and status</h2>
         </CardHeader>
-        <CardBody className="p-0">
+        <CardBody className="overflow-x-auto p-0">
           {report.by_marketplace_task_status.length === 0 ? (
             <p className="px-5 py-8 text-center text-sm text-text-tertiary">
               No submissions recorded yet on this deployment.
             </p>
           ) : (
-            <table className="w-full text-sm">
+            <table className="w-full min-w-[520px] text-sm">
               <thead>
                 <tr className="text-left text-xs uppercase tracking-wide text-text-tertiary">
                   <th className="px-5 py-3 font-medium">Marketplace</th>
@@ -74,10 +87,13 @@ export default async function ReportsPage() {
                 {report.by_marketplace_task_status.map((row, i) => (
                   <tr key={i}>
                     <td className="px-5 py-3 font-mono text-xs text-text-secondary">
-                      {row.marketplace_id.slice(0, 8)}
+                      {/* A marketplace is named after its account until it registers a name. */}
+                      {row.marketplace_name === row.marketplace_account
+                        ? truncateMiddle(row.marketplace_account, 6, 6)
+                        : row.marketplace_name}
                     </td>
                     <td className="px-5 py-3 capitalize">{row.task_type}</td>
-                    <td className="px-5 py-3 capitalize">{row.status}</td>
+                    <td className="px-5 py-3">{STATUS_LABEL[row.status] ?? row.status}</td>
                     <td className="px-5 py-3 text-right font-mono">{row.count}</td>
                   </tr>
                 ))}

@@ -50,3 +50,27 @@ export function formatCountdown(deadlineIso: string): string {
 export function windowDeadlineIso(submittedAtIso: string, windowSeconds: number): string {
   return new Date(new Date(submittedAtIso).getTime() + windowSeconds * 1000).toISOString();
 }
+
+/** Parses an XLM amount a person typed into stroops. Null when it is not a
+ * positive amount with at most 7 decimal places — so a form can say so,
+ * instead of a number conversion throwing somewhere downstream. */
+export function xlmToStroops(input: string): bigint | null {
+  const value = input.trim();
+  if (!/^\d+(\.\d{1,7})?$/.test(value)) return null;
+  const [whole, frac = ""] = value.split(".");
+  const stroops = BigInt(whole) * BigInt(STROOPS_PER_XLM) + BigInt(frac.padEnd(7, "0"));
+  return stroops > BigInt(0) ? stroops : null;
+}
+
+/** "10 minutes", "1 hour", "24 hours" — for windows and waits. */
+export function formatDuration(seconds: number): string {
+  const plural = (n: number, unit: string) => `${n} ${unit}${n === 1 ? "" : "s"}`;
+  if (seconds % 3600 === 0) return plural(seconds / 3600, "hour");
+  if (seconds % 60 === 0) return plural(seconds / 60, "minute");
+  return plural(seconds, "second");
+}
+
+/** Basis points as a percentage: 500 -> "5%", 6600 -> "66%", 1250 -> "12.5%". */
+export function bpsToPercent(bps: number): string {
+  return `${(bps / 100).toString()}%`;
+}

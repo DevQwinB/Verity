@@ -1,7 +1,24 @@
+/** Fired when the server no longer recognises the session, so the wallet
+ * provider can show the account as disconnected instead of letting every
+ * action fail with "not authenticated". */
+export const SESSION_EXPIRED_EVENT = "verity:session-expired";
+
 async function json<T>(res: Response): Promise<T> {
-  const data = await res.json();
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && typeof window !== "undefined") {
+    window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+    throw new Error("Your session has expired. Connect your wallet again to continue.");
+  }
   if (!res.ok) throw new Error(data.error ?? `Request failed: ${res.status}`);
   return data as T;
+}
+
+function post(path: string, body?: unknown): Promise<Response> {
+  return fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
 }
 
 export async function fetchChallenge(account: string) {
@@ -47,9 +64,11 @@ export async function createSubmission(input: CreateSubmissionInput) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
   });
+  // unsigned_transaction_xdr is null when this idempotency key already
+  // reached the chain: there is nothing left to sign.
   return json<{
     submission: { id: string };
-    unsigned_transaction_xdr: string;
+    unsigned_transaction_xdr: string | null;
     network_passphrase: string;
   }>(res);
 }
@@ -106,4 +125,13 @@ export async function uploadArtifact(contentBase64: string, contentType?: string
     body: JSON.stringify({ content_base64: contentBase64, content_type: contentType }),
   });
   return json<{ content_hash: string; storage_ref: string; size_bytes: number }>(res);
+}
+
+export async function buildStakeWithdrawal(id: string, amount: string) {
+  return json<{ unsigned_transaction_xdr: string }>(await post(`/api/reexecutors/${id}/withdraw`, { amount }));
+}
+
+/** Asks the testnet faucet to fund the signed-in account. */
+export async function fundTestnetAccount() {
+  return json<{ funded: boolean; message: string }>(await post("/api/friendbot"));
 }

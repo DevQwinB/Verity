@@ -1,50 +1,74 @@
 import { Badge } from "./ui/badge";
-import type { SubmissionStatus, ChallengeResolutionMethod } from "../lib/types";
+import type { SubmissionStatus, SubmissionResolutionMethod } from "../lib/types";
 
-const STATUS_LABEL: Record<SubmissionStatus, string> = {
-  pending: "Pending",
-  verified: "Verified",
-  disputed: "Disputed",
-  slashed: "Slashed",
-  expired_unverified: "Expired, unverified",
-};
-
-const STATUS_TONE: Record<SubmissionStatus, "pending" | "verified" | "disputed" | "slashed" | "expired"> = {
-  pending: "pending",
-  verified: "verified",
-  disputed: "disputed",
-  slashed: "slashed",
-  expired_unverified: "expired",
-};
+type Tone = "pending" | "verified" | "disputed" | "slashed" | "expired" | "neutral";
 
 /**
- * PRD §10 hard requirement: every verdict display must state whether it was
- * reached by re-execution consensus (Phase 1, economic) or a ZK proof
- * (Phase 2, cryptographic) - never blur the two, and never imply a
- * cryptographic guarantee this deployment cannot back (the ZKVerifierRegistry
- * ships with zero registered verifiers, so `zk_proof` never actually occurs
- * here today, but the label is driven by the real field, not hardcoded).
+ * PRD §10 hard requirement: every verdict display must state how it was
+ * reached, and never imply a guarantee this deployment cannot back. Three
+ * things are kept apart here, all driven by what the contract recorded:
+ *
+ *  - a bonded re-execution consensus (economic, not cryptographic);
+ *  - a window that simply elapsed — the work was never replayed to quorum,
+ *    so it is not shown in the same green as work that was;
+ *  - a ZK proof (Phase 2; the contract accepts none today, so this cannot
+ *    occur, but the label follows the real field rather than assuming).
  */
+export function describeVerdict(
+  status: SubmissionStatus,
+  method: SubmissionResolutionMethod | null | undefined,
+  hasChallenge: boolean
+): { label: string; tone: Tone; mechanism: string } {
+  switch (status) {
+    case "pending":
+      return { label: "Pending", tone: "pending", mechanism: "Awaiting replay consensus or the end of its challenge window" };
+    case "disputed":
+      return { label: "Disputed", tone: "disputed", mechanism: "Challenge open, awaiting replay consensus" };
+    case "expired_unverified":
+      return {
+        label: "Expired, unverified",
+        tone: "expired",
+        mechanism: hasChallenge
+          ? "Challenge expired without a replay consensus. Both bonds returned."
+          : "Window closed with a mismatch reported but no quorum. Bond returned.",
+      };
+    case "verified":
+      if (method === "window_elapsed") {
+        return {
+          label: "Verified by default",
+          tone: "neutral",
+          mechanism: "Unchallenged when its window closed. Not replayed to quorum.",
+        };
+      }
+      break;
+    case "slashed":
+      break;
+  }
+  const label = status === "verified" ? "Verified" : "Slashed";
+  const tone: Tone = status === "verified" ? "verified" : "slashed";
+  if (method === "zk_proof") return { label, tone, mechanism: "Cryptographic ZK proof" };
+  if (method === "reexecution_consensus") {
+    return { label, tone, mechanism: "Bonded re-execution consensus, not a cryptographic proof" };
+  }
+  // Finalized on-chain, but the method has not been mirrored from the
+  // contract yet. Say nothing rather than guess.
+  return { label, tone, mechanism: "Finalized on-chain" };
+}
+
 export function VerdictBadge({
   status,
   resolutionMethod,
+  hasChallenge = false,
 }: {
   status: SubmissionStatus;
-  resolutionMethod?: ChallengeResolutionMethod | null;
+  resolutionMethod?: SubmissionResolutionMethod | null;
+  hasChallenge?: boolean;
 }) {
-  const mechanism =
-    status === "pending"
-      ? "Awaiting replay consensus or challenge window"
-      : resolutionMethod === "zk_proof"
-        ? "Cryptographic ZK proof"
-        : resolutionMethod === "manual_review"
-          ? "Manual review"
-          : "Economic re-execution consensus, not a cryptographic proof";
-
+  const { label, tone, mechanism } = describeVerdict(status, resolutionMethod, hasChallenge);
   return (
     <div className="inline-flex flex-col gap-1">
-      <Badge tone={STATUS_TONE[status]}>{STATUS_LABEL[status]}</Badge>
-      <span className="text-xs text-text-tertiary">{mechanism}</span>
+      <Badge tone={tone}>{label}</Badge>
+      <span className="max-w-xs text-xs text-text-tertiary">{mechanism}</span>
     </div>
   );
 }

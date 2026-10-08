@@ -9,3 +9,7 @@ export const TESTNET_EXPLORER_ACCOUNT = (account: string) =>
   `https://stellar.expert/explorer/testnet/account/${account}`;
 export const TESTNET_EXPLORER_CONTRACT = (id: string) =>
   `https://stellar.expert/explorer/testnet/contract/${id}`;
+export const FREIGHTER_INSTALL_URL = "https://www.freighter.app/";
+/** Testnet faucet. Server-side only: /api/friendbot calls it for the
+ * signed-in account. */
+export const FRIENDBOT_URL = "https://friendbot.stellar.org";

@@ -11,13 +11,18 @@ import { SESSION_COOKIE } from "../../../lib/backend-proxy";
  */
 export async function POST(req: NextRequest) {
   const body = await req.json();
-  const res = await fetch(`${BACKEND_URL}/auth`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
-  const data = await res.json();
+  let res: Response;
+  try {
+    res = await fetch(`${BACKEND_URL}/auth`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+  } catch {
+    return NextResponse.json({ error: "The Verity backend is not reachable right now. Try again in a moment." }, { status: 502 });
+  }
+  const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.token) {
     return NextResponse.json({ error: data.error ?? "authentication failed" }, { status: res.status });
   }
