@@ -9,7 +9,8 @@
     "migrate": "tsx src/migrate.ts",
     "migrate:down": "tsx src/migrate.ts down",
     "local-postgres": "tsx src/local-postgres.ts",
-    "reset": "tsx src/reset.ts"
+    "reset": "tsx src/reset.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "kysely": "^0.29.6",

@@ -12,7 +12,8 @@
     "db:migrate": "pnpm --filter @verity/db migrate",
     "test:contracts": "cd contracts && cargo test",
     "build": "pnpm -r build",
-    "typecheck": "pnpm -r exec tsc --noEmit",
-    "db:reset": "pnpm --filter @verity/db reset"
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "db:reset": "pnpm --filter @verity/db reset",
+    "lint": "pnpm --filter @verity/frontend lint"
   }
 }

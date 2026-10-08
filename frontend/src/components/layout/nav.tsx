@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { List, X } from "@phosphor-icons/react/dist/ssr";
@@ -23,9 +23,6 @@ export function Nav() {
   const pathname = usePathname();
   const { account, connecting, problem, login, logout, dismissProblem } = useWallet();
   const [menuOpen, setMenuOpen] = useState(false);
-
-  // Following a link in the menu should not leave it covering the new page.
-  useEffect(() => setMenuOpen(false), [pathname]);
 
   return (
     <header className="sticky top-0 z-20 border-b border-border-subtle bg-surface/90 backdrop-blur">
@@ -99,6 +96,8 @@ export function Nav() {
                   <Link
                     href={link.href}
                     aria-current={active ? "page" : undefined}
+                    // Following a link should not leave the menu covering the new page.
+                    onClick={() => setMenuOpen(false)}
                     className={cn(
                       "block rounded-md px-3 py-2.5 text-sm",
                       active ? "bg-surface-hover text-text-primary" : "text-text-secondary"
