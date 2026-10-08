@@ -1,68 +1,92 @@
-import vm from "node:vm";
-import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { Worker } from "node:worker_threads";
 import { canonicalHash } from "./canonical.js";
 
-let dockerAvailable: boolean | undefined;
-function hasDocker(): boolean {
-  if (dockerAvailable === undefined) {
-    try {
-      execFileSync("docker", ["info"], { stdio: "ignore", timeout: 5000 });
-      dockerAvailable = true;
-    } catch {
-      dockerAvailable = false;
-    }
-  }
-  return dockerAvailable;
+/**
+ * Limits every replay runs under. The first three are enforced inside the
+ * engine, by the same WebAssembly build on every re-executor, so a function
+ * that exceeds one fails identically everywhere and that failure is a valid
+ * (mismatch) result. They are deliberately small: Phase 1 covers pure data
+ * transforms, not heavy compute.
+ */
+const LIMITS = {
+  memoryBytes: 64 * 1024 * 1024,
+  // Well under the depth at which the host's own stack would give out first.
+  stackBytes: 128 * 1024,
+  // Interpreter interrupt checks; a tight loop spends about 300 a second.
+  ticks: 1000,
+};
+const MAX_OUTPUT_BYTES = 1_000_000;
+/** Not an engine limit: a kill switch for this host. Hitting it says this
+ * machine was too slow or the engine got stuck, not that the function is wrong. */
+const WALL_CLOCK_MS = 20_000;
+
+const ENGINE_VERSION: string = createRequire(import.meta.url)("quickjs-emscripten/package.json").version;
+export const REPLAY_ENGINE = `quickjs-emscripten@${ENGINE_VERSION} (wasm sandbox, worker-isolated)`;
+
+/** The replay could not be carried out on this host. It says nothing about
+ * the submission, so it must never become a vote: the caller retries later. */
+export class ReplayInfrastructureError extends Error {}
+
+type WorkerResult =
+  | { kind: "ok"; outputJson: string | null }
+  | { kind: "guest-error"; reason: string }
+  | { kind: "host-error"; reason: string };
+
+function runInWorker(functionSource: string, inputJson: string): Promise<WorkerResult> {
+  return new Promise((resolve) => {
+    const worker = new Worker(new URL("./replay-worker.mjs", import.meta.url), {
+      workerData: { functionSource, inputJson, limits: LIMITS },
+      // No environment and no loader flags: the worker cannot read this
+      // process's secrets from process.env, and loads nothing but the engine.
+      env: {},
+      execArgv: [],
+      // Room for the engine's own stack check to trip before the host's does.
+      resourceLimits: { stackSizeMb: 32, maxOldGenerationSizeMb: 256 },
+    });
+    let settled = false;
+    const finish = (result: WorkerResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      void worker.terminate();
+      resolve(result);
+    };
+    const timer = setTimeout(
+      () => finish({ kind: "host-error", reason: `no result within ${WALL_CLOCK_MS / 1000}s on this host` }),
+      WALL_CLOCK_MS
+    );
+    worker.once("message", (message: WorkerResult) => finish(message));
+    worker.once("error", (err) => finish({ kind: "host-error", reason: err.message }));
+    worker.once("exit", (code) => finish({ kind: "host-error", reason: `sandbox worker exited with code ${code} before answering` }));
+  });
 }
 
 /**
- * Real, sandboxed re-execution of a deterministic task's declared function
- * against its declared input, then a real sha256 of the canonical output —
- * never a fabricated match/mismatch. Prefers a real Docker container
- * (--network=none, resource-capped) when Docker is present; otherwise it
- * falls back to a Node `vm` context with no network/require access and a
- * hard timeout instead of silently no-op'ing.
+ * Real re-execution of a deterministic task's declared function against its
+ * declared input, then a real sha256 of the canonical output — never a
+ * fabricated match/mismatch.
  *
- * `node:vm` is NOT a security boundary — a hostile function can escape it.
- * The fallback is for local development only; run re-executors with Docker
- * available before replaying functions from agents you do not trust.
+ * The function runs in QuickJS compiled to WebAssembly, in a worker thread.
+ * That gives two things at once: a real isolation boundary on any host (the
+ * guest has no file system, network, process or Node APIs, and cannot see
+ * this process's memory or environment), and one identical JavaScript engine
+ * for every re-executor, so the same function yields the same bytes everywhere.
+ *
+ * Throws a plain Error when the function itself fails (it threw, or exceeded
+ * an engine limit) — the caller records that as a mismatch. Throws
+ * ReplayInfrastructureError when this host could not complete the replay.
  */
-export function runDeterministicFunction(
+export async function runDeterministicFunction(
   functionSource: string,
   input: unknown
-): { outputHash: string; output: unknown; engine: string } {
-  if (hasDocker()) {
-    return runInDocker(functionSource, input);
+): Promise<{ outputHash: string; output: unknown; engine: string }> {
+  const result = await runInWorker(functionSource, JSON.stringify(input));
+  if (result.kind === "host-error") throw new ReplayInfrastructureError(result.reason);
+  if (result.kind === "guest-error") throw new Error(result.reason);
+  if (result.outputJson !== null && Buffer.byteLength(result.outputJson) > MAX_OUTPUT_BYTES) {
+    throw new Error(`output larger than ${MAX_OUTPUT_BYTES} bytes`);
   }
-  return runInVm(functionSource, input);
-}
-
-function runInVm(functionSource: string, input: unknown) {
-  // Input goes in, and the result comes out, as JSON text: nothing from the
-  // host realm (not even the input object's prototype chain) is reachable
-  // from inside the context, and the context gets its own JSON/Math.
-  const sandbox: Record<string, unknown> = { __inputJson: JSON.stringify(input), __resultJson: undefined };
-  const context = vm.createContext(sandbox, {
-    name: "verity-replay-sandbox",
-    codeGeneration: { strings: false, wasm: false },
-  });
-  const script = new vm.Script(
-    `__resultJson = JSON.stringify((function(input){ ${functionSource}\n})(JSON.parse(__inputJson)));`,
-    { filename: "replay-function.js" }
-  );
-  script.runInContext(context, { timeout: 3000 });
-  const resultJson = sandbox.__resultJson;
-  const output = typeof resultJson === "string" ? JSON.parse(resultJson) : null;
-  return { outputHash: canonicalHash(output), output, engine: "node:vm (no Docker available — development only)" };
-}
-
-function runInDocker(functionSource: string, input: unknown) {
-  const wrapped = `const input = ${JSON.stringify(input)}; const fn = (function(input){${functionSource}\n}); console.log(JSON.stringify(fn(input) ?? null));`;
-  const out = execFileSync(
-    "docker",
-    ["run", "--rm", "--network=none", "--read-only", "--cap-drop=ALL", "--memory=256m", "--cpus=0.5", "--pids-limit=64", "node:22-slim", "node", "-e", wrapped],
-    { timeout: 15000 }
-  ).toString();
-  const output = JSON.parse(out.trim());
-  return { outputHash: canonicalHash(output), output, engine: "docker (--network=none, resource-capped)" };
+  const output = result.outputJson === null ? null : JSON.parse(result.outputJson);
+  return { outputHash: canonicalHash(output), output, engine: REPLAY_ENGINE };
 }
