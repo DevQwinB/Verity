@@ -1,17 +1,17 @@
 import { sql } from "kysely";
 import { db } from "../db.js";
 import { env } from "../config/env.js";
-import { escrowGateAsKeeper } from "../chain/clients.js";
 import {
   consensusOutcome,
   finalizeOnChain,
   readSubmission,
   releaseAttestationLockOnChain,
   resolveChallengeOnChain,
-  slashOnChain,
 } from "../chain/actions.js";
 import { fromChainVerdict } from "../chain/mappers.js";
 import { recordTerminalVerdict } from "../modules/submissions/verdict.js";
+import { exportAttestation } from "../modules/attestations/export.js";
+import { topUpAssignments } from "../modules/reexecutors/assignment.js";
 import { maybeEarlyFinalize } from "./indexer.js";
 
 /** How long settlement waits for the indexer to catch up on a submission's
@@ -149,11 +149,14 @@ export async function expireChallengesOnce(): Promise<number> {
   return stale.length;
 }
 
-/** After a terminal verdict: slash every re-executor whose recorded vote the
- * verdict proved wrong (invariant 2 — the contract itself checks the vote),
- * and release every attester's stake lock so honest re-executors are free to
- * withdraw. settled_at is only stamped once every step has succeeded, so a
- * partial failure is simply retried on the next tick. */
+/** After a terminal verdict: release every attester's stake lock so honest
+ * re-executors are free to withdraw. The contract slashes a vote the
+ * consensus proved wrong in that same call — who, and how much, is decided
+ * on-chain from the recorded votes (invariant 2), so the keeper neither
+ * chooses nor computes anything here; the resulting Slashed event is what
+ * the indexer records. A verdict that only defaulted when the window elapsed
+ * slashes nobody. settled_at is only stamped once every step has succeeded,
+ * so a partial failure is simply retried on the next tick. */
 export async function settleOnce(): Promise<number> {
   const unsettled = await db
     .selectFrom("submission")
@@ -169,13 +172,7 @@ export async function settleOnce(): Promise<number> {
       const votes = await db
         .selectFrom("replay")
         .innerJoin("reexecutor", "reexecutor.id", "replay.reexecutor_id")
-        .select([
-          "replay.id",
-          "replay.match",
-          "replay.slash_tx_hash",
-          "replay.lock_released_at",
-          "reexecutor.stellar_account",
-        ])
+        .select(["replay.id", "replay.lock_released_at", "reexecutor.stellar_account"])
         .where("replay.submission_id", "=", sub.id)
         .where("replay.status", "=", "confirmed_onchain")
         .execute();
@@ -196,40 +193,30 @@ export async function settleOnce(): Promise<number> {
         );
       }
 
-      // Only a verified/slashed verdict proves a vote wrong; an expired
-      // challenge proves nothing, so nobody is slashable for it.
-      const slashable = sub.status !== "expired_unverified";
-      const wrongVote = sub.status === "slashed"; // voted "matched" on a slashed submission
       for (const vote of votes) {
-        if (slashable && vote.match === wrongVote && !vote.slash_tx_hash && env.REEXECUTOR_SLASH_BPS > 0) {
-          const info = await escrowGateAsKeeper.reexecutor_info({ reexecutor: vote.stellar_account });
-          const stake = info.result?.stake_amount ?? 0n;
-          const amount = (stake * BigInt(env.REEXECUTOR_SLASH_BPS)) / 10000n;
-          const hash = amount > 0n ? await slashOnChain(sub.chain_submission_id!, vote.stellar_account, amount) : null;
-          await db
-            .updateTable("replay")
-            .set({ slash_tx_hash: hash ?? "already-slashed" })
-            .where("id", "=", vote.id)
-            .execute();
-        }
-        if (!vote.lock_released_at) {
-          await releaseAttestationLockOnChain(sub.chain_submission_id!, vote.stellar_account);
-          await db
-            .updateTable("replay")
-            .set({ lock_released_at: new Date() })
-            .where("id", "=", vote.id)
-            .execute();
-        }
+        if (vote.lock_released_at) continue;
+        await releaseAttestationLockOnChain(sub.chain_submission_id!, vote.stellar_account);
+        await db
+          .updateTable("replay")
+          .set({ lock_released_at: new Date() })
+          .where("id", "=", vote.id)
+          .execute();
       }
 
-      // Assignments nobody completed can no longer be attested (the
-      // contract rejects votes on a finalized submission) — drop them so
-      // re-executor agents stop being handed dead work.
+      // Assignments nobody completed can no longer be attested (the contract
+      // rejects votes on a finalized submission). They are kept, marked
+      // missed: that a re-executor was asked and did not answer is part of
+      // its record, and agents are only ever handed 'assigned' rows.
       await db
-        .deleteFrom("replay")
+        .updateTable("replay")
+        .set({ status: "missed" })
         .where("submission_id", "=", sub.id)
         .where("status", "=", "assigned")
         .execute();
+
+      // Signed only now, with every indexed vote in hand, so the attestation
+      // lists the complete evidence.
+      await exportAttestation(sub.id);
 
       await db
         .updateTable("submission")
@@ -242,6 +229,19 @@ export async function settleOnce(): Promise<number> {
     }
   }
   return settled;
+}
+
+/** POST /v1/submissions stores a draft row before the agent signs. A draft
+ * never signed — the wallet prompt was dismissed, the tab closed — is not a
+ * submission and is removed once the transaction built for it can no longer
+ * land. */
+export async function purgeDraftsOnce(): Promise<number> {
+  const result = await db
+    .deleteFrom("submission")
+    .where("chain_submission_id", "is", null)
+    .where("created_at", "<", sql<Date>`now() - (${env.DRAFT_TTL_S} || ' seconds')::interval`)
+    .executeTakeFirst();
+  return Number(result.numDeletedRows ?? 0);
 }
 
 /** The chain is the source of truth and events can be missed (RPC event
@@ -285,11 +285,13 @@ export function startScheduler(intervalMs = 10000): { stop: () => void } {
   const tick = async () => {
     if (stopped) return;
     await step("reconcile", reconcileOnce);
+    await step("top-up-assignments", topUpAssignments);
     await step("early-finalize", earlyFinalizeOnce);
     await step("sweep", sweepOnce);
     await step("resolve-challenges", resolveChallengesOnce);
     await step("expire-challenges", expireChallengesOnce);
     await step("settle", settleOnce);
+    await step("purge-drafts", purgeDraftsOnce);
     if (!stopped) timer = setTimeout(tick, intervalMs);
   };
   timer = setTimeout(tick, intervalMs);

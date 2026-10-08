@@ -1,16 +1,28 @@
 import type { FastifyInstance } from "fastify";
 import { sql } from "kysely";
+import { z } from "zod";
 import { db } from "../../db.js";
 
 export async function reportsRoutes(app: FastifyInstance) {
   app.get("/v1/reports/verification-rates", async (req) => {
-    const query = req.query as { marketplace_id?: string };
+    const query = z.object({ marketplace_id: z.string().uuid().optional() }).parse(req.query);
     let qb = db
       .selectFrom("submission")
-      .select(["marketplace_id", "task_type", "status", sql<string>`count(*)`.as("count")])
-      .groupBy(["marketplace_id", "task_type", "status"]);
+      .innerJoin("marketplace", "marketplace.id", "submission.marketplace_id")
+      .select([
+        "submission.marketplace_id",
+        "marketplace.name as marketplace_name",
+        "marketplace.stellar_account as marketplace_account",
+        "submission.task_type",
+        "submission.status",
+        sql<string>`count(*)`.as("count"),
+      ])
+      // A draft whose submit() was never signed does not exist on-chain and
+      // is not a submission; counting it would disagree with every list.
+      .where("submission.chain_submission_id", "is not", null)
+      .groupBy(["submission.marketplace_id", "marketplace.name", "marketplace.stellar_account", "submission.task_type", "submission.status"]);
     if (query.marketplace_id) {
-      qb = qb.where("marketplace_id", "=", query.marketplace_id);
+      qb = qb.where("submission.marketplace_id", "=", query.marketplace_id);
     }
     const rows = await qb.execute();
 

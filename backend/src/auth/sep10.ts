@@ -3,10 +3,14 @@ import jwt from "jsonwebtoken";
 import { env } from "../config/env.js";
 import { keeperKeypair } from "../chain/keeper.js";
 
-/** Verity's own SEP-10 signing key. Reusing the keeper key is fine here —
- * signing a WebAuth challenge grants no on-chain authority, unlike the
- * keeper's escrow-gate calls. */
-const serverKeypair: Keypair = keeperKeypair;
+/** Verity's own SEP-10 signing key. Signing a WebAuth challenge grants no
+ * on-chain authority, so falling back to the keeper key is safe — but a
+ * deployment should set SEP10_SIGNING_SECRET so the key that pays for keeper
+ * transactions is not the one exercised by every login. */
+const serverKeypair: Keypair = env.SEP10_SIGNING_SECRET
+  ? Keypair.fromSecret(env.SEP10_SIGNING_SECRET)
+  : keeperKeypair;
+export const sep10SigningKey = serverKeypair.publicKey();
 
 export function buildChallenge(clientAccountId: string, homeDomain: string) {
   return WebAuth.buildChallengeTx(

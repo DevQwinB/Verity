@@ -9,7 +9,7 @@ import {
   escalateToFullReplay,
 } from "../modules/reexecutors/assignment.js";
 import { escrowGateAsKeeper } from "../chain/clients.js";
-import { consensusOutcome, finalizeOnChain, readSubmission } from "../chain/actions.js";
+import { consensusOutcome, finalizeOnChain, minChallengerBond, readSubmission } from "../chain/actions.js";
 import { dispatchWebhook } from "../modules/webhooks/dispatcher.js";
 import { recordTerminalVerdict } from "../modules/submissions/verdict.js";
 
@@ -90,6 +90,8 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           .set({
             chain_submission_id: chainSubmissionId,
             chain_tx_hash: txHash,
+            escrow_value: v.escrow_value.toString(),
+            min_challenger_bond: sub ? minChallengerBond(sub).toString() : row.min_challenger_bond,
             challenge_window_s: sub ? Number(sub.challenge_window_s) : row.challenge_window_s,
             // The challenge window runs on ledger time, not on when our row
             // was first drafted — align so the countdown and sweep are exact.
@@ -118,7 +120,9 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
       if (existing) {
         await db
           .updateTable("reexecutor")
-          .set({ active: v.active, stake_amount: v.stake_amount.toString(), last_seen_at: new Date() })
+          // last_seen_at is deliberately untouched: staking proves nothing
+          // about whether a worker is running.
+          .set({ active: v.active, stake_amount: v.stake_amount.toString() })
           .where("id", "=", existing.id)
           .execute();
       } else {
@@ -132,6 +136,28 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           })
           .execute();
       }
+      break;
+    }
+
+    case "reexecutor_stake_withdrawn": {
+      const account = topic[1] as string;
+      const v = value as { new_stake: bigint; active: boolean };
+      await db
+        .updateTable("reexecutor")
+        .set({ stake_amount: v.new_stake.toString(), active: v.active })
+        .where("stellar_account", "=", account)
+        .execute();
+      break;
+    }
+
+    case "reexecutor_approval_changed": {
+      const account = topic[1] as string;
+      const v = value as { approved: boolean };
+      await db
+        .updateTable("reexecutor")
+        .set({ approved: v.approved })
+        .where("stellar_account", "=", account)
+        .execute();
       break;
     }
 
@@ -252,7 +278,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           .updateTable("challenge")
           .set({
             resolution: fromChainResolution(v.resolution),
-            resolution_method: fromChainResolutionMethod(v.method),
+            resolution_method: challengeResolutionMethod(v.method),
             resolved_at: new Date(),
           })
           .where("submission_id", "=", sub.id)
@@ -294,7 +320,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
             reexecutor_id: rex.id,
             submission_id: sub?.id ?? null,
             amount: v.amount.toString(),
-            reason: "provable replay/challenge mismatch",
+            reason: "vote contradicted the bonded re-execution consensus",
             tx_hash: txHash,
           })
           .onConflict((oc) => oc.doNothing())
@@ -302,6 +328,14 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           .executeTakeFirst()
           .then(async (inserted) => {
             if (!inserted) return; // event already recorded on an earlier pass
+            if (sub) {
+              await db
+                .updateTable("replay")
+                .set({ slash_tx_hash: txHash })
+                .where("submission_id", "=", sub.id)
+                .where("reexecutor_id", "=", rex.id)
+                .execute();
+            }
             const info = await escrowGateAsKeeper.reexecutor_info({ reexecutor: v.reexecutor });
             await db
               .updateTable("reexecutor")
@@ -317,6 +351,13 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
       break;
     }
   }
+}
+
+/** A challenge row only ever records a resolution the contract accepted;
+ * anything else (None, or a method this deployment cannot use) stays null. */
+function challengeResolutionMethod(v: unknown): "reexecution_consensus" | "zk_proof" | null {
+  const method = fromChainResolutionMethod(v);
+  return method === "reexecution_consensus" || method === "zk_proof" ? method : null;
 }
 
 /** Mirrors invariant 1 off-chain: as soon as a fresh replay tally implies a

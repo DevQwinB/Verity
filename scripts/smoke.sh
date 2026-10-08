@@ -10,6 +10,11 @@
 #   SMOKE_AGENT_ALIAS (agent1)  SMOKE_CHALLENGER_ALIAS (challenger1)
 #   VERITY_API_PORT (3001)      SMOKE_ONLY=honest-deterministic,...
 #   VERITY_DEPLOYMENT (testnet)
+#   SMOKE_PROFILE=quorum        default: needs a quorum of re-executors online
+#   SMOKE_PROFILE=underquorum   needs fewer than a quorum online
+#                               (VERITY_REEXECUTORS="rex1 rex2" pnpm dev);
+#                               waits out real challenge windows
+#   SMOKE_SLOW=1                quorum profile: also wait out one window
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,26 +27,55 @@ API_PORT="${VERITY_API_PORT:-3001}"
 AGENT_ALIAS="${SMOKE_AGENT_ALIAS:-agent1}"
 CHALLENGER_ALIAS="${SMOKE_CHALLENGER_ALIAS:-challenger1}"
 
+PROFILE="${SMOKE_PROFILE:-quorum}"
+GATE_ID="$(json_field escrow_gate_contract_id)"
+
 for alias in "$AGENT_ALIAS" "$CHALLENGER_ALIAS"; do
   if ! stellar keys address "$alias" >/dev/null 2>&1; then
     echo "==> Creating and funding testnet identity '$alias'"
-    stellar keys generate "$alias" --network testnet --fund
+    stellar keys generate "$alias" --network "$NETWORK" --fund
   fi
 done
 
-if ! curl -fs "http://127.0.0.1:$API_PORT/health" >/dev/null; then
+if ! curl -fs "http://127.0.0.1:$API_PORT/health/live" >/dev/null; then
   echo "FATAL: no Verity backend on :$API_PORT — start the stack with 'pnpm dev' first" >&2
   exit 1
+fi
+
+# The quorum profile includes a scenario where a re-executor casts a wrong
+# vote and is slashed for it. That takes a real staked, approved account that
+# is not part of the fleet: no worker runs for it, the smoke test signs its
+# one deliberately wrong vote itself.
+ROGUE_SECRET=""
+if [ "$PROFILE" = quorum ]; then
+  ROGUE_ALIAS="${SMOKE_ROGUE_ALIAS:-${ALIAS_PREFIX}smoke-rogue}"
+  if ! stellar keys address "$ROGUE_ALIAS" >/dev/null 2>&1; then
+    echo "==> Creating and funding testnet identity '$ROGUE_ALIAS'"
+    stellar keys generate "$ROGUE_ALIAS" --network "$NETWORK" --fund
+  fi
+  ROGUE_ADDR="$(stellar keys address "$ROGUE_ALIAS")"
+  ROGUE_INFO="$(stellar contract invoke --id "$GATE_ID" --source "$ROGUE_ALIAS" --network "$NETWORK" \
+    -- reexecutor_info --reexecutor "$ROGUE_ADDR" 2>/dev/null || true)"
+  if ! echo "$ROGUE_INFO" | grep -q '"active": *true'; then
+    echo "==> Staking '$ROGUE_ALIAS' (1,000 XLM)"
+    stellar keys fund "$ROGUE_ALIAS" --network "$NETWORK" >/dev/null 2>&1 || true
+    stellar contract invoke --id "$GATE_ID" --source "$ROGUE_ALIAS" --network "$NETWORK" \
+      -- register_reexecutor --reexecutor "$ROGUE_ADDR" --stake_amount 10000000000
+  fi
+  if ! echo "$ROGUE_INFO" | grep -q '"approved": *true'; then
+    echo "==> Approving '$ROGUE_ALIAS' as a voter"
+    stellar contract invoke --id "$GATE_ID" --source "$DEPLOYER" --network "$NETWORK" \
+      -- set_reexecutor_approved --admin "$(stellar keys address "$DEPLOYER")" --reexecutor "$ROGUE_ADDR" --approved
+  fi
+  ROGUE_SECRET="$(stellar keys secret "$ROGUE_ALIAS")"
 fi
 
 cd "$ROOT_DIR/backend"
 SMOKE_AGENT_SECRET="$(stellar keys secret "$AGENT_ALIAS")" \
 SMOKE_CHALLENGER_SECRET="$(stellar keys secret "$CHALLENGER_ALIAS")" \
+SMOKE_ROGUE_SECRET="$ROGUE_SECRET" \
 SMOKE_BACKEND_URL="http://127.0.0.1:$API_PORT" \
-PORT="$API_PORT" \
-ESCROW_GATE_CONTRACT_ID="$(json_field escrow_gate_contract_id)" \
-ZK_VERIFIER_REGISTRY_CONTRACT_ID="$(json_field zk_verifier_registry_contract_id)" \
-BOND_ASSET_CONTRACT_ID="$(json_field native_xlm_sac_address)" \
-DATABASE_URL="${DATABASE_URL:-postgres://verity:verity@127.0.0.1:${VERITY_PG_PORT:-5433}/verity}" \
-WEB_AUTH_DOMAIN="localhost:$API_PORT" HOME_DOMAIN="localhost:$API_PORT" \
+SMOKE_EXPECT_CONTRACT_ID="$GATE_ID" \
+SMOKE_PROFILE="$PROFILE" \
+SOROBAN_RPC_URL="$SOROBAN_RPC_URL" \
   exec node_modules/.bin/tsx src/smoke/run.ts

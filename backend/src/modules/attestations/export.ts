@@ -1,13 +1,23 @@
 import { db } from "../../db.js";
+import { env } from "../../config/env.js";
 import { keeperKeypair } from "../../chain/keeper.js";
+import { canonicalJson } from "../../chain/canonical.js";
+
+/** Where an attestation has been delivered. Stellar 8004's ingestion schema
+ * is not published (PRD §16 open question 3), so nothing is pushed anywhere:
+ * the attestation is signed, stored, and served by this API. "none" says
+ * exactly that rather than naming a registry it never reached. */
+export const ATTESTATION_TARGET = "none";
 
 /**
- * Stellar 8004's real ingestion schema is not published (PRD §16 open
- * question 3) — this is a versioned, swappable payload we control, signed
- * with Verity's own key, stored regardless of delivery outcome. Delivery
- * itself is a NullPublisher: persist + expose via the DB/API, never a
- * fabricated "successfully pushed to 8004" claim, since no real 8004
- * attestor registration exists yet for this deployment.
+ * A versioned payload describing a submission's terminal verdict, signed with
+ * Verity's keeper key. Every field is read from the mirrored chain state; the
+ * evidence is the list of on-chain attestation transactions, which anyone can
+ * check independently.
+ *
+ * The signature covers the canonical JSON of the payload (keys sorted, no
+ * whitespace), so it can be re-derived from the stored JSON and verified.
+ * Returns true when this call created the attestation.
  */
 export async function exportAttestation(submissionId: string): Promise<boolean> {
   const submission = await db
@@ -15,49 +25,53 @@ export async function exportAttestation(submissionId: string): Promise<boolean> 
     .selectAll()
     .where("id", "=", submissionId)
     .executeTakeFirstOrThrow();
-  if (submission.status !== "verified" && submission.status !== "slashed") return false;
+  if (!["verified", "slashed", "expired_unverified"].includes(submission.status)) return false;
+  if (!submission.resolution_method) return false; // not mirrored from chain yet; retried at the next settle pass
 
-  const challenge = await db
-    .selectFrom("challenge")
-    .select(["resolution_method"])
-    .where("submission_id", "=", submissionId)
-    .where("resolved_at", "is not", null)
-    .executeTakeFirst();
-
-  const replays = await db
+  const votes = await db
     .selectFrom("replay")
-    .select(["id"])
-    .where("submission_id", "=", submissionId)
-    .where("status", "=", "confirmed_onchain")
+    .innerJoin("reexecutor", "reexecutor.id", "replay.reexecutor_id")
+    .select(["reexecutor.stellar_account", "replay.match", "replay.tx_hash"])
+    .where("replay.submission_id", "=", submissionId)
+    .where("replay.status", "=", "confirmed_onchain")
+    .orderBy("replay.tx_hash")
     .execute();
 
   const payload = {
-    schema: "verity.attestation.v1",
+    schema: "verity.attestation.v2",
+    network_passphrase: env.NETWORK_PASSPHRASE,
+    escrow_gate_contract_id: env.ESCROW_GATE_CONTRACT_ID,
     attestor: { type: "verity-verification-layer", stellar_account: keeperKeypair.publicKey() },
     subject: {
       agent_stellar_account: submission.agent_id,
       escrow_ref: submission.escrow_ref,
       submission_id: submission.id,
+      chain_submission_id: submission.chain_submission_id,
     },
     claim: {
       task_type: submission.task_type,
       verdict: submission.status,
-      resolution_method: challenge?.resolution_method ?? "reexecution_consensus",
-      evidence_refs: replays.map((r) => `replay:${r.id}`),
+      resolution_method: submission.resolution_method,
+      attestations: votes.map((v) => ({
+        reexecutor: v.stellar_account,
+        matched: v.match,
+        tx_hash: v.tx_hash,
+      })),
     },
+    submit_tx_hash: submission.chain_tx_hash,
+    finalize_tx_hash: submission.finalize_tx_hash,
     issued_at: new Date().toISOString(),
-    tx_hash: submission.chain_tx_hash,
   };
 
-  const canonical = JSON.stringify(payload);
+  const canonical = canonicalJson(payload);
   const signature = Buffer.from(keeperKeypair.sign(Buffer.from(canonical))).toString("base64");
 
-  // One attestation per submission: returns false when one already exists.
+  // One attestation per submission: nothing is inserted when one already exists.
   const inserted = await db
     .insertInto("attestation_export")
     .values({
       submission_id: submissionId,
-      target_registry: "stellar-8004",
+      target_registry: ATTESTATION_TARGET,
       payload: canonical,
       signature,
     })

@@ -1,8 +1,8 @@
 import type { SubmissionRecord } from "escrow-gate";
 import { Errors } from "escrow-gate";
 import { escrowGateAsKeeper } from "./clients.js";
-import { keeperPublicKey, withKeeperLock } from "./keeper.js";
-import { fromChainVerdict, toChainResolutionMethod } from "./mappers.js";
+import { withKeeperLock } from "./keeper.js";
+import { fromChainVerdict } from "./mappers.js";
 
 /** Maps "Error(Contract, #11)" in an SDK/RPC error message back to the
  * contract's own error name (BondTooLow), or null if it isn't one. */
@@ -34,6 +34,12 @@ export function consensusOutcome(record: SubmissionRecord): "verified" | "slashe
   return null;
 }
 
+/** The challenger bond floor the contract will enforce for this submission:
+ * the bps snapshotted at submit() time, applied to its escrow value. */
+export function minChallengerBond(record: SubmissionRecord): bigint {
+  return (record.escrow_value * BigInt(record.cfg_challenger_bond_min_bps)) / 10000n;
+}
+
 export interface KeeperTxResult {
   status: string;
   txHash: string | null;
@@ -61,7 +67,8 @@ export function resolveChallengeOnChain(chainSubmissionId: string): Promise<Keep
   return withKeeperLock(async () => {
     const tx = await escrowGateAsKeeper.resolve_challenge({
       submission_id: BigInt(chainSubmissionId),
-      method: toChainResolutionMethod("reexecution_consensus"),
+      // The only method the contract accepts in Phase 1.
+      method: { tag: "ReexecutionConsensus", values: void 0 },
     });
     const sent = await tx.signAndSend();
     return {
@@ -71,34 +78,12 @@ export function resolveChallengeOnChain(chainSubmissionId: string): Promise<Keep
   });
 }
 
-/** Returns the slash tx hash, or null when there was nothing left to do
- * (already slashed, or the contract says this party was not on the wrong
- * side — the contract, not this caller, decides who is slashable). */
-export function slashOnChain(
-  chainSubmissionId: string,
-  reexecutor: string,
-  amount: bigint
-): Promise<string | null> {
-  return withKeeperLock(async () => {
-    try {
-      const tx = await escrowGateAsKeeper.slash({
-        keeper: keeperPublicKey,
-        reexecutor,
-        submission_id: BigInt(chainSubmissionId),
-        amount,
-      });
-      const sent = await tx.signAndSend();
-      sent.result.unwrap();
-      return sent.sendTransactionResponse?.hash ?? null;
-    } catch (err) {
-      const name = contractErrorName(err);
-      if (name === "AlreadySlashed" || name === "PartyNotOnWrongSide") return null;
-      throw err;
-    }
-  });
-}
-
-export function releaseAttestationLockOnChain(chainSubmissionId: string, reexecutor: string): Promise<void> {
+/** Releases a voter's stake lock on a finalized submission. The contract
+ * slashes a vote the consensus proved wrong in this same call, before the
+ * lock comes off — whether and how much is decided entirely on-chain, so
+ * there is no separate slash step and nothing for this caller to choose.
+ * Returns the transaction hash, or null if the lock was already released. */
+export function releaseAttestationLockOnChain(chainSubmissionId: string, reexecutor: string): Promise<string | null> {
   return withKeeperLock(async () => {
     try {
       const tx = await escrowGateAsKeeper.release_attestation_lock({
@@ -107,8 +92,9 @@ export function releaseAttestationLockOnChain(chainSubmissionId: string, reexecu
       });
       const sent = await tx.signAndSend();
       sent.result.unwrap();
+      return sent.sendTransactionResponse?.hash ?? null;
     } catch (err) {
-      if (contractErrorName(err) === "AttestationAlreadyReleased") return;
+      if (contractErrorName(err) === "AttestationAlreadyReleased") return null;
       throw err;
     }
   });

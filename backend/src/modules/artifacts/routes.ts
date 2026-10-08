@@ -14,6 +14,10 @@ export async function artifactsRoutes(app: FastifyInstance) {
       })
       .parse(req.body);
     const content = Buffer.from(body.content_base64, "base64");
+    if (content.byteLength > env.ARTIFACT_MAX_BYTES) {
+      reply.code(413);
+      return { error: `artifact is larger than the ${env.ARTIFACT_MAX_BYTES}-byte limit` };
+    }
     const { contentHash, storageRef } = await storeArtifact(content);
     reply.code(201);
     return {

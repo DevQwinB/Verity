@@ -1,5 +1,6 @@
 import { createHmac } from "node:crypto";
 import { db } from "../../db.js";
+import { assertPublicHttpUrl } from "./url-guard.js";
 
 export async function dispatchWebhook(marketplaceId: string, eventType: string, payload: unknown) {
   const subs = await db
@@ -19,8 +20,12 @@ export async function dispatchWebhook(marketplaceId: string, eventType: string, 
       .returningAll()
       .executeTakeFirstOrThrow();
     try {
+      // Re-checked at send time: the host may resolve somewhere else now than
+      // it did when the subscription was created. No redirects, for the same reason.
+      await assertPublicHttpUrl(sub.url);
       const res = await fetch(sub.url, {
         method: "POST",
+        redirect: "error",
         headers: { "content-type": "application/json", "x-verity-signature": signature },
         body,
       });

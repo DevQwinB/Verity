@@ -10,18 +10,20 @@
     "smoke": "tsx src/smoke/run.ts"
   },
   "dependencies": {
-    "@verity/db": "workspace:*",
-    "kysely": "^0.29.6",
-    "escrow-gate": "workspace:*",
-    "zk-verifier-registry": "workspace:*",
-    "@stellar/stellar-sdk": "^17.1.0",
-    "fastify": "^5.12.5",
     "@fastify/cookie": "^11.1.2",
-    "pg-boss": "^12.33.0",
-    "zod": "^4.6.5",
-    "pino": "^10.3.1",
+    "@fastify/helmet": "^13.1.2",
+    "@fastify/rate-limit": "^11.2.1",
+    "@stellar/stellar-sdk": "^17.1.0",
+    "@verity/db": "workspace:*",
+    "dotenv": "^17.4.2",
+    "escrow-gate": "workspace:*",
+    "fastify": "^5.12.5",
     "jsonwebtoken": "^9.0.3",
-    "dotenv": "^17.4.2"
+    "kysely": "^0.29.6",
+    "pg-boss": "^12.33.0",
+    "pino": "^10.3.1",
+    "zk-verifier-registry": "workspace:*",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/jsonwebtoken": "^9.0.10",

@@ -69,7 +69,6 @@ if [ ! -f backend/.env ]; then
   echo "==> Creating backend/.env (gitignored)"
   cat > backend/.env <<ENV
 SOROBAN_RPC_URL=$SOROBAN_RPC_URL
-HORIZON_URL=https://horizon-testnet.stellar.org
 NETWORK_PASSPHRASE="$NETWORK_PASSPHRASE"
 ESCROW_GATE_CONTRACT_ID=$GATE_ID
 ZK_VERIFIER_REGISTRY_CONTRACT_ID=$REGISTRY_ID
@@ -125,6 +124,18 @@ fi
 echo "==> Running migrations"
 (cd db && DATABASE_URL="$DATABASE_URL" "$TSX" src/migrate.ts)
 
+# The backend refuses a JWT secret shorter than 32 characters. An older
+# backend/.env may hold one; rather than rewrite a file of secrets, this run
+# gets a temporary one (every session ends when the stack stops).
+JWT_OVERRIDE=()
+current_jwt="$(grep -E '^JWT_SECRET=' backend/.env | head -1 | cut -d= -f2- | tr -d '"' || true)"
+if [ "${#current_jwt}" -lt 32 ]; then
+  echo "WARN: JWT_SECRET in backend/.env is shorter than 32 characters; using a temporary one for this run." >&2
+  echo "      Replace it with the output of: openssl rand -hex 32" >&2
+  JWT_OVERRIDE=(JWT_SECRET="$(openssl rand -hex 32)")
+fi
+unset current_jwt
+
 echo "==> Starting backend on :$API_PORT"
 export SOROBAN_RPC_URL NETWORK_PASSPHRASE
 export ESCROW_GATE_CONTRACT_ID="$GATE_ID" ZK_VERIFIER_REGISTRY_CONTRACT_ID="$REGISTRY_ID" BOND_ASSET_CONTRACT_ID="$BOND_ASSET_ID"
@@ -134,6 +145,7 @@ start backend backend env \
   DATABASE_URL="$DATABASE_URL" PORT="$API_PORT" \
   WEB_AUTH_DOMAIN="localhost:$API_PORT" HOME_DOMAIN="localhost:$API_PORT" \
   DEPLOYMENT_NAME="$DEPLOYMENT" KEEPER_SECRET_KEY="$(stellar keys secret "$KEEPER")" \
+  "${JWT_OVERRIDE[@]}" \
   "$ROOT_DIR/backend/node_modules/.bin/tsx" src/index.ts
 wait_for "backend" "curl -fs http://127.0.0.1:$API_PORT/health"
 

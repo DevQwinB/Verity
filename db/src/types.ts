@@ -23,6 +23,11 @@ export type SubmissionStatus =
   | "slashed"
   | "expired_unverified";
 
+/** How a terminal verdict was reached, mirrored from the chain record.
+ * `window_elapsed` means the window closed without a bonded consensus — the
+ * work was never replayed to quorum. */
+export type SubmissionResolutionMethod = "reexecution_consensus" | "window_elapsed" | "zk_proof";
+
 export interface SubmissionTable {
   id: Generated<string>;
   escrow_ref: string;
@@ -45,6 +50,10 @@ export interface SubmissionTable {
   idempotency_key: string | null;
   finalize_attempted_at: Timestamp | null;
   settled_at: Timestamp | null;
+  resolution_method: SubmissionResolutionMethod | null;
+  finalize_tx_hash: string | null;
+  escrow_value: string | null;
+  min_challenger_bond: string | null;
   created_at: GeneratedTimestamp;
   updated_at: GeneratedTimestamp;
 }
@@ -56,13 +65,14 @@ export interface ReexecutorTable {
   stake_asset: string;
   reputation_score: Generated<string>;
   active: Generated<boolean>;
+  approved: Generated<boolean>;
   slashed_count: Generated<number>;
   chain_stake_tx_hash: string | null;
   last_seen_at: Timestamp | null;
   joined_at: GeneratedTimestamp;
 }
 
-export type ReplayStatus = "assigned" | "submitted" | "confirmed_onchain";
+export type ReplayStatus = "assigned" | "submitted" | "confirmed_onchain" | "missed";
 
 export interface ReplayTable {
   id: Generated<string>;

@@ -1,22 +1,19 @@
 import type { FastifyInstance } from "fastify";
 import { env } from "./config/env.js";
-import { keeperPublicKey } from "./chain/keeper.js";
+import { sep10SigningKey } from "./auth/sep10.js";
 
 /**
- * Served here for dev/smoke-test convenience since WEB_AUTH_DOMAIN points at
- * the backend directly. In a real deployment this belongs on the public home
- * domain (frontend/public/.well-known/stellar.toml) per SEP-1/SEP-10.
+ * SEP-1 file advertising the SEP-10 endpoint and its signing key. Served by
+ * the backend because WEB_AUTH_DOMAIN points at it; a deployment whose home
+ * domain is a different host should serve the same content from there.
  */
 export async function wellKnownPlugin(app: FastifyInstance) {
   app.get("/.well-known/stellar.toml", async (_req, reply) => {
     reply.type("text/plain");
     return [
       `NETWORK_PASSPHRASE="${env.NETWORK_PASSPHRASE}"`,
-      `WEB_AUTH_ENDPOINT="http://${env.WEB_AUTH_DOMAIN}/auth"`,
-      `SIGNING_KEY="${keeperPublicKey}"`,
-      `[[CURRENCIES]]`,
-      `code="VERITY-BOND"`,
-      `issuer="${env.BOND_ASSET_CONTRACT_ID}"`,
+      `WEB_AUTH_ENDPOINT="${env.PUBLIC_SCHEME}://${env.WEB_AUTH_DOMAIN}/auth"`,
+      `SIGNING_KEY="${sep10SigningKey}"`,
     ].join("\n");
   });
 }
