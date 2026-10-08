@@ -1,13 +1,42 @@
+# The whole Verity stack: Postgres, migrations, backend (API + indexer +
+# keeper), dashboard, and optionally a re-executor fleet.
+#
+#   cp .env.example .env        # fill in the contract IDs and secrets
+#   docker compose up -d --build
+#   docker compose --profile fleet up -d --build    # also run re-executors
+#
+# Everything is configured from .env; nothing below is specific to one
+# deployment. See docs/DEPLOY.md.
+
+x-chain-env: &chain-env
+  SOROBAN_RPC_URL: ${SOROBAN_RPC_URL:-https://soroban-testnet.stellar.org}
+  NETWORK_PASSPHRASE: ${NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}
+  ESCROW_GATE_CONTRACT_ID: ${ESCROW_GATE_CONTRACT_ID:?set ESCROW_GATE_CONTRACT_ID in .env}
+
+x-reexecutor: &reexecutor
+  build:
+    context: .
+    dockerfile: reexecutor-agent/Dockerfile
+  restart: unless-stopped
+  profiles: [fleet]
+  depends_on:
+    backend:
+      condition: service_healthy
+
+x-reexecutor-env: &reexecutor-env
+  <<: *chain-env
+  BACKEND_URL: http://backend:3001
+  POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-3000}
+
 services:
   postgres:
     image: postgres:18-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: verity
-      POSTGRES_PASSWORD: verity
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: verity
-    ports:
-      - "5433:5432"
+    # Not published: only the backend talks to the database.
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -20,10 +49,10 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
-    working_dir: /app
-    command: ["node_modules/.bin/tsx", "db/src/migrate.ts"]
+    working_dir: /app/db
+    command: ["node_modules/.bin/tsx", "src/migrate.ts"]
     environment:
-      DATABASE_URL: postgres://verity:verity@postgres:5432/verity
+      DATABASE_URL: postgres://verity:${POSTGRES_PASSWORD}@postgres:5432/verity
     depends_on:
       postgres:
         condition: service_healthy
@@ -33,22 +62,26 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
+    # Reachable from this host only by default. Outside re-executors need the
+    # API, so put it behind your HTTPS reverse proxy (docs/DEPLOY.md).
     ports:
-      - "3001:3001"
+      - "${API_BIND:-127.0.0.1}:3001:3001"
     environment:
-      SOROBAN_RPC_URL: https://soroban-testnet.stellar.org
-      HORIZON_URL: https://horizon-testnet.stellar.org
-      NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
-      ESCROW_GATE_CONTRACT_ID: ${ESCROW_GATE_CONTRACT_ID}
-      ZK_VERIFIER_REGISTRY_CONTRACT_ID: ${ZK_VERIFIER_REGISTRY_CONTRACT_ID}
-      BOND_ASSET_CONTRACT_ID: ${BOND_ASSET_CONTRACT_ID}
-      DATABASE_URL: postgres://verity:verity@postgres:5432/verity
-      KEEPER_SECRET_KEY: ${KEEPER_SECRET_KEY}
-      JWT_SECRET: ${JWT_SECRET}
-      WEB_AUTH_DOMAIN: ${WEB_AUTH_DOMAIN:-localhost:3001}
-      HOME_DOMAIN: ${HOME_DOMAIN:-localhost:3001}
+      <<: *chain-env
+      ZK_VERIFIER_REGISTRY_CONTRACT_ID: ${ZK_VERIFIER_REGISTRY_CONTRACT_ID:?set ZK_VERIFIER_REGISTRY_CONTRACT_ID in .env}
+      BOND_ASSET_CONTRACT_ID: ${BOND_ASSET_CONTRACT_ID:?set BOND_ASSET_CONTRACT_ID in .env}
+      DATABASE_URL: postgres://verity:${POSTGRES_PASSWORD}@postgres:5432/verity
+      KEEPER_SECRET_KEY: ${KEEPER_SECRET_KEY:?set KEEPER_SECRET_KEY in .env}
+      SEP10_SIGNING_SECRET: ${SEP10_SIGNING_SECRET:?set SEP10_SIGNING_SECRET in .env}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      WEB_AUTH_DOMAIN: ${WEB_AUTH_DOMAIN:?set WEB_AUTH_DOMAIN in .env}
+      HOME_DOMAIN: ${HOME_DOMAIN:?set HOME_DOMAIN in .env}
+      PUBLIC_SCHEME: ${PUBLIC_SCHEME:-https}
+      DEPLOYMENT_NAME: ${DEPLOYMENT_NAME:-public}
       PORT: 3001
       ARTIFACT_STORAGE_DIR: /app/backend/.artifacts
+      # The dashboard forwards each visitor's address for rate limiting.
+      TRUST_PROXY: "true"
     volumes:
       - backend_artifacts:/app/backend/.artifacts
     depends_on:
@@ -59,14 +92,44 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
+      args:
+        NEXT_PUBLIC_NETWORK_PASSPHRASE: ${NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "${WEB_BIND:-127.0.0.1}:3000:3000"
     environment:
       BACKEND_URL: http://backend:3001
-      NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+
+  # The operator's own re-executor fleet (profile "fleet"). Each needs a
+  # staked, approved account; a quorum is three by default.
+  reexecutor-1:
+    <<: *reexecutor
+    environment:
+      <<: *reexecutor-env
+      REEXECUTOR_SECRET_KEY: ${REX1_SECRET_KEY:-}
+  reexecutor-2:
+    <<: *reexecutor
+    environment:
+      <<: *reexecutor-env
+      REEXECUTOR_SECRET_KEY: ${REX2_SECRET_KEY:-}
+  reexecutor-3:
+    <<: *reexecutor
+    environment:
+      <<: *reexecutor-env
+      REEXECUTOR_SECRET_KEY: ${REX3_SECRET_KEY:-}
+  reexecutor-4:
+    <<: *reexecutor
+    environment:
+      <<: *reexecutor-env
+      REEXECUTOR_SECRET_KEY: ${REX4_SECRET_KEY:-}
+  reexecutor-5:
+    <<: *reexecutor
+    environment:
+      <<: *reexecutor-env
+      REEXECUTOR_SECRET_KEY: ${REX5_SECRET_KEY:-}
 
 volumes:
   pgdata:

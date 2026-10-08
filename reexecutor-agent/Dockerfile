@@ -1,9 +1,13 @@
-FROM node:22-alpine AS base
+# Verity re-executor worker. Replays assigned submissions and votes on-chain
+# with its own key (REEXECUTOR_SECRET_KEY).
+#
+# Submitted functions run in a WebAssembly sandbox inside the worker process,
+# so this image needs no container runtime, socket or extra privileges.
+FROM node:22-alpine
 RUN corepack enable
 WORKDIR /app
 
-FROM base AS deps
-COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml tsconfig.base.json ./
 COPY backend/package.json backend/package.json
 COPY backend/src/chain/generated/escrow-gate/package.json backend/src/chain/generated/escrow-gate/package.json
 COPY backend/src/chain/generated/zk-verifier-registry/package.json backend/src/chain/generated/zk-verifier-registry/package.json
@@ -12,10 +16,11 @@ COPY reexecutor-agent/package.json reexecutor-agent/package.json
 COPY db/package.json db/package.json
 RUN pnpm install --frozen-lockfile --filter @verity/reexecutor-agent...
 
-FROM deps AS runner
-ENV NODE_ENV=production
 COPY backend/src/chain/generated backend/src/chain/generated
 RUN pnpm --filter escrow-gate build
 COPY reexecutor-agent reexecutor-agent
+
+ENV NODE_ENV=production
 WORKDIR /app/reexecutor-agent
-CMD ["pnpm", "start"]
+USER node
+CMD ["node_modules/.bin/tsx", "src/index.ts"]
