@@ -1,12 +1,28 @@
+import type { Metadata } from "next";
+import Link from "next/link";
 import { notFound } from "next/navigation";
 import { backendGetOrNull } from "../../../lib/server-api";
-import type { SubmissionDetail, ProofStatus } from "../../../lib/types";
+import type { Artifact, Attestation, SubmissionDetail, ProofStatus } from "../../../lib/types";
 import { Card, CardBody, CardHeader } from "../../../components/ui/card";
 import { VerdictBadge } from "../../../components/verdict-badge";
-import { stroopsToXlm, truncateMiddle, formatRelativeTime, windowDeadlineIso } from "../../../lib/format";
-import { TESTNET_EXPLORER_TX } from "../../../lib/config";
+import { AutoRefresh } from "../../../components/auto-refresh";
+import { stroopsToXlm, truncateMiddle, formatDuration, formatRelativeTime, windowDeadlineIso } from "../../../lib/format";
+import { TESTNET_EXPLORER_ACCOUNT, TESTNET_EXPLORER_TX } from "../../../lib/config";
 import { ChallengeWindowCountdown } from "../../../components/challenge-window-countdown";
 import { OpenChallengeButton } from "../../../components/open-challenge-button";
+
+export const metadata: Metadata = { title: "Submission" };
+
+const linkClass = "text-accent underline-offset-2 hover:underline";
+
+/** The stored artifact behind a storage_ref, decoded for display. Null when
+ * there is none or it cannot be read. */
+async function loadArtifact(ref: string | null): Promise<string | null> {
+  const hash = ref?.split(/[\\/]/).pop();
+  if (!hash || !/^[0-9a-f]{64}$/.test(hash)) return null;
+  const artifact = await backendGetOrNull<Artifact>(`/v1/artifacts/${hash}`);
+  return artifact ? Buffer.from(artifact.content_base64, "base64").toString("utf8") : null;
+}
 
 export default async function SubmissionDetailPage({
   params,
@@ -14,97 +30,153 @@ export default async function SubmissionDetailPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
-  const [detail, proof] = await Promise.all([
-    backendGetOrNull<SubmissionDetail>(`/v1/submissions/${id}`),
-    backendGetOrNull<ProofStatus>(`/v1/submissions/${id}/proof`),
-  ]);
+  const detail = await backendGetOrNull<SubmissionDetail>(`/v1/submissions/${id}`);
   if (!detail) notFound();
   const { submission, replays, spot_checks, challenge } = detail;
+
+  const [proof, attestation, inputText, functionText, outputText] = await Promise.all([
+    backendGetOrNull<ProofStatus>(`/v1/submissions/${id}/proof`),
+    detail.has_attestation ? backendGetOrNull<Attestation>(`/v1/submissions/${id}/attestation`) : null,
+    loadArtifact(submission.input_ref),
+    loadArtifact(submission.function_ref),
+    loadArtifact(submission.claimed_output_ref),
+  ]);
+
   const deadline = windowDeadlineIso(submission.submitted_at, submission.challenge_window_s);
+  const open = submission.status === "pending" || submission.status === "disputed";
+  // Keep reading until the verdict is in and its settlement has been recorded.
+  const live = open || (submission.chain_submission_id !== null && !submission.settled_at);
+  const votes = replays.filter((r) => r.status === "confirmed_onchain");
 
   return (
     <div className="space-y-6">
+      {live && <AutoRefresh />}
+
       <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="font-mono text-xl">
-            {submission.chain_submission_id ? `Submission #${submission.chain_submission_id}` : "Submission"}
+        <div className="min-w-0">
+          <Link href="/submissions" className="text-xs text-text-tertiary hover:text-text-secondary">
+            ← Submissions
+          </Link>
+          <h1 className="mt-2 font-mono text-xl">
+            {submission.chain_submission_id ? `Submission #${submission.chain_submission_id}` : "Unsigned draft"}
           </h1>
-          <p className="mt-1 text-sm text-text-secondary">{submission.escrow_ref}</p>
+          <p className="mt-1 break-words text-sm text-text-secondary">{submission.escrow_ref}</p>
         </div>
-        <VerdictBadge status={submission.status} resolutionMethod={challenge?.resolution_method} />
+        <VerdictBadge
+          status={submission.status}
+          resolutionMethod={submission.resolution_method}
+          hasChallenge={challenge !== null}
+          align="end"
+        />
       </div>
 
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-        <Stat label="Task type" value={submission.task_type} />
-        <Stat label="Bond" value={`${stroopsToXlm(submission.bond_amount)} XLM`} />
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <Stat label="Task type" value={submission.task_type} capitalize />
+        <Stat label="Agent bond" value={`${stroopsToXlm(submission.bond_amount)} XLM`} mono />
         <Stat label="Submitted" value={formatRelativeTime(submission.submitted_at)} />
-        <CardStatSlot>
-          {submission.status === "pending" && !challenge ? (
-            <ChallengeWindowCountdown deadlineIso={deadline} />
-          ) : (
-            <Stat label="Window" value={`${submission.challenge_window_s}s`} bare />
-          )}
-        </CardStatSlot>
+        <Card>
+          <CardBody>
+            {submission.status === "pending" && !challenge ? (
+              <ChallengeWindowCountdown deadlineIso={deadline} />
+            ) : (
+              <StatBody label="Challenge window" value={formatDuration(submission.challenge_window_s)} />
+            )}
+          </CardBody>
+        </Card>
       </div>
 
-      {submission.chain_tx_hash && (
-        <a
-          href={TESTNET_EXPLORER_TX(submission.chain_tx_hash)}
-          target="_blank"
-          rel="noreferrer"
-          className="inline-block text-sm text-accent hover:underline"
-        >
-          View submission transaction on stellar.expert
-        </a>
-      )}
+      <dl className="grid grid-cols-1 gap-x-8 gap-y-3 text-sm sm:grid-cols-2">
+        <Fact label="Agent">
+          <a href={TESTNET_EXPLORER_ACCOUNT(submission.agent_id)} target="_blank" rel="noreferrer" className={`font-mono text-xs ${linkClass}`}>
+            {truncateMiddle(submission.agent_id, 8, 8)}
+          </a>
+        </Fact>
+        {submission.escrow_value && (
+          <Fact label="Declared escrow value">
+            <span className="font-mono">{stroopsToXlm(submission.escrow_value)} XLM</span>
+          </Fact>
+        )}
+        {submission.chain_tx_hash && submission.chain_submission_id && (
+          <Fact label="Submit transaction">
+            <a href={TESTNET_EXPLORER_TX(submission.chain_tx_hash)} target="_blank" rel="noreferrer" className={`font-mono text-xs ${linkClass}`}>
+              {truncateMiddle(submission.chain_tx_hash, 8, 8)}
+            </a>
+          </Fact>
+        )}
+        {submission.finalize_tx_hash && (
+          <Fact label="Finalize transaction">
+            <a href={TESTNET_EXPLORER_TX(submission.finalize_tx_hash)} target="_blank" rel="noreferrer" className={`font-mono text-xs ${linkClass}`}>
+              {truncateMiddle(submission.finalize_tx_hash, 8, 8)}
+            </a>
+          </Fact>
+        )}
+      </dl>
 
       <Card>
         <CardHeader>
-          <span className="font-medium">Proof status</span>
+          <h2 className="font-medium">What was declared</h2>
+          <p className="mt-1 max-w-prose text-xs text-text-tertiary">
+            The artifacts re-executors fetch and replay. Each is stored under its own sha256 hash;
+            the input and claimed-output hashes are the ones committed on-chain. The function is
+            not committed on-chain, so a verdict means &ldquo;consistent with these artifacts&rdquo;.
+          </p>
         </CardHeader>
-        <CardBody>
-          {proof?.available ? (
-            <p className="text-sm text-status-verified">A ZK proof artifact is available.</p>
-          ) : (
-            <p className="text-sm text-text-secondary">
-              {proof?.reason ??
-                "No ZK verifier is registered on this deployment. Verdicts are reached by economic re-execution consensus, not cryptographic proof."}
-            </p>
+        <CardBody className="space-y-5">
+          <ArtifactBlock
+            label={submission.task_type === "retrieval" ? "Request spec" : "Input"}
+            hash={submission.input_hash}
+            text={inputText}
+          />
+          {submission.task_type === "deterministic" && (
+            <ArtifactBlock label="Function body" hash={submission.function_hash} text={functionText} />
           )}
+          <ArtifactBlock label="Claimed output" hash={submission.claimed_output_hash} text={outputText} />
         </CardBody>
       </Card>
 
       <Card>
         <CardHeader>
-          <span className="font-medium">Replay attestations</span>
+          <h2 className="font-medium">Replay attestations</h2>
+          {replays.length > 0 && (
+            <p className="mt-1 text-xs text-text-tertiary">
+              {votes.length} of {replays.length} assigned re-executor{replays.length === 1 ? "" : "s"} voted on-chain.
+            </p>
+          )}
         </CardHeader>
         <CardBody className="p-0">
           {replays.length === 0 ? (
             <p className="px-5 py-8 text-center text-sm text-text-tertiary">
-              No re-executors have replayed this submission yet.
+              {submission.task_type === "retrieval"
+                ? "A retrieval task is spot-checked first. It is only replayed by a full quorum if that check fails or someone challenges it."
+                : open
+                  ? "No re-executor has been assigned yet. Assignment waits for one to be online."
+                  : "No re-executor replayed this submission."}
             </p>
           ) : (
             <ul className="divide-y divide-border-subtle">
               {replays.map((r) => (
-                <li key={r.id} className="flex items-center justify-between px-5 py-3 text-sm">
-                  <span className="text-text-secondary">
-                    Re-executor {truncateMiddle(r.reexecutor_id, 6, 4)}
-                  </span>
-                  <div className="flex items-center gap-3">
-                    <span className="text-xs text-text-tertiary">{r.status}</span>
-                    {r.match !== null && (
+                <li key={r.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-3 text-sm">
+                  <Link href={`/reexecutors/${r.reexecutor_id}`} className={`font-mono text-xs ${linkClass}`}>
+                    {truncateMiddle(r.reexecutor_account, 6, 6)}
+                  </Link>
+                  <div className="flex items-center gap-4">
+                    {r.status === "confirmed_onchain" && r.match !== null ? (
                       <span className={r.match ? "text-status-verified" : "text-status-slashed"}>
                         {r.match ? "Match" : "Mismatch"}
                       </span>
+                    ) : (
+                      <span className="text-text-tertiary">
+                        {r.status === "missed" ? "Did not vote" : "Assigned, no vote yet"}
+                      </span>
+                    )}
+                    {r.slash_tx_hash && (
+                      <a href={TESTNET_EXPLORER_TX(r.slash_tx_hash)} target="_blank" rel="noreferrer" className="text-xs text-status-slashed underline-offset-2 hover:underline">
+                        slashed
+                      </a>
                     )}
                     {r.tx_hash && (
-                      <a
-                        href={TESTNET_EXPLORER_TX(r.tx_hash)}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-xs text-accent hover:underline"
-                      >
-                        tx
+                      <a href={TESTNET_EXPLORER_TX(r.tx_hash)} target="_blank" rel="noreferrer" className={`text-xs ${linkClass}`}>
+                        vote tx
                       </a>
                     )}
                   </div>
@@ -118,21 +190,37 @@ export default async function SubmissionDetailPage({
       {submission.task_type === "retrieval" && (
         <Card>
           <CardHeader>
-            <span className="font-medium">Spot checks</span>
+            <h2 className="font-medium">Spot check</h2>
           </CardHeader>
           <CardBody className="p-0">
             {spot_checks.length === 0 ? (
               <p className="px-5 py-8 text-center text-sm text-text-tertiary">
-                Not sampled for spot-check yet.
+                {open ? "Waiting for a re-executor to be online to sample this." : "This submission was not sampled."}
               </p>
             ) : (
               <ul className="divide-y divide-border-subtle">
                 {spot_checks.map((s) => (
-                  <li key={s.id} className="flex items-center justify-between px-5 py-3 text-sm">
-                    <span className="text-text-secondary">
-                      Re-executor {truncateMiddle(s.reexecutor_id, 6, 4)}
+                  <li key={s.id} className="flex items-center justify-between gap-3 px-5 py-3 text-sm">
+                    <Link href={`/reexecutors/${s.reexecutor_id}`} className={`font-mono text-xs ${linkClass}`}>
+                      {truncateMiddle(s.reexecutor_account, 6, 6)}
+                    </Link>
+                    <span
+                      className={
+                        s.result === "match"
+                          ? "text-status-verified"
+                          : s.result === "mismatch"
+                            ? "text-status-slashed"
+                            : "text-text-tertiary"
+                      }
+                    >
+                      {s.result === "match"
+                        ? "Match"
+                        : s.result === "mismatch"
+                          ? "Mismatch, escalated to a full quorum"
+                          : open
+                            ? "Sampled, no result yet"
+                            : "No result"}
                     </span>
-                    <span>{s.result ?? "pending"}</span>
                   </li>
                 ))}
               </ul>
@@ -143,26 +231,92 @@ export default async function SubmissionDetailPage({
 
       <Card>
         <CardHeader>
-          <span className="font-medium">Challenge</span>
+          <h2 className="font-medium">Challenge</h2>
         </CardHeader>
         <CardBody className="space-y-3">
           {challenge ? (
-            <div className="text-sm">
+            <div className="space-y-2 text-sm">
               <p>
-                Challenger {truncateMiddle(challenge.challenger_account, 6, 6)} bonded{" "}
-                {stroopsToXlm(challenge.challenger_bond)} XLM
+                <a href={TESTNET_EXPLORER_ACCOUNT(challenge.challenger_account)} target="_blank" rel="noreferrer" className={`font-mono text-xs ${linkClass}`}>
+                  {truncateMiddle(challenge.challenger_account, 6, 6)}
+                </a>{" "}
+                bonded <span className="font-mono">{stroopsToXlm(challenge.challenger_bond)} XLM</span>{" "}
+                against this submission {formatRelativeTime(challenge.opened_at)}.
               </p>
-              <p className="mt-1 text-text-tertiary">
-                {challenge.resolved_at
-                  ? `Resolved: ${challenge.resolution} via ${challenge.resolution_method}`
-                  : "Awaiting resolution"}
+              <p className="text-text-secondary">
+                {challenge.resolution === "upheld"
+                  ? "Upheld by bonded re-execution consensus: the work was found wrong. The challenger got their bond back plus a share of the agent's."
+                  : challenge.resolution === "rejected"
+                    ? "Rejected by bonded re-execution consensus: the work was found right. The challenger's bond went to the agent."
+                    : challenge.resolved_at
+                      ? "Expired: re-executors did not reach a consensus within a further window. Both bonds were returned."
+                      : "Open. It resolves when a quorum of re-executors reaches consensus, or expires one window after it was opened."}
               </p>
+              {challenge.chain_tx_hash && (
+                <a href={TESTNET_EXPLORER_TX(challenge.chain_tx_hash)} target="_blank" rel="noreferrer" className={`text-xs ${linkClass}`}>
+                  View challenge transaction
+                </a>
+              )}
             </div>
-          ) : submission.chain_submission_id ? (
-            <OpenChallengeButton submissionId={submission.id} />
+          ) : !submission.chain_submission_id ? (
+            <p className="text-sm text-text-tertiary">
+              This draft was never signed, so it is not on-chain and there is nothing to challenge.
+            </p>
+          ) : submission.status === "pending" ? (
+            <OpenChallengeButton
+              submissionId={submission.id}
+              deadlineIso={deadline}
+              minBondStroops={submission.min_challenger_bond}
+            />
           ) : (
             <p className="text-sm text-text-tertiary">
-              Not yet confirmed on-chain, cannot be challenged.
+              This submission was finalized without a challenge and can no longer be challenged.
+            </p>
+          )}
+        </CardBody>
+      </Card>
+
+      {attestation && (
+        <Card>
+          <CardHeader>
+            <h2 className="font-medium">Signed attestation</h2>
+            <p className="mt-1 max-w-prose text-xs text-text-tertiary">
+              Verity&apos;s signed record of this verdict. The signature covers the canonical JSON of the
+              payload, so anyone can check it against the signer&apos;s key. It is stored and served
+              here; it has not been pushed to any external registry.
+            </p>
+          </CardHeader>
+          <CardBody className="space-y-3 text-sm">
+            <dl className="grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-2">
+              {attestation.signer && (
+                <Fact label="Signer">
+                  <a href={TESTNET_EXPLORER_ACCOUNT(attestation.signer)} target="_blank" rel="noreferrer" className={`font-mono text-xs ${linkClass}`}>
+                    {truncateMiddle(attestation.signer, 8, 8)}
+                  </a>
+                </Fact>
+              )}
+              <Fact label="Signature (ed25519, base64)">
+                <span className="break-all font-mono text-xs text-text-secondary">{attestation.signature}</span>
+              </Fact>
+            </dl>
+            <pre className="max-h-64 overflow-auto rounded-lg border border-border-subtle bg-surface p-3 font-mono text-xs leading-relaxed text-text-secondary">
+              {JSON.stringify(attestation.payload, null, 2)}
+            </pre>
+          </CardBody>
+        </Card>
+      )}
+
+      <Card>
+        <CardHeader>
+          <h2 className="font-medium">Proof status</h2>
+        </CardHeader>
+        <CardBody>
+          {proof?.available ? (
+            <p className="text-sm text-status-verified">A ZK proof artifact is available.</p>
+          ) : (
+            <p className="max-w-prose text-sm text-text-secondary">
+              {proof?.reason ??
+                "ZK proving is not active in Phase 1. Verdicts come from bonded re-execution, not cryptographic proof."}
             </p>
           )}
         </CardBody>
@@ -171,25 +325,48 @@ export default async function SubmissionDetailPage({
   );
 }
 
-function Stat({ label, value, bare }: { label: string; value: string; bare?: boolean }) {
-  const content = (
+function StatBody({ label, value, mono, capitalize }: { label: string; value: string; mono?: boolean; capitalize?: boolean }) {
+  return (
     <>
       <p className="text-xs uppercase tracking-wide text-text-tertiary">{label}</p>
-      <p className="mt-2 text-sm capitalize">{value}</p>
+      <p className={`mt-2 text-sm ${mono ? "font-mono" : ""} ${capitalize ? "capitalize" : ""}`}>{value}</p>
     </>
   );
-  if (bare) return content;
+}
+
+function Stat(props: { label: string; value: string; mono?: boolean; capitalize?: boolean }) {
   return (
     <Card>
-      <CardBody>{content}</CardBody>
+      <CardBody>
+        <StatBody {...props} />
+      </CardBody>
     </Card>
   );
 }
 
-function CardStatSlot({ children }: { children: React.ReactNode }) {
+function Fact({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <Card>
-      <CardBody>{children}</CardBody>
-    </Card>
+    <div>
+      <dt className="text-xs text-text-tertiary">{label}</dt>
+      <dd className="mt-1">{children}</dd>
+    </div>
+  );
+}
+
+function ArtifactBlock({ label, hash, text }: { label: string; hash: string | null; text: string | null }) {
+  return (
+    <div>
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h3 className="text-sm text-text-secondary">{label}</h3>
+        {hash && <span className="font-mono text-xs text-text-tertiary">sha256 {truncateMiddle(hash, 10, 10)}</span>}
+      </div>
+      {text === null ? (
+        <p className="mt-2 text-sm text-text-tertiary">Not stored on this deployment.</p>
+      ) : (
+        <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border-subtle bg-surface p-3 font-mono text-xs leading-relaxed">
+          {text}
+        </pre>
+      )}
+    </div>
   );
 }

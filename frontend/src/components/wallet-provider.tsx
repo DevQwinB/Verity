@@ -1,16 +1,30 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
-import { connectWallet, signXdr } from "../lib/wallet";
-import { fetchChallenge, exchangeChallenge, getSession, logout as apiLogout } from "../lib/client-api";
+import { WatchWalletChanges } from "@stellar/freighter-api";
+import { connectWallet, signXdr, WalletError, type WalletErrorCode } from "../lib/wallet";
+import {
+  fetchChallenge,
+  exchangeChallenge,
+  getSession,
+  logout as apiLogout,
+  SESSION_EXPIRED_EVENT,
+} from "../lib/client-api";
 import { NETWORK_PASSPHRASE } from "../lib/config";
+
+export interface WalletProblem {
+  message: string;
+  /** Set when the wallet itself is the problem, so the UI can offer the fix. */
+  code: WalletErrorCode | null;
+}
 
 interface WalletState {
   account: string | null;
   connecting: boolean;
-  error: string | null;
+  problem: WalletProblem | null;
   login: () => Promise<void>;
   logout: () => Promise<void>;
+  dismissProblem: () => void;
 }
 
 const WalletContext = createContext<WalletState | null>(null);
@@ -18,7 +32,7 @@ const WalletContext = createContext<WalletState | null>(null);
 export function WalletProvider({ children }: { children: React.ReactNode }) {
   const [account, setAccount] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [problem, setProblem] = useState<WalletProblem | null>(null);
 
   useEffect(() => {
     getSession()
@@ -26,11 +40,40 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       .catch(() => setAccount(null));
   }, []);
 
+  // The session lives an hour. When the server stops recognising it, show
+  // that here rather than leaving a connected-looking account that cannot act.
+  useEffect(() => {
+    const onExpired = () => {
+      setAccount(null);
+      setProblem({ message: "Your session has expired. Connect your wallet again to continue.", code: null });
+    };
+    window.addEventListener(SESSION_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
+  }, []);
+
+  // The session is for one account. If Freighter's active account changes,
+  // anything signed next would be for somebody else, so sign out and say why.
+  useEffect(() => {
+    if (!account) return;
+    const watcher = new WatchWalletChanges(3000);
+    watcher.watch(({ address }) => {
+      if (address && address !== account) {
+        void apiLogout();
+        setAccount(null);
+        setProblem({
+          message: "Freighter switched to a different account. Connect again to continue as that account.",
+          code: null,
+        });
+      }
+    });
+    return () => watcher.stop();
+  }, [account]);
+
   const login = useCallback(async () => {
     setConnecting(true);
-    setError(null);
+    setProblem(null);
     try {
-      const address = await connectWallet();
+      const address = await connectWallet(NETWORK_PASSPHRASE);
       const { transaction, network_passphrase } = await fetchChallenge(address);
       const signed = await signXdr(transaction, {
         networkPassphrase: network_passphrase || NETWORK_PASSPHRASE,
@@ -39,7 +82,10 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       const { account: authedAccount } = await exchangeChallenge(signed);
       setAccount(authedAccount);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Wallet connection failed.");
+      setProblem({
+        message: err instanceof Error ? err.message : "Wallet connection failed.",
+        code: err instanceof WalletError ? err.code : null,
+      });
     } finally {
       setConnecting(false);
     }
@@ -50,8 +96,10 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     setAccount(null);
   }, []);
 
+  const dismissProblem = useCallback(() => setProblem(null), []);
+
   return (
-    <WalletContext.Provider value={{ account, connecting, error, login, logout }}>
+    <WalletContext.Provider value={{ account, connecting, problem, login, logout, dismissProblem }}>
       {children}
     </WalletContext.Provider>
   );

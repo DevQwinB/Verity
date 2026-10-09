@@ -28,3 +28,17 @@ export async function readArtifact(storageRef: string): Promise<Buffer> {
   }
   return content;
 }
+
+/** Path of the artifact stored under a content hash. */
+export function artifactPath(contentHash: string): string {
+  return path.join(env.ARTIFACT_STORAGE_DIR, contentHash);
+}
+
+export async function artifactExists(contentHash: string): Promise<boolean> {
+  try {
+    await fs.access(artifactPath(contentHash));
+    return true;
+  } catch {
+    return false;
+  }
+}

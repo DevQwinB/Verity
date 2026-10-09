@@ -2,13 +2,19 @@
   "name": "verity",
   "private": true,
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "packageManager": "pnpm@10.22.0",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
+    "dev": "bash scripts/dev.sh",
+    "smoke": "bash scripts/smoke.sh",
+    "db:migrate": "pnpm --filter @verity/db migrate",
+    "test:contracts": "cd contracts && cargo test",
     "build": "pnpm -r build",
-    "test": "pnpm -r test",
-    "lint": "pnpm -r lint"
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "db:reset": "pnpm --filter @verity/db reset",
+    "lint": "pnpm --filter @verity/frontend lint"
   }
 }

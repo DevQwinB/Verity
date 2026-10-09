@@ -21,6 +21,8 @@ fn default_config() -> ConfigRecord {
         window_tier_small_s: 3600,
         window_tier_large_s: 86_400,
         slash_split_challenger_bps: 2000,
+        reexecutor_slash_bps: 1000,
+        reexecutor_allowlist: false,
     }
 }
 
@@ -34,9 +36,8 @@ fn release_pays_agent_only_after_gate_verifies() {
     let token = token::Client::new(&e, &sac.address());
     let token_admin = token::StellarAssetClient::new(&e, &sac.address());
 
-    let gate_id = e.register(EscrowGate, ());
+    let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
-    gate.initialize(&admin, &sac.address(), &default_config());
 
     let mkt_id = e.register(ExampleMarketplaceEscrow, ());
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
@@ -88,9 +89,8 @@ fn release_refunds_poster_when_gate_slashes() {
     let token = token::Client::new(&e, &sac.address());
     let token_admin = token::StellarAssetClient::new(&e, &sac.address());
 
-    let gate_id = e.register(EscrowGate, ());
+    let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
-    gate.initialize(&admin, &sac.address(), &default_config());
 
     let mkt_id = e.register(ExampleMarketplaceEscrow, ());
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);

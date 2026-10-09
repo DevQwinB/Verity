@@ -6,10 +6,9 @@ use verity_common::Error;
 
 fn setup(e: &Env) -> (ZkVerifierRegistryClient<'_>, Address) {
     let admin = Address::generate(e);
-    let id = e.register(ZkVerifierRegistry, ());
+    let id = e.register(ZkVerifierRegistry, (admin.clone(),));
     let client = ZkVerifierRegistryClient::new(e, &id);
     e.mock_all_auths();
-    client.initialize(&admin);
     (client, admin)
 }
 

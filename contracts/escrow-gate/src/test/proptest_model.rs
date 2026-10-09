@@ -8,8 +8,11 @@
 
 use crate::{EscrowGate, EscrowGateClient};
 use proptest::prelude::*;
-use soroban_sdk::{testutils::Address as _, token, Address, BytesN, Env};
-use verity_common::{ConfigRecord, TaskType, Verdict};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    token, Address, BytesN, Env,
+};
+use verity_common::{ConfigRecord, ResolutionMethod, TaskType, Verdict};
 
 const XLM: i128 = 10_000_000;
 const QUORUM_MIN: u32 = 3;
@@ -43,23 +46,21 @@ fn run_case(votes: Vec<(i64, bool)>) {
     let token = token::Client::new(&e, &sac.address());
     let token_admin = token::StellarAssetClient::new(&e, &sac.address());
 
-    let id = e.register(EscrowGate, ());
+    let config = ConfigRecord {
+        min_stake_floor: 1,
+        quorum_min_reexecutors: QUORUM_MIN,
+        quorum_supermajority_bps: SUPERMAJORITY_BPS as u32,
+        agent_bond_min_bps: 500,
+        challenger_bond_min_bps: 500,
+        window_tier_small_ceiling: 100_000 * XLM,
+        window_tier_small_s: 3600,
+        window_tier_large_s: 86_400,
+        slash_split_challenger_bps: 2000,
+        reexecutor_slash_bps: 1000,
+        reexecutor_allowlist: false,
+    };
+    let id = e.register(EscrowGate, (admin.clone(), sac.address(), config));
     let client = EscrowGateClient::new(&e, &id);
-    client.initialize(
-        &admin,
-        &sac.address(),
-        &ConfigRecord {
-            min_stake_floor: 1,
-            quorum_min_reexecutors: QUORUM_MIN,
-            quorum_supermajority_bps: SUPERMAJORITY_BPS as u32,
-            agent_bond_min_bps: 500,
-            challenger_bond_min_bps: 500,
-            window_tier_small_ceiling: 100_000 * XLM,
-            window_tier_small_s: 3600,
-            window_tier_large_s: 86_400,
-            slash_split_challenger_bps: 2000,
-        },
-    );
 
     let agent = Address::generate(&e);
     token_admin.mint(&agent, &(1000 * XLM));
@@ -87,13 +88,38 @@ fn run_case(votes: Vec<(i64, bool)>) {
     let actual = client.finalize(&submission_id);
 
     match expected {
-        Some(v) => assert_eq!(actual, v, "votes={:?}", recorded_votes),
-        None => assert_eq!(
-            actual,
-            Verdict::Pending,
-            "expected no consensus yet (window hasn't elapsed): votes={:?}",
-            recorded_votes
-        ),
+        Some(v) => {
+            assert_eq!(actual, v, "votes={:?}", recorded_votes);
+            assert_eq!(
+                client.get_submission(&submission_id).unwrap().resolution_method,
+                ResolutionMethod::ReexecutionConsensus
+            );
+        }
+        None => {
+            assert_eq!(
+                actual,
+                Verdict::Pending,
+                "expected no consensus yet (window hasn't elapsed): votes={:?}",
+                recorded_votes
+            );
+            // Once the window closes without a consensus, the outcome is a
+            // default, never a slash: Verified only if nobody reported a
+            // mismatch, and always labelled as a window that elapsed.
+            e.ledger().with_mut(|l| l.timestamp += 3600);
+            let any_mismatch = recorded_votes.iter().any(|(_, matched)| !*matched);
+            let defaulted = client.finalize(&submission_id);
+            assert_eq!(
+                defaulted,
+                if any_mismatch { Verdict::ExpiredUnverified } else { Verdict::Verified },
+                "votes={:?}",
+                recorded_votes
+            );
+            assert_eq!(
+                client.get_submission(&submission_id).unwrap().resolution_method,
+                ResolutionMethod::WindowElapsed
+            );
+            assert_eq!(token.balance(&agent), 1000 * XLM, "bond must come back on a default");
+        }
     }
     let _ = token; // silence unused warning if a future edit drops balance assertions
 }

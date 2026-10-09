@@ -1,19 +1,11 @@
 import { createHash } from "node:crypto";
-import type { TaskType as ChainTaskType, ResolutionMethod as ChainResolutionMethod } from "escrow-gate";
-import type { TaskType } from "@verity/db";
+import type { TaskType as ChainTaskType } from "escrow-gate";
+import type { SubmissionResolutionMethod, TaskType } from "@verity/db";
 
 export function toChainTaskType(t: TaskType): ChainTaskType {
   if (t === "deterministic") return { tag: "Deterministic", values: void 0 };
   if (t === "retrieval") return { tag: "Retrieval", values: void 0 };
   return { tag: "Unverifiable", values: void 0 };
-}
-
-export function toChainResolutionMethod(
-  m: "reexecution_consensus" | "zk_proof"
-): ChainResolutionMethod {
-  return m === "zk_proof"
-    ? { tag: "ZkProof", values: void 0 }
-    : { tag: "ReexecutionConsensus", values: void 0 };
 }
 
 /** A fieldless #[contracttype] enum variant decodes differently depending on
@@ -54,8 +46,19 @@ export function fromChainResolution(v: unknown): "upheld" | "rejected" | null {
   return null;
 }
 
-export function fromChainResolutionMethod(v: unknown): "reexecution_consensus" | "zk_proof" {
-  return enumTag(v) === "ZkProof" ? "zk_proof" : "reexecution_consensus";
+/** Null for `None` (not resolved yet) and for anything unrecognised: an
+ * unknown method must never be reported as re-execution consensus. */
+export function fromChainResolutionMethod(v: unknown): SubmissionResolutionMethod | null {
+  switch (enumTag(v)) {
+    case "ReexecutionConsensus":
+      return "reexecution_consensus";
+    case "WindowElapsed":
+      return "window_elapsed";
+    case "ZkProof":
+      return "zk_proof";
+    default:
+      return null;
+  }
 }
 
 /** Deterministic 32-byte content address, matching what the contract expects

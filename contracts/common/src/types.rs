@@ -34,12 +34,20 @@ pub enum Verdict {
 /// `Option<CustomEnum>` fields fail to derive their ScVal conversion in
 /// soroban-sdk 27's #[contracttype] macro for simple (data-less) enums, so a
 /// dedicated `None` variant is used as the "not yet set" sentinel instead.
+///
+/// `WindowElapsed` marks a verdict nobody actually established: the window
+/// closed without a bonded consensus. It is kept distinct from
+/// `ReexecutionConsensus` so a submission that was never replayed to quorum
+/// can never be presented as one that was, and so nobody is slashed for it.
+///
+/// `ZkProof` is reserved for Phase 2. No entrypoint accepts it today.
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolutionMethod {
     None,
     ReexecutionConsensus,
     ZkProof,
+    WindowElapsed,
 }
 
 #[contracttype]
@@ -66,9 +74,17 @@ pub struct ConfigRecord {
     pub window_tier_small_s: u64,
     pub window_tier_large_s: u64,
     /// Share of a slashed amount that goes to the prevailing challenger; the
-    /// remainder is distributed to correctly-voting re-executors. Fixed in
-    /// practice — treated as effectively immutable governance, not a per-dispute lever.
+    /// remainder goes to the admin/treasury account. Fixed in practice —
+    /// treated as effectively immutable governance, not a per-dispute lever.
     pub slash_split_challenger_bps: u32,
+    /// Share of a wrong-side re-executor's stake forfeited when a bonded
+    /// consensus proves their vote wrong. Set on-chain so the amount is never
+    /// a caller's choice; 0 disables re-executor slashing.
+    pub reexecutor_slash_bps: u32,
+    /// When true, only re-executors the admin has approved may attest. Meant
+    /// for networks where stake is free (testnet), where an open voter set
+    /// can be captured at no cost.
+    pub reexecutor_allowlist: bool,
 }
 
 impl ConfigRecord {
@@ -103,6 +119,7 @@ pub struct SubmissionRecord {
     pub cfg_quorum_supermajority_bps: u32,
     pub cfg_slash_split_challenger_bps: u32,
     pub cfg_challenger_bond_min_bps: u32,
+    pub cfg_reexecutor_slash_bps: u32,
 }
 
 #[contracttype]
@@ -126,4 +143,7 @@ pub struct ReexecutorInfo {
     /// min_stake_floor while this is nonzero — see EscrowGate::withdraw_stake
     /// and EscrowGate::release_attestation_lock.
     pub open_attestations: u32,
+    /// Set by the admin through EscrowGate::set_reexecutor_approved. Only
+    /// consulted while ConfigRecord::reexecutor_allowlist is on.
+    pub approved: bool,
 }

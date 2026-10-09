@@ -6,7 +6,6 @@ use verity_common::{ChallengeRecord, ConfigRecord, ReexecutorInfo, SubmissionRec
 pub enum DataKey {
     Admin,
     BondAsset,
-    ZkRegistry,
     Config,
     NextSubmissionId,
     Submission(u64),
@@ -31,6 +30,13 @@ fn extend(e: &Env, key: &DataKey) {
         .extend_ttl(key, BUMP_THRESHOLD, BUMP_TO);
 }
 
+/// The instance entry holds the admin, config and id counter, and its TTL
+/// also covers the contract code. Called from every state-changing
+/// entrypoint so a deployment in use never has them archived.
+pub fn bump_instance(e: &Env) {
+    e.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+}
+
 pub fn get_admin(e: &Env) -> Option<Address> {
     e.storage().instance().get(&DataKey::Admin)
 }
@@ -45,14 +51,6 @@ pub fn get_bond_asset(e: &Env) -> Option<Address> {
 
 pub fn set_bond_asset(e: &Env, asset: &Address) {
     e.storage().instance().set(&DataKey::BondAsset, asset);
-}
-
-pub fn get_zk_registry(e: &Env) -> Option<Address> {
-    e.storage().instance().get(&DataKey::ZkRegistry)
-}
-
-pub fn set_zk_registry(e: &Env, registry: &Address) {
-    e.storage().instance().set(&DataKey::ZkRegistry, registry);
 }
 
 pub fn get_config(e: &Env) -> Option<ConfigRecord> {

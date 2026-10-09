@@ -1,66 +1,210 @@
 import { createHash } from "node:crypto";
+import { sql } from "kysely";
+import type { TaskType } from "@verity/db";
 import { db } from "../../db.js";
-import { escrowGateAsKeeper } from "../../chain/clients.js";
+import { env } from "../../config/env.js";
+import { getGateConfig } from "../../chain/config.js";
+
+/** The contract's live voting rules, as far as assignment needs them. */
+async function votingRules(): Promise<{ quorum: number; allowlist: boolean }> {
+  const cfg = await getGateConfig();
+  return { quorum: Number(cfg.quorum_min_reexecutors), allowlist: cfg.reexecutor_allowlist };
+}
+
+function assignmentSeed(submissionId: string, chainSubmissionId: string): string {
+  return createHash("sha256").update(`${submissionId}|${chainSubmissionId}`).digest("hex");
+}
 
 /**
- * Deterministic, auditable re-executor selection: rank active re-executors
- * by sha256(seed + account) and take the top N, where N is the live
- * on-chain quorum_min_reexecutors. The seed is recorded on each replay row
- * so anyone can reproduce the exact selection later.
+ * Re-executors that can actually cast a counting vote right now, in this
+ * submission's deterministic order: staked above the floor, approved when the
+ * contract runs an allow-list, and with a worker that polled for work
+ * recently. Ranking is by sha256(seed + account); the seed is stored on each
+ * replay row so anyone can reproduce the selection.
  *
- * Simplification vs. the full plan: ranking is uniform over active,
- * sufficiently-staked accounts rather than stake-weighted (e.g. sqrt(stake)
- * probability). Real and deterministic, just not weighted yet — documented
- * here rather than silently different from the design.
+ * Liveness matters because an assignment is a claim on a quorum seat: handing
+ * one to an account that staked but runs no worker costs the submission its
+ * consensus. Ranking is uniform, not stake-weighted.
  */
-export async function assignReplayJobs(params: {
-  submissionId: string;
-  chainSubmissionId: string;
-  taskType: "deterministic" | "retrieval" | "unverifiable";
-}) {
-  if (params.taskType === "unverifiable") return;
-
-  const cfgTx = await escrowGateAsKeeper.get_config();
-  const cfg = cfgTx.result;
-  const quorum = cfg ? Number(cfg.quorum_min_reexecutors) : 3;
-
-  const active = await db
+async function rankedLiveReexecutors(seed: string, allowlist: boolean) {
+  let qb = db
     .selectFrom("reexecutor")
-    .selectAll()
+    .select(["id", "stellar_account"])
     .where("active", "=", true)
-    .execute();
-  if (active.length === 0) return;
-
-  const seed = createHash("sha256")
-    .update(`${params.submissionId}|${params.chainSubmissionId}`)
-    .digest("hex");
-
-  const ranked = active
-    .map((r) => ({
-      r,
-      rank: createHash("sha256").update(`${seed}|${r.stellar_account}`).digest("hex"),
-    }))
+    .where("last_seen_at", ">", sql<Date>`now() - (${env.REEXECUTOR_LIVENESS_S} || ' seconds')::interval`);
+  if (allowlist) qb = qb.where("approved", "=", true);
+  const live = await qb.execute();
+  return live
+    .map((r) => ({ r, rank: createHash("sha256").update(`${seed}|${r.stellar_account}`).digest("hex") }))
     .sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : 0))
-    .slice(0, Math.min(quorum, active.length));
+    .map(({ r }) => r);
+}
 
-  if (params.taskType === "deterministic") {
-    for (const { r } of ranked) {
+/** Adds up to `count` re-executors who hold no row yet in `table` for this
+ * submission, in ranked order. Returns how many were added. */
+async function assignNext(
+  table: "replay" | "spot_check",
+  submissionId: string,
+  seed: string,
+  allowlist: boolean,
+  count: number
+): Promise<number> {
+  if (count <= 0) return 0;
+  const taken = new Set(
+    (
+      await db.selectFrom(table).select("reexecutor_id").where("submission_id", "=", submissionId).execute()
+    ).map((row) => row.reexecutor_id)
+  );
+  const next = (await rankedLiveReexecutors(seed, allowlist)).filter((r) => !taken.has(r.id)).slice(0, count);
+  for (const r of next) {
+    if (table === "replay") {
       await db
         .insertInto("replay")
-        .values({ submission_id: params.submissionId, reexecutor_id: r.id, assignment_seed: seed })
+        .values({ submission_id: submissionId, reexecutor_id: r.id, assignment_seed: seed })
         .onConflict((oc) => oc.columns(["submission_id", "reexecutor_id"]).doNothing())
         .execute();
-    }
-  } else {
-    // Retrieval tasks: statistical spot-check on a random subset (10-20%),
-    // not full replay by every quorum member.
-    const sampleSize = Math.max(1, Math.round(ranked.length * 0.2));
-    for (const { r } of ranked.slice(0, sampleSize)) {
+    } else {
       await db
         .insertInto("spot_check")
-        .values({ submission_id: params.submissionId, reexecutor_id: r.id })
+        .values({ submission_id: submissionId, reexecutor_id: r.id })
         .onConflict((oc) => oc.columns(["submission_id", "reexecutor_id"]).doNothing())
         .execute();
     }
   }
+  return next.length;
+}
+
+/**
+ * First assignment for a new submission. A deterministic task (or any task
+ * forced to a full quorum) gets the contract's quorum plus REPLAY_OVERASSIGN
+ * spare re-executors: the contract counts any eligible vote, so a spare costs
+ * nothing and keeps one slow worker from stalling the verdict. A retrieval
+ * task gets a single sampled spot-checker.
+ *
+ * If nobody is online nothing is assigned here; topUpAssignments() picks the
+ * submission up as soon as somebody is.
+ */
+export async function assignReplayJobs(params: {
+  submissionId: string;
+  chainSubmissionId: string;
+  taskType: TaskType;
+  /** Force a full replay quorum even for a retrieval task — used when a
+   * spot-check mismatches or a challenge is opened, where a single sampled
+   * vote can never reach on-chain consensus on its own. */
+  fullQuorum?: boolean;
+}) {
+  if (params.taskType === "unverifiable") return;
+  const { quorum, allowlist } = await votingRules();
+  const seed = assignmentSeed(params.submissionId, params.chainSubmissionId);
+
+  if (params.taskType === "deterministic" || params.fullQuorum) {
+    const held = await db
+      .selectFrom("replay")
+      .select(sql<string>`count(*)`.as("count"))
+      .where("submission_id", "=", params.submissionId)
+      .where("status", "!=", "missed")
+      .executeTakeFirst();
+    const want = quorum + env.REPLAY_OVERASSIGN - Number(held?.count ?? 0);
+    await assignNext("replay", params.submissionId, seed, allowlist, want);
+  } else {
+    await assignNext("spot_check", params.submissionId, seed, allowlist, 1);
+  }
+}
+
+/** Escalates a submission to a full replay quorum. Idempotent: re-executors
+ * that already hold a replay row (assigned or attested) are left untouched. */
+export async function escalateToFullReplay(submissionId: string) {
+  const sub = await db
+    .selectFrom("submission")
+    .selectAll()
+    .where("id", "=", submissionId)
+    .executeTakeFirst();
+  if (!sub?.chain_submission_id) return;
+  await assignReplayJobs({
+    submissionId: sub.id,
+    chainSubmissionId: sub.chain_submission_id,
+    taskType: sub.task_type,
+    fullQuorum: true,
+  });
+}
+
+/** PRD §5: a spot-check mismatch "flags every other unverified submission
+ * from that agent for review" — here, review means a full replay quorum
+ * instead of the sampled spot-check they would otherwise have received. */
+export async function escalateAgentPendingSubmissions(agentId: string, exceptSubmissionId: string) {
+  const others = await db
+    .selectFrom("submission")
+    .select(["id"])
+    .where("agent_id", "=", agentId)
+    .where("status", "=", "pending")
+    .where("chain_submission_id", "is not", null)
+    .where("id", "!=", exceptSubmissionId)
+    .execute();
+  for (const other of others) {
+    await escalateToFullReplay(other.id);
+  }
+}
+
+/**
+ * Keeps every open submission supplied with enough working re-executors to
+ * reach quorum. An assignment still unanswered after REPLAY_REASSIGN_AFTER_S
+ * stops counting — its re-executor may be offline — and the next-ranked live
+ * one is asked as well. The slow one's row stays, and its vote still counts
+ * if it arrives. Returns how many assignments were added.
+ */
+export async function topUpAssignments(): Promise<number> {
+  const open = await db
+    .selectFrom("submission")
+    .select(["id", "chain_submission_id", "task_type", "status"])
+    .where("status", "in", ["pending", "disputed"])
+    .where("chain_submission_id", "is not", null)
+    // Once the window has closed on an unchallenged submission the sweep
+    // finalizes it; a vote arriving after that would be rejected anyway.
+    .where((eb) =>
+      eb.or([
+        eb("status", "=", "disputed"),
+        sql<boolean>`submitted_at + (challenge_window_s || ' seconds')::interval > now()`,
+      ])
+    )
+    .execute();
+  if (open.length === 0) return 0;
+
+  const { quorum, allowlist } = await votingRules();
+  const freshSince = sql<Date>`now() - (${env.REPLAY_REASSIGN_AFTER_S} || ' seconds')::interval`;
+  let added = 0;
+
+  for (const sub of open) {
+    const seed = assignmentSeed(sub.id, sub.chain_submission_id!);
+    const replays = await db
+      .selectFrom("replay")
+      .select([
+        sql<string>`count(*) filter (where status = 'confirmed_onchain')`.as("confirmed"),
+        sql<string>`count(*) filter (where status = 'assigned' and assigned_at > ${freshSince})`.as("fresh"),
+        sql<string>`count(*)`.as("total"),
+      ])
+      .where("submission_id", "=", sub.id)
+      .executeTakeFirst();
+    const needsFullQuorum =
+      sub.task_type === "deterministic" || sub.status === "disputed" || Number(replays?.total ?? 0) > 0;
+
+    if (needsFullQuorum) {
+      const working = Number(replays?.confirmed ?? 0) + Number(replays?.fresh ?? 0);
+      added += await assignNext("replay", sub.id, seed, allowlist, quorum - working);
+      continue;
+    }
+
+    // Retrieval, not escalated: one spot-check answer is all it needs.
+    const spot = await db
+      .selectFrom("spot_check")
+      .select([
+        sql<string>`count(*) filter (where result is not null)`.as("answered"),
+        sql<string>`count(*) filter (where result is null and sampled_at > ${freshSince})`.as("fresh"),
+      ])
+      .where("submission_id", "=", sub.id)
+      .executeTakeFirst();
+    if (Number(spot?.answered ?? 0) === 0 && Number(spot?.fresh ?? 0) === 0) {
+      added += await assignNext("spot_check", sub.id, seed, allowlist, 1);
+    }
+  }
+  return added;
 }

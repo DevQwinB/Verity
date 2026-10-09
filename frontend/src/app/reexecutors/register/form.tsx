@@ -1,0 +1,184 @@
+"use client";
+
+import { useState } from "react";
+import Link from "next/link";
+import { useWallet } from "../../../components/wallet-provider";
+import { Card, CardBody, CardHeader } from "../../../components/ui/card";
+import { Button, buttonClasses } from "../../../components/ui/button";
+import { registerReexecutor, relayReexecutorStake } from "../../../lib/client-api";
+import { signXdr } from "../../../lib/wallet";
+import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../../../lib/config";
+import { stroopsToXlm, xlmToStroops } from "../../../lib/format";
+import type { GateConfig } from "../../../lib/types";
+
+type Status = "idle" | "building" | "signing" | "relaying" | "done" | "error";
+
+/** `config` is the contract's live rule set: the stake floor, the slash
+ * rate, and whether voting needs the admin's approval. */
+export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
+  const { account, connecting, login } = useWallet();
+  // Twice the floor by default: a single slash then leaves the account active.
+  const [stakeXlm, setStakeXlm] = useState(stroopsToXlm((BigInt(config.min_stake_floor) * BigInt(2)).toString()));
+  const [status, setStatus] = useState<Status>("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{ id: string; txHash: string; stake: bigint } | null>(null);
+
+  const floor = BigInt(config.min_stake_floor);
+  const floorXlm = stroopsToXlm(config.min_stake_floor);
+  const stake = xlmToStroops(stakeXlm);
+  const belowFloor = stake !== null && stake < floor;
+
+  async function handleRegister() {
+    if (!account) return;
+    setError(null);
+    if (stake === null) {
+      setError("Enter the stake as a positive XLM amount, for example 1000.");
+      setStatus("error");
+      return;
+    }
+    try {
+      setStatus("building");
+      const { reexecutor, unsigned_transaction_xdr } = await registerReexecutor(stake.toString());
+
+      setStatus("signing");
+      const signed = await signXdr(unsigned_transaction_xdr, {
+        networkPassphrase: NETWORK_PASSPHRASE,
+        address: account,
+      });
+
+      setStatus("relaying");
+      const { tx_hash } = await relayReexecutorStake(reexecutor.id, signed);
+      setResult({ id: reexecutor.id, txHash: tx_hash, stake });
+      setStatus("done");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Registration failed.");
+      setStatus("error");
+    }
+  }
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div>
+        <Link href="/reexecutors" className="text-xs text-text-tertiary hover:text-text-secondary">
+          ← Re-executors
+        </Link>
+        <h1 className="mt-2 text-2xl font-semibold tracking-tight">Register as a re-executor</h1>
+        <p className="mt-1 max-w-prose text-sm text-text-secondary">
+          A re-executor stakes XLM on EscrowGate, runs a worker that replays submitted work, and
+          votes on-chain on whether it matches. Staking is a real, signed testnet transaction; the
+          contract holds the stake.
+        </p>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <h2 className="font-medium">Before you stake</h2>
+        </CardHeader>
+        <CardBody>
+          <ol className="max-w-prose list-decimal space-y-2 pl-5 text-sm text-text-secondary">
+            <li>
+              The contract&apos;s floor is <span className="font-mono text-text-primary">{floorXlm} XLM</span>.
+              Below it an account holds stake but is assigned no work.
+            </li>
+            {config.reexecutor_allowlist && (
+              <li>
+                This deployment runs an approved voter set. After you stake, your account shows as
+                pending until the deployment admin approves it; until then it cannot vote. You can
+                withdraw your stake at any time while you wait.
+              </li>
+            )}
+            <li>
+              Staking alone does nothing. Work is only assigned to an account whose worker is
+              running and polling. Start one with your own key:{" "}
+              <code className="rounded-md bg-surface px-1.5 py-0.5 font-mono text-xs text-text-primary">
+                pnpm --filter @verity/reexecutor-agent start
+              </code>
+            </li>
+            <li>
+              A vote that a bonded consensus proves wrong costs {config.reexecutor_slash_bps / 100}% of
+              your stake. The contract fixes that amount.
+            </li>
+          </ol>
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <h2 className="font-medium">Stake</h2>
+        </CardHeader>
+        <CardBody className="space-y-4">
+          {status === "done" && result ? (
+            <div className="space-y-3 text-sm" role="status">
+              <p className="text-status-verified">
+                Stake of {stroopsToXlm(result.stake.toString())} XLM confirmed on testnet.
+              </p>
+              <p className="max-w-prose text-text-secondary">
+                {result.stake < floor
+                  ? `This is below the ${floorXlm} XLM floor, so the account is not yet eligible for work. Stake more to reach it.`
+                  : config.reexecutor_allowlist
+                    ? "Your account is now pending approval by the deployment admin. Start your worker; it will begin receiving assignments as soon as you are approved."
+                    : "Your account is eligible. Start your worker and it will begin receiving assignments."}
+              </p>
+              <div className="flex flex-wrap items-center gap-4">
+                <Link href={`/reexecutors/${result.id}`} className={buttonClasses("secondary")}>
+                  View your re-executor page
+                </Link>
+                <a
+                  href={TESTNET_EXPLORER_TX(result.txHash)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-accent underline-offset-2 hover:underline"
+                >
+                  View transaction
+                </a>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="space-y-2">
+                <label htmlFor="stake" className="block text-sm text-text-secondary">
+                  Amount (XLM)
+                </label>
+                <input
+                  id="stake"
+                  inputMode="decimal"
+                  value={stakeXlm}
+                  onChange={(e) => setStakeXlm(e.target.value)}
+                  aria-describedby="stake-help"
+                  className="w-full max-w-xs rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
+                />
+                <p id="stake-help" className={belowFloor ? "text-xs text-status-pending" : "text-xs text-text-tertiary"}>
+                  {belowFloor
+                    ? `Below the ${floorXlm} XLM floor: this would be staked, but the account would not be assigned work.`
+                    : `At least ${floorXlm} XLM to be assigned work. Staking again later adds to this.`}
+                </p>
+              </div>
+
+              {error && (
+                <p role="alert" className="text-sm text-status-slashed">
+                  {error}
+                </p>
+              )}
+
+              {account ? (
+                <Button onClick={handleRegister} disabled={status !== "idle" && status !== "error"}>
+                  {status === "building"
+                    ? "Building transaction..."
+                    : status === "signing"
+                      ? "Awaiting signature in Freighter..."
+                      : status === "relaying"
+                        ? "Submitting to testnet..."
+                        : "Stake and register"}
+                </Button>
+              ) : (
+                <Button onClick={login} disabled={connecting}>
+                  {connecting ? "Connecting..." : "Connect wallet to continue"}
+                </Button>
+              )}
+            </>
+          )}
+        </CardBody>
+      </Card>
+    </div>
+  );
+}

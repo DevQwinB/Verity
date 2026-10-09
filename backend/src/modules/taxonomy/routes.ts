@@ -17,13 +17,13 @@ export async function taxonomyRoutes(app: FastifyInstance) {
         type: "retrieval",
         verification_method: "statistical_spot_check",
         description:
-          "A scraping/retrieval task against a declared, egress-locked endpoint. Verified by re-issuing a random 10-20% sample of requests and comparing extracted results.",
+          "A retrieval task against a declared public URL. Verified by one sampled re-executor re-fetching it and comparing the extracted result; a mismatch escalates the submission, and the agent's other pending submissions, to a full replay quorum.",
       },
       {
         type: "unverifiable",
         verification_method: "manual_review",
         description:
-          "Open-ended, subjective, or creative tasks with no consistent scoring rubric. Not auto-verified on-chain in Phase 1 — routed for record-keeping only.",
+          "Open-ended, subjective, or creative tasks with no consistent scoring rubric. Not accepted for submission in Phase 1: the contract has no way to verify them.",
       },
     ],
   }));

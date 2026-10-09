@@ -11,8 +11,10 @@ build
 .DS_Store
 /deployments/*.local.json
 /pgdata
+/.pgdata
 /.smoke-pgdata
 /backend/.artifacts
 .turbo
 coverage
 *.tsbuildinfo
+next-env.d.ts

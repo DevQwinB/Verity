@@ -3,7 +3,7 @@ import { z } from "zod";
 import { requireAuth } from "../../auth/plugin.js";
 import { db } from "../../db.js";
 import { escrowGateFor } from "../../chain/clients.js";
-import { relaySignedXdr } from "../../chain/rpc.js";
+import { assertGateCall, relaySignedXdr } from "../../chain/rpc.js";
 
 export async function challengesRoutes(app: FastifyInstance) {
   // Read-only list addition (same rationale as GET /v1/submissions above) so
@@ -12,7 +12,11 @@ export async function challengesRoutes(app: FastifyInstance) {
   // of one-at-a-time lookups with no discovery path.
   app.get("/v1/challenges", async (req) => {
     const query = z
-      .object({ resolved: z.enum(["true", "false"]).optional(), limit: z.coerce.number().int().min(1).max(200).optional() })
+      .object({
+        resolved: z.enum(["true", "false"]).optional(),
+        limit: z.coerce.number().int().min(1).max(200).optional(),
+        offset: z.coerce.number().int().min(0).optional(),
+      })
       .parse(req.query);
     let qb = db
       .selectFrom("challenge")
@@ -32,15 +36,16 @@ export async function challengesRoutes(app: FastifyInstance) {
         "submission.status",
         "submission.chain_submission_id",
       ])
-      .orderBy("challenge.opened_at", "desc");
+      .orderBy("challenge.opened_at", "desc")
+      .orderBy("challenge.id");
     if (query.resolved === "true") qb = qb.where("challenge.resolved_at", "is not", null);
     if (query.resolved === "false") qb = qb.where("challenge.resolved_at", "is", null);
-    return qb.limit(query.limit ?? 50).execute();
+    return qb.limit(query.limit ?? 50).offset(query.offset ?? 0).execute();
   });
 
   app.post("/v1/submissions/:id/challenge", { preHandler: requireAuth }, async (req, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
-    const body = z.object({ bond: z.string() }).parse(req.body);
+    const body = z.object({ bond: z.string().regex(/^[1-9]\d*$/, "must be a positive integer amount in stroops") }).parse(req.body);
     const challenger = req.stellarAccount!;
 
     const submission = await db
@@ -67,6 +72,22 @@ export async function challengesRoutes(app: FastifyInstance) {
   app.post("/v1/submissions/:id/challenge/relay", { preHandler: requireAuth }, async (req, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
     const body = z.object({ signed_transaction_xdr: z.string().min(1) }).parse(req.body);
+    const submission = await db
+      .selectFrom("submission")
+      .select(["chain_submission_id"])
+      .where("id", "=", params.id)
+      .executeTakeFirst();
+    if (!submission?.chain_submission_id) {
+      reply.code(404);
+      return { error: "submission not found or not yet confirmed on-chain" };
+    }
+    // Only the caller's own open_challenge on this very submission is relayed.
+    const chainId = BigInt(submission.chain_submission_id);
+    assertGateCall(body.signed_transaction_xdr, {
+      account: req.stellarAccount!,
+      fns: ["open_challenge"],
+      check: (call) => (call.args[1] === chainId ? null : "signed transaction challenges a different submission"),
+    });
     const { hash } = await relaySignedXdr(body.signed_transaction_xdr);
     return { tx_hash: hash, note: "chain indexer will reconcile the challenge row from the on-chain event" };
   });

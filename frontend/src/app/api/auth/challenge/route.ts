@@ -6,10 +6,14 @@ export async function GET(req: NextRequest) {
   if (!account) {
     return NextResponse.json({ error: "account query param required" }, { status: 400 });
   }
-  const res = await fetch(
-    `${BACKEND_URL}/auth?account=${encodeURIComponent(account)}`,
-    { cache: "no-store" }
-  );
-  const data = await res.json();
-  return NextResponse.json(data, { status: res.status });
+  try {
+    const res = await fetch(
+      `${BACKEND_URL}/auth?account=${encodeURIComponent(account)}`,
+      { cache: "no-store" }
+    );
+    const data = await res.json().catch(() => ({}));
+    return NextResponse.json(data, { status: res.status });
+  } catch {
+    return NextResponse.json({ error: "The Verity backend is not reachable right now. Try again in a moment." }, { status: 502 });
+  }
 }

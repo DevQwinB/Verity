@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { requireAuth } from "../../auth/plugin.js";
 import { db } from "../../db.js";
+import { assertPublicHttpUrl } from "../webhooks/url-guard.js";
 
 export async function marketplacesRoutes(app: FastifyInstance) {
   app.post("/v1/marketplaces", { preHandler: requireAuth }, async (req, reply) => {
@@ -27,6 +28,16 @@ export async function marketplacesRoutes(app: FastifyInstance) {
     const body = z
       .object({ url: z.string().url(), secret: z.string().min(8), events: z.array(z.string()).min(1) })
       .parse(req.body);
+    const marketplace = await db
+      .selectFrom("marketplace")
+      .select(["stellar_account"])
+      .where("id", "=", params.id)
+      .executeTakeFirst();
+    if (!marketplace || marketplace.stellar_account !== req.stellarAccount) {
+      reply.code(403);
+      return { error: "only the marketplace's own account can manage its webhooks" };
+    }
+    await assertPublicHttpUrl(body.url);
     const row = await db
       .insertInto("webhook_subscription")
       .values({

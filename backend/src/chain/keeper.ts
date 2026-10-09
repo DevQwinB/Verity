@@ -11,3 +11,14 @@ import { env } from "../config/env.js";
 export const keeperKeypair = Keypair.fromSecret(env.KEEPER_SECRET_KEY);
 export const keeperSigner = basicNodeSigner(keeperKeypair, env.NETWORK_PASSPHRASE);
 export const keeperPublicKey = keeperKeypair.publicKey();
+
+/** Every keeper-signed transaction shares one account sequence number, and
+ * the indexer and scheduler loops run concurrently — so all keeper sends go
+ * through this single-file queue, or two of them race on the same sequence
+ * and one is rejected with txBadSeq. */
+let keeperQueue: Promise<unknown> = Promise.resolve();
+export function withKeeperLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = keeperQueue.then(fn, fn);
+  keeperQueue = run.catch(() => undefined);
+  return run;
+}
