@@ -258,3 +258,7 @@ Webhooks (HMAC-SHA256 in `x-verity-signature`): `submission.verified`,
   and passed the smoke test, using podman with the services started one by
   one. `docker-compose.yml` describes the same services but has not itself
   been executed: the machine this was developed on has no compose provider.
+
+## License
+
+Apache License 2.0. See [`LICENSE`](LICENSE).

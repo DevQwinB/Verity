@@ -2,6 +2,7 @@
   "name": "verity",
   "private": true,
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "packageManager": "pnpm@10.22.0",
   "engines": {
     "node": ">=20"
