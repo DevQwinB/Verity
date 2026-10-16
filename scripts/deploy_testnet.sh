@@ -14,10 +14,6 @@
 #                       runner and smoke test will refuse to touch it
 #   --force             replace an existing deployments/<name>.json
 #   VERITY_GATE_CONFIG  full EscrowGate ConfigRecord JSON, to override defaults
-#
-# Network calls in this repo's dev sandbox require disabling the default
-# command sandbox (DNS is blocked otherwise) — outside that sandbox this
-# script needs no special flags.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
