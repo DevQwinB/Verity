@@ -21,6 +21,9 @@ function textToBase64(text: string): string {
 
 type Step = "idle" | "uploading" | "building" | "signing" | "relaying" | "done" | "error";
 
+// The reference is free text that is hashed on-chain and shown in lists, so it is capped for sanity; keep it in line with any backend limit.
+const ESCROW_REF_MAX_LENGTH = 128;
+
 /** `config` is the contract's live rule set, so the bond floor and the
  * window shown here are the ones EscrowGate will actually apply. */
 export function NewSubmissionForm({ config }: { config: GateConfig }) {
@@ -40,6 +43,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
   const [step, setStep] = useState<Step>("idle");
   const [error, setError] = useState<string | null>(null);
 
+  const escrowRefTrimmed = escrowRef.trim();
   const escrowValue = xlmToStroops(escrowValueXlm);
   const minBond =
     escrowValue === null ? null : (escrowValue * BigInt(config.agent_bond_min_bps)) / BigInt(10_000);
@@ -97,6 +101,9 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
     if (!account) return;
     setError(null);
     try {
+      if (!escrowRefTrimmed) {
+        throw new Error("Enter an escrow reference.");
+      }
       const amounts = prepareAmounts();
       const artifacts = prepareArtifacts();
       setStep("uploading");
@@ -109,7 +116,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
 
       setStep("building");
       const { submission, unsigned_transaction_xdr } = await createSubmission({
-        escrow_ref: escrowRef,
+        escrow_ref: escrowRefTrimmed,
         task_type: taskType,
         input_hash: input.content_hash,
         input_ref: input.storage_ref,
@@ -161,10 +168,15 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
           <span className="font-medium">Task details</span>
         </CardHeader>
         <CardBody className="space-y-4">
-          <Field label="Escrow reference">
+          <Field
+            label="Escrow reference"
+            helper="Up to 128 characters. Surrounding spaces are removed."
+          >
             <input
               value={escrowRef}
               onChange={(e) => setEscrowRef(e.target.value)}
+              maxLength={ESCROW_REF_MAX_LENGTH}
+              aria-invalid={escrowRef !== "" && escrowRefTrimmed === "" ? true : undefined}
               placeholder="bounty-platform-order-id"
               className={inputClass}
             />
@@ -276,7 +288,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
       )}
 
       {account ? (
-        <Button onClick={handleSubmit} disabled={busy || !escrowRef || !inputContent || !outputContent}>
+        <Button onClick={handleSubmit} disabled={busy || !escrowRefTrimmed || !inputContent || !outputContent}>
           {step === "uploading"
             ? "Uploading artifacts..."
             : step === "building"
