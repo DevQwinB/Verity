@@ -4,6 +4,20 @@ import { BACKEND_ACTION_TIMEOUT_MS, BACKEND_URL } from "./config";
 
 export const SESSION_COOKIE = "verity_jwt";
 
+/** Parse a request body as JSON, answering a malformed or empty body with a
+ * 400 instead of letting the SyntaxError from Request.json() surface as an
+ * unhandled 500. Returns a result so callers stay one-liners; the 400 is
+ * built here, in one place. */
+export async function readJsonBody(
+  req: Request
+): Promise<{ ok: true; body: unknown } | { ok: false; response: NextResponse }> {
+  try {
+    return { ok: true, body: await req.json() };
+  } catch {
+    return { ok: false, response: NextResponse.json({ error: "invalid JSON body" }, { status: 400 }) };
+  }
+}
+
 /** The signed-in account, read from the session cookie without verifying
  * it — good enough to address a request, never to authorise one (the backend
  * verifies the token itself on every call). */
