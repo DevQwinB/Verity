@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { BACKEND_URL } from "../../../lib/config";
-import { SESSION_COOKIE } from "../../../lib/backend-proxy";
+import { readJsonBody, SESSION_COOKIE } from "../../../lib/backend-proxy";
 
 /**
  * Step 2 of SEP-10: the client has already signed the challenge with
@@ -10,7 +10,9 @@ import { SESSION_COOKIE } from "../../../lib/backend-proxy";
  * back to client JS - so an XSS bug can't exfiltrate the session token.
  */
 export async function POST(req: NextRequest) {
-  const body = await req.json();
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
   let res: Response;
   try {
     res = await fetch(`${BACKEND_URL}/auth`, {
