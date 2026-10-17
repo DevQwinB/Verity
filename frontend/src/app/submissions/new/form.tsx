@@ -45,6 +45,10 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
   const [step, setStep] = useState<Step>("idle");
   const [error, setError] = useState<string | null>(null);
 
+  // The raw string is hashed on-chain, so a leading or trailing space would
+  // produce a different reference for what a person reads as the same order.
+  const escrowRefTrimmed = escrowRef.trim();
+
   const escrowValue = xlmToStroops(escrowValueXlm);
   const minBond =
     escrowValue === null ? null : (escrowValue * BigInt(config.agent_bond_min_bps)) / BigInt(10_000);
@@ -102,6 +106,9 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
     if (!account) return;
     setError(null);
     try {
+      if (!escrowRefTrimmed) {
+        throw new Error("Enter an escrow reference.");
+      }
       const amounts = prepareAmounts();
       const artifacts = prepareArtifacts();
       setStep("uploading");
@@ -114,7 +121,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
 
       setStep("building");
       const { submission, unsigned_transaction_xdr } = await createSubmission({
-        escrow_ref: escrowRef,
+        escrow_ref: escrowRefTrimmed,
         task_type: taskType,
         input_hash: input.content_hash,
         input_ref: input.storage_ref,
@@ -175,6 +182,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
               onChange={(e) => setEscrowRef(e.target.value)}
               placeholder="bounty-platform-order-id"
               maxLength={ESCROW_REF_MAX_LENGTH}
+              aria-invalid={escrowRef !== "" && escrowRefTrimmed === "" ? true : undefined}
               className={inputClass}
             />
           </Field>
@@ -285,7 +293,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
       )}
 
       {account ? (
-        <Button onClick={handleSubmit} disabled={busy || !escrowRef || !inputContent || !outputContent}>
+        <Button onClick={handleSubmit} disabled={busy || !escrowRefTrimmed || !inputContent || !outputContent}>
           {step === "uploading"
             ? "Uploading artifacts..."
             : step === "building"
