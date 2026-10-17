@@ -52,7 +52,7 @@ fn release_pays_agent_only_after_gate_verifies() {
 
     let submission_id = gate.submit(
         &agent,
-        &BytesN::from_array(&e, &[1u8; 32]),
+        &crate::escrow_ref_for(&e, escrow_id),
         &(1000 * XLM),
         &TaskType::Deterministic,
         &BytesN::from_array(&e, &[2u8; 32]),
@@ -104,7 +104,7 @@ fn release_refunds_poster_when_gate_slashes() {
     let escrow_id = mkt.create_escrow(&poster, &agent, &(1000 * XLM));
     let submission_id = gate.submit(
         &agent,
-        &BytesN::from_array(&e, &[1u8; 32]),
+        &crate::escrow_ref_for(&e, escrow_id),
         &(1000 * XLM),
         &TaskType::Deterministic,
         &BytesN::from_array(&e, &[2u8; 32]),
