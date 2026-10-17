@@ -12,6 +12,11 @@ import { canonicalJson, parseJsonOrText } from "../../../lib/canonical";
 import { bpsToPercent, formatDuration, stroopsToXlm, xlmToStroops } from "../../../lib/format";
 import type { GateConfig, TaskType } from "../../../lib/types";
 
+/** The escrow reference is free text that is hashed on-chain and shown in
+ * submission lists, so it is capped for sanity. Keep in line with the
+ * backend's own limit when one exists. */
+const ESCROW_REF_MAX_LENGTH = 128;
+
 function textToBase64(text: string): string {
   const bytes = new TextEncoder().encode(text);
   let binary = "";
@@ -161,11 +166,15 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
           <span className="font-medium">Task details</span>
         </CardHeader>
         <CardBody className="space-y-4">
-          <Field label="Escrow reference">
+          <Field
+            label="Escrow reference"
+            helper="Up to 128 characters. Surrounding spaces are removed."
+          >
             <input
               value={escrowRef}
               onChange={(e) => setEscrowRef(e.target.value)}
               placeholder="bounty-platform-order-id"
+              maxLength={ESCROW_REF_MAX_LENGTH}
               className={inputClass}
             />
           </Field>
