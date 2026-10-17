@@ -6,7 +6,7 @@ use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token, Address, BytesN, Env,
 };
-use verity_common::{ConfigRecord, TaskType};
+use verity_common::{ConfigRecord, Error, TaskType};
 
 const XLM: i128 = 10_000_000;
 
@@ -125,4 +125,162 @@ fn release_refunds_poster_when_gate_slashes() {
     // Bounty returns to the poster, not the agent, on a Slashed verdict.
     assert_eq!(token.balance(&poster), 1000 * XLM);
     assert_eq!(token.balance(&agent), 950 * XLM); // never got the Verity bond back either
+}
+
+#[test]
+fn release_rejects_submission_from_other_agent() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let sac = e.register_stellar_asset_contract_v2(admin.clone());
+    let token = token::Client::new(&e, &sac.address());
+    let token_admin = token::StellarAssetClient::new(&e, &sac.address());
+
+    let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
+    let gate = EscrowGateClient::new(&e, &gate_id);
+
+    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
+    mkt.initialize(&admin, &gate_id, &sac.address());
+
+    let poster = Address::generate(&e);
+    let payee = Address::generate(&e);
+    let other_agent = Address::generate(&e);
+    token_admin.mint(&poster, &(1000 * XLM));
+    token_admin.mint(&other_agent, &(1000 * XLM));
+
+    let escrow_id = mkt.create_escrow(&poster, &payee, &(1000 * XLM));
+
+    // A valid, matching-escrow submission that simply belongs to a different
+    // agent must not release this escrow.
+    let submission_id = gate.submit(
+        &other_agent,
+        &crate::escrow_ref_for(&e, escrow_id),
+        &(1000 * XLM),
+        &TaskType::Deterministic,
+        &BytesN::from_array(&e, &[2u8; 32]),
+        &BytesN::from_array(&e, &[3u8; 32]),
+        &(50 * XLM),
+    );
+
+    let res = mkt.try_release(&escrow_id, &submission_id);
+    assert_eq!(res, Err(Ok(Error::SubmissionNotFound)));
+    assert_eq!(token.balance(&payee), 0);
+    assert_eq!(token.balance(&mkt_id), 1000 * XLM);
+    // The rejected submission was not finalized as a side effect.
+    assert!(!gate.get_submission(&submission_id).unwrap().finalized);
+}
+
+#[test]
+fn release_rejects_mismatched_escrow_value() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let sac = e.register_stellar_asset_contract_v2(admin.clone());
+    let token = token::Client::new(&e, &sac.address());
+    let token_admin = token::StellarAssetClient::new(&e, &sac.address());
+
+    let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
+    let gate = EscrowGateClient::new(&e, &gate_id);
+
+    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
+    mkt.initialize(&admin, &gate_id, &sac.address());
+
+    let poster = Address::generate(&e);
+    let payee = Address::generate(&e);
+    token_admin.mint(&poster, &(1000 * XLM));
+    token_admin.mint(&payee, &(1000 * XLM));
+
+    let escrow_id = mkt.create_escrow(&poster, &payee, &(1000 * XLM));
+
+    // Right agent and escrow_ref, but the claimed value does not match the
+    // escrow's amount.
+    let submission_id = gate.submit(
+        &payee,
+        &crate::escrow_ref_for(&e, escrow_id),
+        &(10 * XLM),
+        &TaskType::Deterministic,
+        &BytesN::from_array(&e, &[2u8; 32]),
+        &BytesN::from_array(&e, &[3u8; 32]),
+        &XLM,
+    );
+
+    let payee_before = token.balance(&payee);
+    let res = mkt.try_release(&escrow_id, &submission_id);
+    assert_eq!(res, Err(Ok(Error::InvalidEscrowValue)));
+    assert_eq!(token.balance(&payee), payee_before);
+    assert_eq!(token.balance(&mkt_id), 1000 * XLM);
+    assert!(!gate.get_submission(&submission_id).unwrap().finalized);
+}
+
+#[test]
+fn release_rejects_mismatched_escrow_ref() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let sac = e.register_stellar_asset_contract_v2(admin.clone());
+    let token = token::Client::new(&e, &sac.address());
+    let token_admin = token::StellarAssetClient::new(&e, &sac.address());
+
+    let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
+    let gate = EscrowGateClient::new(&e, &gate_id);
+
+    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
+    mkt.initialize(&admin, &gate_id, &sac.address());
+
+    let poster = Address::generate(&e);
+    let payee = Address::generate(&e);
+    token_admin.mint(&poster, &(1000 * XLM));
+    token_admin.mint(&payee, &(1000 * XLM));
+
+    let escrow_id = mkt.create_escrow(&poster, &payee, &(1000 * XLM));
+
+    // Right agent and value, but the submission names a different escrow.
+    let submission_id = gate.submit(
+        &payee,
+        &BytesN::from_array(&e, &[1u8; 32]),
+        &(1000 * XLM),
+        &TaskType::Deterministic,
+        &BytesN::from_array(&e, &[2u8; 32]),
+        &BytesN::from_array(&e, &[3u8; 32]),
+        &(50 * XLM),
+    );
+
+    let payee_before = token.balance(&payee);
+    let res = mkt.try_release(&escrow_id, &submission_id);
+    assert_eq!(res, Err(Ok(Error::SubmissionNotFound)));
+    assert_eq!(token.balance(&payee), payee_before);
+    assert_eq!(token.balance(&mkt_id), 1000 * XLM);
+    assert!(!gate.get_submission(&submission_id).unwrap().finalized);
+}
+
+#[test]
+fn release_rejects_unknown_submission() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let sac = e.register_stellar_asset_contract_v2(admin.clone());
+    let token = token::Client::new(&e, &sac.address());
+    let token_admin = token::StellarAssetClient::new(&e, &sac.address());
+
+    let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
+    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
+    mkt.initialize(&admin, &gate_id, &sac.address());
+
+    let poster = Address::generate(&e);
+    let payee = Address::generate(&e);
+    token_admin.mint(&poster, &(1000 * XLM));
+
+    let escrow_id = mkt.create_escrow(&poster, &payee, &(1000 * XLM));
+
+    let res = mkt.try_release(&escrow_id, &99u64);
+    assert_eq!(res, Err(Ok(Error::SubmissionNotFound)));
+    assert_eq!(token.balance(&mkt_id), 1000 * XLM);
 }
