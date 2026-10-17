@@ -72,5 +72,8 @@ export function hex(buf: Buffer): string {
 }
 
 export function bufFromHex(h: string): Buffer {
+  if (!/^[0-9a-fA-F]{64}$/.test(h)) {
+    throw new Error(`expected 64 hex characters, got ${h.length}`);
+  }
   return Buffer.from(h, "hex");
 }
