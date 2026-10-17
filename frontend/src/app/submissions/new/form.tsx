@@ -41,6 +41,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
   const [error, setError] = useState<string | null>(null);
 
   const escrowValue = xlmToStroops(escrowValueXlm);
+  const bondValue = xlmToStroops(bondXlm);
   const minBond =
     escrowValue === null ? null : (escrowValue * BigInt(config.agent_bond_min_bps)) / BigInt(10_000);
   const windowS =
@@ -162,23 +163,29 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
         </CardHeader>
         <CardBody className="space-y-4">
           <Field label="Escrow reference">
-            <input
-              value={escrowRef}
-              onChange={(e) => setEscrowRef(e.target.value)}
-              placeholder="bounty-platform-order-id"
-              className={inputClass}
-            />
+            {(control) => (
+              <input
+                {...control}
+                value={escrowRef}
+                onChange={(e) => setEscrowRef(e.target.value)}
+                placeholder="bounty-platform-order-id"
+                className={inputClass}
+              />
+            )}
           </Field>
 
           <Field label="Task type">
-            <select
-              value={taskType}
-              onChange={(e) => setTaskType(e.target.value as TaskType)}
-              className={inputClass}
-            >
-              <option value="deterministic">Deterministic (replay-verified)</option>
-              <option value="retrieval">Retrieval (spot-checked)</option>
-            </select>
+            {(control) => (
+              <select
+                {...control}
+                value={taskType}
+                onChange={(e) => setTaskType(e.target.value as TaskType)}
+                className={inputClass}
+              >
+                <option value="deterministic">Deterministic (replay-verified)</option>
+                <option value="retrieval">Retrieval (spot-checked)</option>
+              </select>
+            )}
           </Field>
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -186,12 +193,16 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
               label="Escrow value (XLM)"
               helper={`What the work is worth to the marketplace. Sets the bond floor and the challenge window: ${formatDuration(windowS)} at this value.`}
             >
-              <input
-                inputMode="decimal"
-                value={escrowValueXlm}
-                onChange={(e) => setEscrowValueXlm(e.target.value)}
-                className={`${inputClass} font-mono`}
-              />
+              {(control) => (
+                <input
+                  {...control}
+                  inputMode="decimal"
+                  value={escrowValueXlm}
+                  onChange={(e) => setEscrowValueXlm(e.target.value)}
+                  aria-invalid={escrowValueXlm !== "" && escrowValue === null}
+                  className={`${inputClass} font-mono`}
+                />
+              )}
             </Field>
             <Field
               label="Agent bond (XLM)"
@@ -201,12 +212,16 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
                   : `At least ${stroopsToXlm(minBond.toString())} XLM (${bpsToPercent(config.agent_bond_min_bps)} of the escrow value). Returned if verified, forfeited if the work is found wrong.`
               }
             >
-              <input
-                inputMode="decimal"
-                value={bondXlm}
-                onChange={(e) => setBondXlm(e.target.value)}
-                className={`${inputClass} font-mono`}
-              />
+              {(control) => (
+                <input
+                  {...control}
+                  inputMode="decimal"
+                  value={bondXlm}
+                  onChange={(e) => setBondXlm(e.target.value)}
+                  aria-invalid={bondXlm !== "" && bondValue === null}
+                  className={`${inputClass} font-mono`}
+                />
+              )}
             </Field>
           </div>
         </CardBody>
@@ -225,46 +240,55 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
                 : "Passed to your function as `input`."
             }
           >
-            <textarea
-              value={inputContent}
-              onChange={(e) => setInputContent(e.target.value)}
-              rows={3}
-              spellCheck={false}
-              placeholder={
-                taskType === "retrieval"
-                  ? '{"url": "https://horizon-testnet.stellar.org/", "pointer": "/network_passphrase"}'
-                  : '{"n": 21}'
-              }
-              className={cnMono}
-            />
+            {(control) => (
+              <textarea
+                {...control}
+                value={inputContent}
+                onChange={(e) => setInputContent(e.target.value)}
+                rows={3}
+                spellCheck={false}
+                placeholder={
+                  taskType === "retrieval"
+                    ? '{"url": "https://horizon-testnet.stellar.org/", "pointer": "/network_passphrase"}'
+                    : '{"n": 21}'
+                }
+                className={cnMono}
+              />
+            )}
           </Field>
           {taskType === "deterministic" && (
             <Field
               label="Function body (JavaScript)"
               helper="The body of a pure function of `input` that returns the result. Re-executors run this exact artifact in a WebAssembly sandbox with no network, files or clock: `Date` and `Math.random` do not exist there, and compute and memory are capped. A function that throws or exceeds the limits counts as a mismatch."
             >
-              <textarea
-                value={functionContent}
-                onChange={(e) => setFunctionContent(e.target.value)}
-                rows={4}
-                spellCheck={false}
-                placeholder="return { doubled: input.n * 2 };"
-                className={cnMono}
-              />
+              {(control) => (
+                <textarea
+                  {...control}
+                  value={functionContent}
+                  onChange={(e) => setFunctionContent(e.target.value)}
+                  rows={4}
+                  spellCheck={false}
+                  placeholder="return { doubled: input.n * 2 };"
+                  className={cnMono}
+                />
+              )}
             </Field>
           )}
           <Field
             label="Claimed output"
             helper="JSON or plain text. Normalised to canonical JSON before hashing, so key order and whitespace do not matter."
           >
-            <textarea
-              value={outputContent}
-              onChange={(e) => setOutputContent(e.target.value)}
-              rows={3}
-              spellCheck={false}
-              placeholder={taskType === "retrieval" ? "Test SDF Network ; September 2015" : '{"doubled": 42}'}
-              className={cnMono}
-            />
+            {(control) => (
+              <textarea
+                {...control}
+                value={outputContent}
+                onChange={(e) => setOutputContent(e.target.value)}
+                rows={3}
+                spellCheck={false}
+                placeholder={taskType === "retrieval" ? "Test SDF Network ; September 2015" : '{"doubled": 42}'}
+                className={cnMono}
+              />
+            )}
           </Field>
         </CardBody>
       </Card>
@@ -302,6 +326,11 @@ const inputClass =
   "w-full rounded-lg border border-border-strong bg-surface px-3 py-2 text-sm outline-none focus:border-accent";
 const cnMono = `${inputClass} font-mono text-xs`;
 
+interface FieldControlProps {
+  id: string;
+  "aria-describedby"?: string;
+}
+
 function Field({
   label,
   helper,
@@ -309,20 +338,24 @@ function Field({
 }: {
   label: string;
   helper?: string;
-  children: React.ReactNode;
+  children: (control: FieldControlProps) => React.ReactNode;
 }) {
-  // A wrapping <label> ties the caption to the control without threading ids
-  // through every call site; the helper is linked for screen readers.
+  const controlId = useId();
   const helperId = useId();
   return (
-    <label className="block space-y-2" aria-describedby={helper ? helperId : undefined}>
-      <span className="block text-sm text-text-secondary">{label}</span>
-      {children}
+    <div className="block space-y-2">
+      <label htmlFor={controlId} className="block text-sm text-text-secondary">
+        {label}
+      </label>
+      {children({
+        id: controlId,
+        "aria-describedby": helper ? helperId : undefined,
+      })}
       {helper && (
         <span id={helperId} className="block max-w-[65ch] text-xs text-text-tertiary">
           {helper}
         </span>
       )}
-    </label>
+    </div>
   );
 }
