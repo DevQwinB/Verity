@@ -2,7 +2,7 @@
 
 use crate::{EscrowGate, EscrowGateClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{storage::Instance as _, Address as _, Ledger as _},
     token, Address, BytesN, Env,
 };
 use verity_common::{ConfigRecord, Error, Resolution, ResolutionMethod, TaskType, Verdict};
@@ -827,6 +827,69 @@ fn zero_slash_bps_disables_reexecutor_slashing() {
     assert_eq!(w.client.try_slash(&wrong, &id), Err(Ok(Error::NotSlashable)));
     w.client.release_attestation_lock(&id, &wrong);
     assert_eq!(w.client.reexecutor_info(&wrong).unwrap().stake_amount, 600 * XLM);
+}
+
+#[test]
+fn release_attestation_lock_extends_instance_ttl() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex);
+    w.client.attest_replay(&rex, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+
+    e.ledger().set_timestamp(e.ledger().timestamp() + 3601);
+    assert_eq!(w.client.finalize(&id), Verdict::Verified);
+
+    // Finalize bumped the instance TTL to BUMP_TO (500_000 ledgers; see storage.rs).
+    let ttl = e.as_contract(&w.client.address, || e.storage().instance().get_ttl());
+    assert_eq!(ttl, 500_000);
+
+    // Let the TTL decay below BUMP_THRESHOLD (100_000 ledgers) by advancing sequence.
+    e.ledger().with_mut(|l| l.sequence_number += 450_000);
+    let decayed_ttl = e.as_contract(&w.client.address, || e.storage().instance().get_ttl());
+    assert_eq!(decayed_ttl, 50_000);
+
+    // release_attestation_lock must bump the instance TTL back to 500_000.
+    w.client.release_attestation_lock(&id, &rex);
+    let restored_ttl = e.as_contract(&w.client.address, || e.storage().instance().get_ttl());
+    assert_eq!(restored_ttl, 500_000);
+}
+
+#[test]
+fn slash_extends_instance_ttl() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let wrong = Address::generate(&e);
+    let rex2 = Address::generate(&e);
+    let rex3 = Address::generate(&e);
+    for r in [&wrong, &rex2, &rex3] {
+        register_rex(&w, r);
+    }
+    w.client.attest_replay(&wrong, &id, &BytesN::from_array(&e, &[9u8; 32]), &true);
+    w.client.attest_replay(&rex2, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    w.client.attest_replay(&rex3, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+
+    assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+
+    // Finalize bumped the instance TTL to 500_000 ledgers.
+    let ttl = e.as_contract(&w.client.address, || e.storage().instance().get_ttl());
+    assert_eq!(ttl, 500_000);
+
+    // Let the TTL decay below BUMP_THRESHOLD (100_000 ledgers) by advancing sequence.
+    e.ledger().with_mut(|l| l.sequence_number += 450_000);
+    let decayed_ttl = e.as_contract(&w.client.address, || e.storage().instance().get_ttl());
+    assert_eq!(decayed_ttl, 50_000);
+
+    // slash must bump the instance TTL back to 500_000.
+    assert_eq!(w.client.slash(&wrong, &id), 60 * XLM);
+    let restored_ttl = e.as_contract(&w.client.address, || e.storage().instance().get_ttl());
+    assert_eq!(restored_ttl, 500_000);
 }
 
 mod proptest_model;
