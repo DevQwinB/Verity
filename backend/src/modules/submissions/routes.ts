@@ -143,38 +143,66 @@ export async function submissionsRoutes(app: FastifyInstance) {
       chain_tx_hash: Buffer.from(assembled.built!.hash()).toString("hex"),
     };
 
-    if (existing) {
+    const updateExistingDraft = async (submissionId: string) => {
       // A retry of a draft that was never signed: the transaction built the
       // first time may have expired, so the draft is pointed at a fresh one.
       const row = await db
         .updateTable("submission")
         .set({ ...values, updated_at: new Date() })
-        .where("id", "=", existing.id)
+        .where("id", "=", submissionId)
         .returningAll()
         .executeTakeFirstOrThrow();
       return { submission: row, unsigned_transaction_xdr: unsignedXdr, network_passphrase: env.NETWORK_PASSPHRASE };
+    };
+
+    if (existing) {
+      return updateExistingDraft(existing.id);
     }
 
     const marketplace = await findOrCreateMarketplaceForAccount(agent);
-    const row = await db
-      .insertInto("submission")
-      .values({
-        ...values,
-        marketplace_id: marketplace.id,
-        agent_id: agent,
-        bond_asset: "native",
-        challenge_window_s: 0, // set by the contract at submit() time; filled in on relay confirm
-        idempotency_key: body.idempotency_key,
-      })
-      .returningAll()
-      .executeTakeFirstOrThrow();
+    try {
+      const row = await db
+        .insertInto("submission")
+        .values({
+          ...values,
+          marketplace_id: marketplace.id,
+          agent_id: agent,
+          bond_asset: "native",
+          challenge_window_s: 0, // set by the contract at submit() time; filled in on relay confirm
+          idempotency_key: body.idempotency_key,
+        })
+        .returningAll()
+        .executeTakeFirstOrThrow();
 
-    reply.code(201);
-    return {
-      submission: row,
-      unsigned_transaction_xdr: unsignedXdr,
-      network_passphrase: env.NETWORK_PASSPHRASE,
-    };
+      reply.code(201);
+      return {
+        submission: row,
+        unsigned_transaction_xdr: unsignedXdr,
+        network_passphrase: env.NETWORK_PASSPHRASE,
+      };
+    } catch (err: unknown) {
+      const isUniqueViolation = typeof err === "object" && err !== null && (err as { code?: string }).code === "23505";
+      if (!isUniqueViolation) {
+        throw err;
+      }
+
+      const raced = await db
+        .selectFrom("submission")
+        .selectAll()
+        .where("idempotency_key", "=", body.idempotency_key)
+        .where("agent_id", "=", agent)
+        .executeTakeFirst();
+
+      if (!raced) {
+        throw new HttpError(409, "idempotency_key is already in use");
+      }
+
+      if (raced.chain_submission_id) {
+        return { submission: raced, unsigned_transaction_xdr: null, network_passphrase: env.NETWORK_PASSPHRASE };
+      }
+
+      return updateExistingDraft(raced.id);
+    }
   });
 
   // Build-sign-relay-confirm step 2: relay the agent-signed XDR to real
