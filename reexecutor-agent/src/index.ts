@@ -12,10 +12,10 @@ const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:3001";
 const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
 const RPC_URL = process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const CONTRACT_ID = requireEnv("ESCROW_GATE_CONTRACT_ID");
-const POLL_MS = Number(process.env.POLL_INTERVAL_MS ?? 3000);
+const POLL_MS = numberEnv("POLL_INTERVAL_MS", 3000, 250);
 // How long a retrieval target may stay unreachable before this worker
 // concludes it is the target's fault (never longer than half the window).
-const RETRIEVAL_RETRY_BUDGET_S = Number(process.env.RETRIEVAL_RETRY_BUDGET_S ?? 120);
+const RETRIEVAL_RETRY_BUDGET_S = numberEnv("RETRIEVAL_RETRY_BUDGET_S", 120, 1);
 // Any endpoint this worker must be able to reach anyway. If even this fails,
 // the problem is our network, and an unreachable target proves nothing.
 const CONNECTIVITY_CHECK_URL = process.env.CONNECTIVITY_CHECK_URL ?? RPC_URL;
@@ -25,6 +25,20 @@ function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
     console.error(`[reexecutor-agent] ${name} is required (see reexecutor-agent/.env.example)`);
+    process.exit(1);
+  }
+  return value;
+}
+
+/** A numeric setting: unset or empty uses `fallback`; anything else must be a
+ * finite number >= `min`, or the agent refuses to start. A bare `Number(...)`
+ * turned a typo into NaN, i.e. a 1 ms poll loop or no retrieval retry wait. */
+function numberEnv(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < min) {
+    console.error(`[reexecutor-agent] ${name} must be a number >= ${min} (got "${raw}")`);
     process.exit(1);
   }
   return value;
