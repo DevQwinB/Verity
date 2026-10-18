@@ -169,11 +169,44 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
         .selectAll()
         .where("chain_submission_id", "=", chainSubmissionId)
         .executeTakeFirst();
-      const rex = await db
+      let rex = await db
         .selectFrom("reexecutor")
         .selectAll()
         .where("stellar_account", "=", v.reexecutor)
         .executeTakeFirst();
+      if (sub && !rex) {
+        // A vote can arrive from an account staked before this backend's
+        // event-retention horizon (or registered directly on-chain), so there
+        // is no mirror row yet. The vote is on-chain and counts toward
+        // consensus; mirror the account from the contract and record it,
+        // or settlement never releases that account's stake lock. An RPC
+        // failure here propagates so the event is retried, not consumed.
+        const info = (await escrowGateAsKeeper.reexecutor_info({ reexecutor: v.reexecutor })).result;
+        if (!info) {
+          console.warn(
+            `[indexer] replay_attested by ${v.reexecutor} (tx ${txHash}) ignored: the contract knows no such re-executor`
+          );
+          break;
+        }
+        await db
+          .insertInto("reexecutor")
+          .values({
+            stellar_account: v.reexecutor,
+            stake_amount: info.stake_amount.toString(),
+            stake_asset: "native",
+            active: info.active,
+            approved: info.approved,
+          })
+          // The /v1/reexecutors/sync route mirrors concurrently; whoever
+          // loses the race reads the winner's row below.
+          .onConflict((oc) => oc.column("stellar_account").doNothing())
+          .execute();
+        rex = await db
+          .selectFrom("reexecutor")
+          .selectAll()
+          .where("stellar_account", "=", v.reexecutor)
+          .executeTakeFirst();
+      }
       if (sub && rex) {
         const existing = await db
           .selectFrom("replay")
