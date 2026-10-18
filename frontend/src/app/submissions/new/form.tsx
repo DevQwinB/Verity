@@ -19,6 +19,31 @@ function textToBase64(text: string): string {
   return btoa(binary);
 }
 
+/** Largest artifact the dashboard will try to upload, in UTF-8 bytes. The
+ * upload request carries the artifact as base64 inside JSON, and the backend
+ * rejects any request over its 1 MiB body limit (`bodyLimit: 1_048_576` in
+ * `backend/src/app.ts`) before Verity's own code runs. 1,048,576 base64
+ * characters carry at most 786,432 raw bytes; this leaves a little room for
+ * the JSON envelope. Keep it in sync with that `bodyLimit`. */
+const MAX_UPLOAD_ARTIFACT_BYTES = 786_000;
+
+/** UTF-8 size, which is what gets uploaded. `text.length` undercounts any
+ * multi-byte character. */
+function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+const formatKb = (bytes: number) => `${(bytes / 1000).toFixed(1)} KB`;
+
+function checkArtifactSize(name: string, text: string) {
+  const bytes = utf8ByteLength(text);
+  if (bytes > MAX_UPLOAD_ARTIFACT_BYTES) {
+    throw new Error(
+      `The ${name} is ${formatKb(bytes)}. The largest artifact the dashboard can upload is about ${formatKb(MAX_UPLOAD_ARTIFACT_BYTES)}.`
+    );
+  }
+}
+
 type Step = "idle" | "uploading" | "building" | "signing" | "relaying" | "done" | "error";
 
 // The reference is free text that is hashed on-chain and shown in lists, so it is capped for sanity; keep it in line with any backend limit.
@@ -95,7 +120,14 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
     if (taskType === "deterministic" && !functionContent.trim()) {
       throw new Error("A deterministic task needs the function re-executors will replay.");
     }
-    return { input: canonicalJson(inputValue), output: canonicalJson(parseJsonOrText(outputContent)) };
+    const input = canonicalJson(inputValue);
+    const output = canonicalJson(parseJsonOrText(outputContent));
+    // Checked here, before anything is uploaded, so an oversize artifact is
+    // named instead of failing the upload with a bare "Request body is too large".
+    checkArtifactSize("input", input);
+    checkArtifactSize("claimed output", output);
+    if (taskType === "deterministic") checkArtifactSize("function", functionContent);
+    return { input, output };
   }
 
   async function handleSubmit() {
