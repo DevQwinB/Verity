@@ -21,6 +21,12 @@ use verity_common::{
 
 const MAX_BPS: i128 = 10_000;
 
+// Maximum allowed challenge window (7 days).
+// Reasoning: the longest a submission legitimately lives is its window plus,
+// if challenged late, one further window for challenge expiry (~2x window = 14 days),
+// well inside the ~28.9 day (500,000 ledgers) persistent storage extension (`BUMP_TO` in storage.rs).
+pub const MAX_WINDOW_S: u64 = 7 * 24 * 60 * 60; // 604_800
+
 fn checked_bps(value: i128, bps: u32) -> Result<i128, Error> {
     let product = value.checked_mul(bps as i128).ok_or(Error::Overflow)?;
     product.checked_div(MAX_BPS).ok_or(Error::Overflow)
@@ -33,7 +39,9 @@ fn validate_config(cfg: &ConfigRecord) -> Result<(), Error> {
         return Err(Error::InvalidConfig);
     }
     if cfg.window_tier_small_s < ConfigRecord::MIN_WINDOW_S
+        || cfg.window_tier_small_s > MAX_WINDOW_S
         || cfg.window_tier_large_s < ConfigRecord::MIN_WINDOW_S
+        || cfg.window_tier_large_s > MAX_WINDOW_S
     {
         return Err(Error::InvalidConfig);
     }
