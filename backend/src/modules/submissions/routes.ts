@@ -11,25 +11,7 @@ import { canonicalJson } from "../../chain/canonical.js";
 import { HttpError } from "../../http-error.js";
 import { findOrCreateMarketplaceForAccount } from "../marketplaces/routes.js";
 import { artifactExists } from "../artifacts/storage.js";
-
-const sha256Hex = z.string().regex(/^[0-9a-f]{64}$/, "must be a lowercase hex sha256 digest");
-const stroops = z.string().regex(/^\d+$/, "must be an integer amount in stroops");
-
-const submitBody = z.object({
-  escrow_ref: z.string().min(1),
-  // "unverifiable" is in the taxonomy but has no on-chain path in Phase 1 —
-  // the contract rejects it, so it is rejected here with a clear message.
-  task_type: z.enum(["deterministic", "retrieval"]),
-  input_hash: sha256Hex,
-  claimed_output_hash: sha256Hex,
-  input_ref: z.string().optional(),
-  function_hash: z.string().optional(),
-  function_ref: z.string().optional(),
-  claimed_output_ref: z.string().optional(),
-  escrow_value: stroops,
-  bond_amount: stroops,
-  idempotency_key: z.string().min(1),
-});
+import { submitBody } from "./schema.js";
 
 /** An artifact reference is the storage_ref POST /v1/artifacts returned,
  * whose last path segment is the content hash. The artifact must really be
