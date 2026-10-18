@@ -1,6 +1,8 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { StrKey } from "@stellar/stellar-sdk";
 import { z } from "zod";
 import { env } from "../config/env.js";
+import { HttpError } from "../http-error.js";
 import { buildChallenge, issueJwt, verifyChallenge, verifyJwt } from "./sep10.js";
 
 declare module "fastify" {
@@ -12,9 +14,18 @@ declare module "fastify" {
 export async function authPlugin(app: FastifyInstance) {
   app.get("/auth", async (req, reply) => {
     const query = z
-      .object({ account: z.string().min(1), home_domain: z.string().optional() })
+      .object({
+        account: z
+          .string()
+          .min(1)
+          .refine(StrKey.isValidEd25519PublicKey, "account must be a valid Stellar public key"),
+        home_domain: z.string().optional(),
+      })
       .parse(req.query);
-    const transaction = buildChallenge(query.account, query.home_domain ?? env.HOME_DOMAIN);
+    if (query.home_domain !== undefined && query.home_domain !== env.HOME_DOMAIN) {
+      throw new HttpError(400, `home_domain must be ${env.HOME_DOMAIN}`);
+    }
+    const transaction = buildChallenge(query.account, env.HOME_DOMAIN);
     return { transaction, network_passphrase: env.NETWORK_PASSPHRASE };
   });
 
