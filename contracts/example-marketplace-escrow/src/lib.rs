@@ -7,8 +7,8 @@
 //! integrator can copy the pattern from (Rust) or reimplement against the
 //! exported EscrowGate contract spec (any language via stellar-sdk bindings).
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
-use verity_common::{Error, Verdict};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
+use verity_common::{Error, SubmissionRecord, Verdict};
 
 #[contracttype]
 #[derive(Clone)]
@@ -31,6 +31,16 @@ struct EscrowRecord {
 
 #[contract]
 pub struct ExampleMarketplaceEscrow;
+
+/// `escrow_ref` for escrow `N` is the 32-byte value with all bytes zero except
+/// the last 8, which hold `N` as a big-endian `u64`. This is the convention a
+/// marketplace and its submitters agree on so a submission can be bound to the
+/// escrow it names; a submission must carry it for its escrow to be releasable.
+fn escrow_ref_for(e: &Env, escrow_id: u64) -> BytesN<32> {
+    let mut bytes = [0u8; 32];
+    bytes[24..32].copy_from_slice(&escrow_id.to_be_bytes());
+    BytesN::from_array(e, &bytes)
+}
 
 #[contractimpl]
 impl ExampleMarketplaceEscrow {
@@ -85,6 +95,26 @@ impl ExampleMarketplaceEscrow {
             .instance()
             .get(&DataKey::Gate)
             .ok_or(Error::NotInitialized)?;
+
+        // Bind the named submission to this escrow before finalizing it.
+        // Otherwise any submission that verifies (or gets slashed) could
+        // release any escrow: the verdict alone says nothing about which
+        // escrow the work was for. A mismatch must not reach `finalize`, so a
+        // wrong submission is not finalized (and its bonds not moved) as a
+        // side effect of a failed release attempt.
+        let submission: Option<SubmissionRecord> = e.invoke_contract(
+            &gate,
+            &soroban_sdk::Symbol::new(&e, "get_submission"),
+            soroban_sdk::vec![&e, soroban_sdk::IntoVal::into_val(&submission_id, &e)],
+        );
+        let submission = submission.ok_or(Error::SubmissionNotFound)?;
+        if submission.agent != rec.payee || submission.escrow_ref != escrow_ref_for(&e, escrow_id) {
+            return Err(Error::SubmissionNotFound);
+        }
+        if submission.escrow_value != rec.amount {
+            return Err(Error::InvalidEscrowValue);
+        }
+
         let verdict: Verdict = e.invoke_contract(
             &gate,
             &soroban_sdk::Symbol::new(&e, "finalize"),

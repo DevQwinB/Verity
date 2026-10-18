@@ -244,12 +244,17 @@ export async function settleOnce(): Promise<number> {
 /** POST /v1/submissions stores a draft row before the agent signs. A draft
  * never signed — the wallet prompt was dismissed, the tab closed — is not a
  * submission and is removed once the transaction built for it can no longer
- * land. */
+ * land.
+ *
+ * Age is counted from `updated_at`, not `created_at`: a retry of a draft
+ * rebuilds the transaction and bumps only `updated_at`, so the clock restarts
+ * with each new transaction. Counting from `created_at` could delete a draft
+ * minutes after the agent was handed a fresh transaction for it. */
 export async function purgeDraftsOnce(): Promise<number> {
   const result = await db
     .deleteFrom("submission")
     .where("chain_submission_id", "is", null)
-    .where("created_at", "<", sql<Date>`now() - (${env.DRAFT_TTL_S} || ' seconds')::interval`)
+    .where("updated_at", "<", sql<Date>`now() - (${env.DRAFT_TTL_S} || ' seconds')::interval`)
     .executeTakeFirst();
   return Number(result.numDeletedRows ?? 0);
 }

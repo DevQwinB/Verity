@@ -771,6 +771,43 @@ fn constructor_rejects_an_invalid_config() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn constructor_rejects_a_zero_min_stake_floor() {
+    let e = Env::default();
+    setup_with(&e, ConfigRecord { min_stake_floor: 0, ..default_config() });
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn constructor_rejects_a_negative_min_stake_floor() {
+    let e = Env::default();
+    setup_with(&e, ConfigRecord { min_stake_floor: -1, ..default_config() });
+}
+
+#[test]
+fn update_config_rejects_a_non_positive_min_stake_floor() {
+    let e = Env::default();
+    let w = setup_with(&e, default_config());
+
+    for floor in [0, -1] {
+        let cfg = ConfigRecord { min_stake_floor: floor, ..default_config() };
+        assert_eq!(w.client.try_update_config(&w.admin, &cfg), Err(Ok(Error::InvalidConfig)));
+        // The rejected update leaves the stored config alone.
+        assert_eq!(w.client.get_config().unwrap().min_stake_floor, 500 * XLM);
+    }
+}
+
+#[test]
+fn update_config_accepts_a_min_stake_floor_of_one() {
+    let e = Env::default();
+    let w = setup_with(&e, default_config());
+
+    w.client.update_config(&w.admin, &ConfigRecord { min_stake_floor: 1, ..default_config() });
+
+    assert_eq!(w.client.get_config().unwrap().min_stake_floor, 1);
+}
+
+#[test]
 fn zero_slash_bps_disables_reexecutor_slashing() {
     let e = Env::default();
     let w = setup_with(&e, ConfigRecord { reexecutor_slash_bps: 0, ..default_config() });

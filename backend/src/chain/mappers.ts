@@ -71,6 +71,14 @@ export function hex(buf: Buffer): string {
   return buf.toString("hex");
 }
 
+/** Convert a hex string into the 32-byte Buffer a BytesN<32> field expects.
+ * It is for those values only; it rejects anything that is not exactly 64 hex
+ * characters because Node's Buffer.from(str, "hex") silently stops at the
+ * first invalid pair and drops a trailing odd nibble, which would otherwise
+ * yield a shorter or different buffer than the caller intended. */
 export function bufFromHex(h: string): Buffer {
+  if (!/^[0-9a-fA-F]{64}$/.test(h)) {
+    throw new Error(`expected 64 hex characters, got ${h.length}`);
+  }
   return Buffer.from(h, "hex");
 }

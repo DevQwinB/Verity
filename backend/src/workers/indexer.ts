@@ -1,4 +1,5 @@
 import { scValToNative } from "@stellar/stellar-sdk";
+import { sql } from "kysely";
 import { db } from "../db.js";
 import { server } from "../chain/rpc.js";
 import { env } from "../config/env.js";
@@ -314,39 +315,52 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
         .where("stellar_account", "=", v.reexecutor)
         .executeTakeFirst();
       if (rex) {
-        await db
-          .insertInto("slashing_event")
-          .values({
-            reexecutor_id: rex.id,
-            submission_id: sub?.id ?? null,
-            amount: v.amount.toString(),
-            reason: "vote contradicted the bonded re-execution consensus",
-            tx_hash: txHash,
-          })
-          .onConflict((oc) => oc.doNothing())
-          .returningAll()
-          .executeTakeFirst()
-          .then(async (inserted) => {
-            if (!inserted) return; // event already recorded on an earlier pass
-            if (sub) {
-              await db
-                .updateTable("replay")
-                .set({ slash_tx_hash: txHash })
-                .where("submission_id", "=", sub.id)
-                .where("reexecutor_id", "=", rex.id)
-                .execute();
-            }
-            const info = await escrowGateAsKeeper.reexecutor_info({ reexecutor: v.reexecutor });
-            await db
-              .updateTable("reexecutor")
-              .set({
-                slashed_count: rex.slashed_count + 1,
-                stake_amount: info.result ? info.result.stake_amount.toString() : rex.stake_amount,
-                active: info.result?.active ?? rex.active,
-              })
-              .where("id", "=", rex.id)
+        // Read the stake before writing anything. No database connection is
+        // held open across a network call, and if this throws nothing has been
+        // written yet, so the retry of this event starts from scratch.
+        const info = await escrowGateAsKeeper.reexecutor_info({ reexecutor: v.reexecutor });
+
+        // All or nothing: a failure after the insert must roll the insert back,
+        // or the retry would find the row, skip the update, and slashed_count
+        // would never be corrected.
+        await db.transaction().execute(async (trx) => {
+          const inserted = await trx
+            .insertInto("slashing_event")
+            .values({
+              reexecutor_id: rex.id,
+              submission_id: sub?.id ?? null,
+              amount: v.amount.toString(),
+              reason: "vote contradicted the bonded re-execution consensus",
+              tx_hash: txHash,
+            })
+            .onConflict((oc) => oc.doNothing())
+            .returningAll()
+            .executeTakeFirst();
+          if (!inserted) return; // event already recorded on an earlier pass
+
+          if (sub) {
+            await trx
+              .updateTable("replay")
+              .set({ slash_tx_hash: txHash })
+              .where("submission_id", "=", sub.id)
+              .where("reexecutor_id", "=", rex.id)
               .execute();
-          });
+          }
+          await trx
+            .updateTable("reexecutor")
+            .set({
+              // Incremented in SQL, not from the row read above, so two slashes
+              // handled close together cannot overwrite each other.
+              slashed_count: sql<number>`slashed_count + 1`,
+              // Without a fresh read, leave the stored stake alone rather than
+              // rewriting it from the stale row.
+              ...(info.result
+                ? { stake_amount: info.result.stake_amount.toString(), active: info.result.active }
+                : {}),
+            })
+            .where("id", "=", rex.id)
+            .execute();
+        });
       }
       break;
     }
