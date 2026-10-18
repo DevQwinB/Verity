@@ -78,10 +78,25 @@ export async function relaySignedXdr(
     const code = sendResult.errorResult?.result.type ?? "unknown";
     throw new HttpError(422, `The network rejected the transaction (${code}).`);
   }
+  if (sendResult.status === "TRY_AGAIN_LATER") {
+    throw new HttpError(503, "The network did not accept the transaction right now; nothing was submitted. Sign and relay it again in a moment.");
+  }
   const hash = sendResult.hash;
   const deadline = Date.now() + 45_000;
+  // PENDING and DUPLICATE both mean this hash is (or already was) in flight,
+  // so both fall through to polling for the result.
+  let lastPollError: unknown;
   while (Date.now() < deadline) {
-    const got = await server.getTransaction(hash);
+    let got;
+    try {
+      got = await server.getTransaction(hash);
+    } catch (err) {
+      // A transient RPC failure must not abort the wait: the transaction was
+      // accepted and may confirm on the next poll.
+      lastPollError = err;
+      await new Promise((r) => setTimeout(r, 1500));
+      continue;
+    }
     if (got.status === "SUCCESS") {
       const returnValue = got.returnValue ? scValToNative(got.returnValue) : null;
       return { hash, status: "SUCCESS", returnValue };
@@ -90,6 +105,9 @@ export async function relaySignedXdr(
       throw new HttpError(422, `Transaction ${hash} was included but failed on-chain.`);
     }
     await new Promise((r) => setTimeout(r, 1500));
+  }
+  if (lastPollError !== undefined) {
+    console.error(`polling transaction ${hash} failed:`, lastPollError);
   }
   throw new HttpError(504, `Timed out waiting for transaction ${hash} to confirm. It may still land; check before retrying.`);
 }
