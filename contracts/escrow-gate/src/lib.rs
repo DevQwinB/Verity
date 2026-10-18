@@ -55,6 +55,11 @@ fn validate_config(cfg: &ConfigRecord) -> Result<(), Error> {
     if cfg.window_tier_small_ceiling < 0 {
         return Err(Error::InvalidConfig);
     }
+    // A floor of zero (or less) would keep a re-executor that has withdrawn all
+    // of its stake "active", and its votes would still count toward the quorum.
+    if cfg.min_stake_floor <= 0 {
+        return Err(Error::InvalidConfig);
+    }
     Ok(())
 }
 
