@@ -20,11 +20,16 @@ const TIMEOUT_MS = 10_000;
 
 /**
  * The target could not be reached, or answered in a way that says "try
- * again" (5xx, 408, 429). That may be the target, or it may be this host's
- * network — and a vote is irreversible — so the caller retries for a while
- * and then checks its own connectivity before concluding anything.
+ * again" (5xx, 408, 429) or is often local to this worker's IP/network (401,
+ * 403, 451). That may be the target, or it may be this host's network/geo-block —
+ * and a vote is irreversible — so the caller retries for a while and then checks
+ * its own connectivity before concluding anything (and voting mismatch if still failing).
  */
 export class RetrievalTransientError extends Error {}
+
+export function isInconclusiveStatus(status: number): boolean {
+  return status >= 500 || status === 408 || status === 429 || status === 401 || status === 403 || status === 451;
+}
 
 function isPrivateAddress(ip: string): boolean {
   if (ip.includes(":")) {
@@ -150,8 +155,9 @@ function resolvePointer(doc: unknown, pointer: string): unknown {
 /**
  * Re-issues the declared request. Throws a plain Error for an outcome that
  * settles the question against the submission (bad spec, private target,
- * redirect, 4xx, oversize, pointer that does not resolve), and a
- * RetrievalTransientError for one that does not.
+ * redirect, definitive 4xx like 404, oversize, pointer that does not resolve), and a
+ * RetrievalTransientError for one that does not (unreachable target, 5xx, 408, 429,
+ * or inconclusive worker-specific statuses like 401, 403, 451).
  */
 export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: string; output: unknown; engine: string }> {
   if (!spec || typeof spec.url !== "string") {
@@ -162,7 +168,7 @@ export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: s
   // A redirect could bounce to a private address, and a moved resource is a
   // legitimate mismatch anyway: the agent declared this URL, not another.
   if (res.status >= 300 && res.status < 400) throw new Error(`retrieval target redirected (HTTP ${res.status})`);
-  if (res.status >= 500 || res.status === 408 || res.status === 429) {
+  if (isInconclusiveStatus(res.status)) {
     throw new RetrievalTransientError(`retrieval target answered HTTP ${res.status}`);
   }
   if (res.status < 200 || res.status >= 300) throw new Error(`retrieval target answered HTTP ${res.status}`);
