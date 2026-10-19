@@ -535,6 +535,7 @@ impl EscrowGate {
         info.open_attestations = info.open_attestations.saturating_sub(1);
         storage::set_reexecutor(&e, &reexecutor, &info);
         storage::mark_released(&e, submission_id, &reexecutor);
+        storage::bump_instance(&e);
         Ok(())
     }
 
@@ -716,6 +717,7 @@ impl EscrowGate {
             return Err(Error::NotSlashable);
         }
         storage::set_reexecutor(&e, &reexecutor, &info);
+        storage::bump_instance(&e);
         Ok(amount)
     }
 

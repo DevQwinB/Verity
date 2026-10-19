@@ -829,4 +829,72 @@ fn zero_slash_bps_disables_reexecutor_slashing() {
     assert_eq!(w.client.reexecutor_info(&wrong).unwrap().stake_amount, 600 * XLM);
 }
 
+#[test]
+fn release_attestation_lock_extends_instance_ttl() {
+    use soroban_sdk::testutils::storage::Instance as _;
+
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex);
+    w.client.attest_replay(&rex, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+
+    for _ in 0..2 {
+        let r = Address::generate(&e);
+        register_rex(&w, &r);
+        w.client.attest_replay(&r, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+    }
+
+    assert_eq!(w.client.finalize(&id), Verdict::Verified);
+
+    // Let the instance TTL decay below the 100,000 threshold (storage.rs BUMP_THRESHOLD).
+    // Finalize extended it to 500,000 (storage.rs BUMP_TO).
+    e.ledger().with_mut(|l| l.sequence_number += 450_000);
+
+    let ttl_before = e.as_contract(&w.client.address, || e.storage().instance().get_ttl());
+    assert!(ttl_before < 100_000);
+
+    w.client.release_attestation_lock(&id, &rex);
+
+    let ttl_after = e.as_contract(&w.client.address, || e.storage().instance().get_ttl());
+    assert_eq!(ttl_after, 500_000);
+}
+
+#[test]
+fn slash_extends_instance_ttl() {
+    use soroban_sdk::testutils::storage::Instance as _;
+
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let wrong = Address::generate(&e);
+    register_rex(&w, &wrong);
+    w.client.attest_replay(&wrong, &id, &BytesN::from_array(&e, &[9u8; 32]), &true);
+
+    for _ in 0..2 {
+        let r = Address::generate(&e);
+        register_rex(&w, &r);
+        w.client.attest_replay(&r, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    }
+
+    assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+
+    // Let the instance TTL decay below the 100,000 threshold (storage.rs BUMP_THRESHOLD).
+    e.ledger().with_mut(|l| l.sequence_number += 450_000);
+
+    let ttl_before = e.as_contract(&w.client.address, || e.storage().instance().get_ttl());
+    assert!(ttl_before < 100_000);
+
+    let slashed_amount = w.client.slash(&wrong, &id);
+    assert!(slashed_amount > 0);
+
+    let ttl_after = e.as_contract(&w.client.address, || e.storage().instance().get_ttl());
+    assert_eq!(ttl_after, 500_000);
+}
+
 mod proptest_model;
