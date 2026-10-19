@@ -77,10 +77,10 @@ export default async function ReportsPage() {
             <table className="w-full min-w-[520px] text-sm">
               <thead>
                 <tr className="text-left text-xs uppercase tracking-wide text-text-tertiary">
-                  <th className="px-5 py-3 font-medium">Marketplace</th>
-                  <th className="px-5 py-3 font-medium">Task type</th>
-                  <th className="px-5 py-3 font-medium">Status</th>
-                  <th className="px-5 py-3 text-right font-medium">Count</th>
+                  <th scope="col" className="px-5 py-3 font-medium">Marketplace</th>
+                  <th scope="col" className="px-5 py-3 font-medium">Task type</th>
+                  <th scope="col" className="px-5 py-3 font-medium">Status</th>
+                  <th scope="col" className="px-5 py-3 text-right font-medium">Count</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border-subtle">
