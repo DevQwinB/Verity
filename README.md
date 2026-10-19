@@ -227,8 +227,19 @@ GET  /v1/reports/verification-rates
 POST /v1/marketplaces, POST /v1/marketplaces/:id/webhooks
 ```
 
-Webhooks (HMAC-SHA256 in `x-verity-signature`): `submission.verified`,
-`submission.slashed`, `submission.disputed`.
+Webhooks: `submission.verified`, `submission.slashed`, `submission.disputed`.
+Every delivery includes three headers:
+- `x-verity-delivery`: the delivery UUID.
+- `x-verity-timestamp`: the Unix timestamp in whole seconds when the request was sent.
+- `x-verity-signature`: lowercase hex HMAC-SHA256 computed with the subscription secret over the payload string:
+  ```
+  ${timestamp}.${deliveryId}.${rawBody}
+  ```
+
+To verify a delivery:
+1. Recompute the HMAC-SHA256 over `timestamp + "." + deliveryId + "." + rawBody` using your webhook subscription secret.
+2. Compare the computed digest to `x-verity-signature` in constant time.
+3. Reject deliveries where `x-verity-timestamp` is older than an acceptable tolerance window (e.g. 5 minutes) to protect against replay attacks. Use `x-verity-delivery` to deduplicate deliveries.
 
 ## Known limits
 

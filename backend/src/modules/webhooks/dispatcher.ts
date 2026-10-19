@@ -13,12 +13,15 @@ export async function dispatchWebhook(marketplaceId: string, eventType: string, 
   for (const sub of subs) {
     if (!sub.events.includes(eventType)) continue;
     const body = JSON.stringify({ event: eventType, data: payload });
-    const signature = createHmac("sha256", sub.secret).update(body).digest("hex");
     const delivery = await db
       .insertInto("webhook_delivery")
       .values({ subscription_id: sub.id, event_type: eventType, payload: payload as any })
       .returningAll()
       .executeTakeFirstOrThrow();
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = createHmac("sha256", sub.secret)
+      .update(`${timestamp}.${delivery.id}.${body}`)
+      .digest("hex");
     try {
       // Re-checked at send time: the host may resolve somewhere else now than
       // it did when the subscription was created. No redirects, for the same reason.
@@ -26,7 +29,12 @@ export async function dispatchWebhook(marketplaceId: string, eventType: string, 
       const res = await fetch(sub.url, {
         method: "POST",
         redirect: "error",
-        headers: { "content-type": "application/json", "x-verity-signature": signature },
+        headers: {
+          "content-type": "application/json",
+          "x-verity-delivery": delivery.id,
+          "x-verity-timestamp": timestamp,
+          "x-verity-signature": signature,
+        },
         body,
       });
       await db
