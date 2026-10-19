@@ -230,6 +230,87 @@ POST /v1/marketplaces, POST /v1/marketplaces/:id/webhooks
 Webhooks (HMAC-SHA256 in `x-verity-signature`): `submission.verified`,
 `submission.slashed`, `submission.disputed`.
 
+### Verify an attestation
+
+Fetch `GET /v1/submissions/:id/attestation` using Verity's submission UUID,
+not the on-chain submission ID. Replace the example UUID below with a real
+settled submission from your backend:
+
+```bash
+curl --fail-with-body http://localhost:3001/v1/submissions/00000000-0000-0000-0000-000000000000/attestation
+```
+
+A non-UUID ID returns HTTP 400. HTTP 404 means no attestation exists yet:
+it is issued in the settlement pass after a terminal verdict and release of
+indexed attestation locks, not immediately on finalisation.
+
+The response contains `payload`, `canonical`, `signature`,
+`signature_algorithm`, `signer`, `delivered_to` and `issued_at`:
+
+- `canonical` is the exact UTF-8 string that was signed: canonical JSON of
+  `payload`, with object keys sorted recursively and no whitespace. The API
+  recomputes it from the stored payload. Verify these bytes directly.
+- `signature` is the base64-encoded raw 64-byte ed25519 signature;
+  `signature_algorithm` is `"ed25519"`.
+- `signer` is the keeper's Stellar G-address, also recorded as
+  `payload.attestor.stellar_account`. Pin it to the expected
+  `keeper_public_key` in your trusted `deployments/<name>.json`; accepting an
+  arbitrary key from the response does not establish the expected signer.
+- `delivered_to` is `null`: the record is signed and served by the API,
+  with nothing pushed to Stellar 8004 or any other registry.
+
+The signed `verity.attestation.v2` payload identifies the network and
+EscrowGate contract, attestor, subject (agent, escrow reference, Verity UUID
+and chain submission ID), claim (task type, verdict, resolution method and
+indexed attestations), submit/finalise transaction hashes and `issued_at`.
+Each claim attestation contains `reexecutor`, `matched` and `tx_hash`.
+Verdicts are `verified`, `slashed` or `expired_unverified`.
+`payload.issued_at` is inside the signed bytes; the response-level
+`issued_at` is the database export time and is **not** signed.
+
+From the repository root after `pnpm install`, run this Node.js example.
+Set `SUBMISSION_ID` to a real settled UUID. `API` defaults to the local
+backend; `DEPLOYMENT` selects the trusted deployment file (default `testnet`).
+
+```bash
+SUBMISSION_ID=00000000-0000-0000-0000-000000000000 node --input-type=module <<'JS'
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+const require = createRequire(new URL("./backend/package.json", import.meta.url));
+const { Keypair } = require("@stellar/stellar-sdk");
+
+const API = process.env.API ?? "http://localhost:3001";
+const id = process.env.SUBMISSION_ID;
+if (!id) throw new Error("Set SUBMISSION_ID to a settled Verity submission UUID");
+const deployment = JSON.parse(readFileSync(
+  `deployments/${process.env.DEPLOYMENT ?? "testnet"}.json`, "utf8"
+));
+const response = await fetch(`${API}/v1/submissions/${encodeURIComponent(id)}/attestation`);
+if (!response.ok) throw new Error(`Attestation HTTP ${response.status}: ${await response.text()}`);
+const att = await response.json();
+if (att.signature_algorithm !== "ed25519") throw new Error("Unexpected algorithm");
+if (!deployment.keeper_public_key || att.signer !== deployment.keeper_public_key)
+  throw new Error("Unexpected keeper signer");
+const key = Keypair.fromPublicKey(att.signer);
+const signature = Buffer.from(att.signature, "base64");
+const message = Buffer.from(att.canonical, "utf8");
+if (signature.length !== 64 || !key.verify(message, signature))
+  throw new Error("Invalid attestation signature");
+if (key.verify(Buffer.concat([message, Buffer.from(" ")]), signature))
+  throw new Error("Tampered canonical string unexpectedly verified");
+console.log("Signature valid; tampered canonical string rejected");
+JS
+```
+
+A valid signature shows that Verity's keeper key attested to these verdict
+record bytes; it is not a cryptographic proof of correctness. Check the
+signed record's `finalize_tx_hash` and the contract for the verdict itself:
+the contract is the authority. `claim.attestations` contains only votes the
+backend indexed as `confirmed_onchain`, ordered by transaction hash. If the
+indexer is missing votes, settlement waits up to 600 seconds, then may issue
+the record with incomplete evidence. Read the on-chain submission for the
+full tally.
+
 ## Known limits
 
 - **Testnet only. Contracts are unaudited.**
