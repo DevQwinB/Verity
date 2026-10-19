@@ -51,15 +51,49 @@ export function windowDeadlineIso(submittedAtIso: string, windowSeconds: number)
   return new Date(new Date(submittedAtIso).getTime() + windowSeconds * 1000).toISOString();
 }
 
+export type XlmAmountResult =
+  | { ok: true; stroops: bigint }
+  | { ok: false; reason: string };
+
+/** Parses an XLM amount a person typed, and says why when it cannot.
+ *
+ * Accepted forms: `5`, `5.5`, `.5` and `1.` — digits with an optional dot and
+ * at most 7 decimal places. Commas are rejected rather than guessed at:
+ * whether `1,5` means one and a half or fifteen hundred depends on locale,
+ * and a wrong guess changes a bond amount tenfold. */
+export function parseXlmAmount(input: string): XlmAmountResult {
+  const value = input.trim();
+  if (value === "") {
+    return { ok: false, reason: "Enter an amount." };
+  }
+  if (value.includes(",")) {
+    return { ok: false, reason: "Use a dot for decimals and no thousands separators." };
+  }
+  if (value.startsWith("-")) {
+    return { ok: false, reason: "The amount must be positive." };
+  }
+  if (/^(?:\d+\.\d{8,}|\.\d{8,})$/.test(value)) {
+    return { ok: false, reason: "Use at most 7 decimal places." };
+  }
+  if (!/^(?:\d+(?:\.\d{0,7})?|\.\d{1,7})$/.test(value)) {
+    return { ok: false, reason: "Enter a number, like 5 or 0.5." };
+  }
+  const [whole = "", frac = ""] = value.split(".");
+  // ".5".split(".") gives ["", "5"]; BigInt("") happens to be 0n, but say it.
+  const stroops = BigInt(whole || "0") * BigInt(STROOPS_PER_XLM) + BigInt(frac.padEnd(7, "0"));
+  if (stroops <= BigInt(0)) {
+    return { ok: false, reason: "The amount must be more than zero." };
+  }
+  return { ok: true, stroops };
+}
+
 /** Parses an XLM amount a person typed into stroops. Null when it is not a
  * positive amount with at most 7 decimal places — so a form can say so,
- * instead of a number conversion throwing somewhere downstream. */
+ * instead of a number conversion throwing somewhere downstream. Accepts the
+ * same forms as [parseXlmAmount], which also says why an input was rejected. */
 export function xlmToStroops(input: string): bigint | null {
-  const value = input.trim();
-  if (!/^\d+(\.\d{1,7})?$/.test(value)) return null;
-  const [whole, frac = ""] = value.split(".");
-  const stroops = BigInt(whole) * BigInt(STROOPS_PER_XLM) + BigInt(frac.padEnd(7, "0"));
-  return stroops > BigInt(0) ? stroops : null;
+  const result = parseXlmAmount(input);
+  return result.ok ? result.stroops : null;
 }
 
 /** "10 minutes", "1 hour", "24 hours" — for windows and waits. */
