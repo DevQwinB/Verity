@@ -13,10 +13,16 @@ export function truncateMiddle(value: string, head = 6, tail = 6): string {
   return `${value.slice(0, head)}...${value.slice(-tail)}`;
 }
 
+/** Formats a timestamp relative to now (e.g. "3 minutes ago", "in 1 hour").
+ * Degrades gracefully to "\u2014" on invalid dates and never throws.
+ * Avoids impossible boundary values (such as "60 minutes" or "24 hours")
+ * by rolling over to the next larger unit when rounding reaches it. */
 export function formatRelativeTime(iso: string): string {
-  const date = new Date(iso);
-  const diffMs = date.getTime() - Date.now();
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return "\u2014";
+  const diffMs = t - Date.now();
   const diffSec = Math.round(diffMs / 1000);
+  const sign = Math.sign(diffSec) || 1;
   const abs = Math.abs(diffSec);
   const units: [Intl.RelativeTimeFormatUnit, number][] = [
     ["year", 31536000],
@@ -29,14 +35,29 @@ export function formatRelativeTime(iso: string): string {
   const rtf = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
   for (const [unit, secondsInUnit] of units) {
     if (abs >= secondsInUnit || unit === "second") {
-      return rtf.format(Math.round(diffSec / secondsInUnit), unit);
+      const rounded = Math.round(abs / secondsInUnit);
+      if (unit === "minute" && rounded >= 60) {
+        return rtf.format(sign * Math.round(abs / 3600), "hour");
+      }
+      if (unit === "hour" && rounded >= 24) {
+        return rtf.format(sign * Math.round(abs / 86400), "day");
+      }
+      if (unit === "day" && rounded >= 30) {
+        return rtf.format(sign * Math.round(abs / 2592000), "month");
+      }
+      return rtf.format(sign * rounded, unit);
     }
   }
   return rtf.format(diffSec, "second");
 }
 
+/** Formats remaining time until a deadline (e.g. "59m 59s remaining").
+ * Returns "window closed" when the deadline is in the past.
+ * Degrades gracefully to "\u2014" on invalid dates and never throws. */
 export function formatCountdown(deadlineIso: string): string {
-  const ms = new Date(deadlineIso).getTime() - Date.now();
+  const t = new Date(deadlineIso).getTime();
+  if (Number.isNaN(t)) return "\u2014";
+  const ms = t - Date.now();
   if (ms <= 0) return "window closed";
   const totalSec = Math.floor(ms / 1000);
   const h = Math.floor(totalSec / 3600);
