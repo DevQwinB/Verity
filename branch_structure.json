@@ -1,0 +1,21 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix/9-decode-failures",
+    "launch-readiness",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "fix/9-decode-failures": "main",
+    "launch-readiness": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "fix/9-decode-failures",
+    "launch-readiness",
+    "origin"
+  ]
+}

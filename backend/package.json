@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc",
-    "dev": "tsx watch src/index.ts",
-    "start": "node dist/index.js",
+    "build": "node api.js && tsc",
+    "dev": "node api.js && tsx watch src/index.ts",
+    "start": "node api.js && node dist/index.js",
     "smoke": "tsx src/smoke/run.ts",
     "typecheck": "tsc --noEmit"
   },
