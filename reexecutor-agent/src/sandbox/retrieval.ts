@@ -20,9 +20,10 @@ const TIMEOUT_MS = 10_000;
 
 /**
  * The target could not be reached, or answered in a way that says "try
- * again" (5xx, 408, 429). That may be the target, or it may be this host's
- * network — and a vote is irreversible — so the caller retries for a while
- * and then checks its own connectivity before concluding anything.
+ * again" (5xx, 408, 429), or the resolver could not find the host. That may
+ * be the target, or it may be this host's network/resolver — and a vote is
+ * irreversible — so the caller retries for a while and then checks its own
+ * connectivity before concluding anything.
  */
 export class RetrievalTransientError extends Error {}
 
@@ -73,9 +74,11 @@ async function resolvePublicTarget(raw: string): Promise<PinnedTarget> {
       addresses = await lookup(host, { all: true });
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      // The name does not exist: that is an answer. Anything else (timeout,
-      // server failure) is the resolver, not the target.
-      if (code === "ENOTFOUND") throw new Error(`retrieval host ${host} does not exist`);
+      // The resolver on this host can answer NXDOMAIN wrongly (captive portal,
+      // split horizon, flaky DNS cache), and a vote is irreversible.
+      if (code === "ENOTFOUND") {
+        throw new RetrievalTransientError(`could not resolve ${host}: ENOTFOUND`);
+      }
       throw new RetrievalTransientError(`could not resolve ${host}: ${code ?? (err as Error).message}`);
     }
   }
@@ -151,7 +154,8 @@ function resolvePointer(doc: unknown, pointer: string): unknown {
  * Re-issues the declared request. Throws a plain Error for an outcome that
  * settles the question against the submission (bad spec, private target,
  * redirect, 4xx, oversize, pointer that does not resolve), and a
- * RetrievalTransientError for one that does not.
+ * RetrievalTransientError for one that does not (network failures, unresolvable
+ * hosts, 5xx, 408, 429).
  */
 export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: string; output: unknown; engine: string }> {
   if (!spec || typeof spec.url !== "string") {
