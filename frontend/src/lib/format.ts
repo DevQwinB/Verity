@@ -74,3 +74,26 @@ export function formatDuration(seconds: number): string {
 export function bpsToPercent(bps: number): string {
   return `${(bps / 100).toString()}%`;
 }
+
+const CONTRACT_ERROR_DESCRIPTIONS: Record<string, string> = {
+  BondTooLow: "The bond amount is below the required minimum for this escrow value.",
+  InvalidEscrowValue: "The declared escrow value must be greater than zero.",
+  ChallengeWindowClosed:
+    "The challenge window for this submission has closed, so it can no longer be challenged.",
+  ChallengeAlreadyOpen: "A challenge has already been opened for this submission.",
+  SubmissionNotFound: "The contract has no record of this submission.",
+  InvalidAmount: "The amount must be greater than zero and cannot exceed available stake.",
+  StakeLockedByOpenAttestation:
+    "Stake is locked while the re-executor has open attestations and cannot be withdrawn below the minimum until they settle.",
+  ReexecutorNotActive:
+    "This account is not an active re-executor or its stake is below the minimum threshold.",
+};
+
+/** Plain-language explanation for contract error names a dashboard user can trigger. */
+export function describeContractError(name: string): string | null {
+  if (Object.hasOwn(CONTRACT_ERROR_DESCRIPTIONS, name)) {
+    return CONTRACT_ERROR_DESCRIPTIONS[name];
+  }
+  return null;
+}
+
