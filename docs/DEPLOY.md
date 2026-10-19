@@ -144,12 +144,12 @@ stellar contract extend --id <ESCROW_GATE_CONTRACT_ID> --source verity-public-ke
 ```
 
 **Testnet resets.** Stellar testnet is wiped periodically. After a reset the
-contracts are gone: repeat step 1 with `--force`, update `.env`, and start
+contracts are gone: repeat step 1 with `--force --replace-public` (the public-deployment guard requires `--replace-public` because replacing it abandons the old contracts), update `.env`, and start
 from an empty database (`docker compose down -v` deletes both volumes).
 
 **Upgrading.** EscrowGate has no upgrade entrypoint. A backend, dashboard or
 worker change is `git pull && docker compose --profile fleet up -d --build`.
-A contract change is a new deployment: step 1 with `--force`, then as for a
+A contract change is a new deployment: step 1 with `--force --replace-public`, then as for a
 testnet reset. Stakes on the old contract stay withdrawable from it.
 
 ## What this deployment does not give you
