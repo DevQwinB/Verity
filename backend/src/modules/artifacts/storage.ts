@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { env } from "../../config/env.js";
@@ -15,8 +15,15 @@ export async function storeArtifact(content: Buffer): Promise<{ contentHash: str
   await ensureDir();
   const contentHash = createHash("sha256").update(content).digest("hex");
   const storageRef = path.join(env.ARTIFACT_STORAGE_DIR, contentHash);
-  await fs.writeFile(storageRef, content);
-  return { contentHash, storageRef };
+  const tmpFile = path.join(env.ARTIFACT_STORAGE_DIR, `${contentHash}.${randomUUID()}.tmp`);
+  try {
+    await fs.writeFile(tmpFile, content);
+    await fs.rename(tmpFile, storageRef);
+  } catch (err) {
+    await fs.rm(tmpFile, { force: true }).catch(() => {});
+    throw err;
+  }
+  return { contentHash, storageRef: contentHash };
 }
 
 export async function readArtifact(storageRef: string): Promise<Buffer> {
