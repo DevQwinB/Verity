@@ -283,6 +283,9 @@ separately authenticated operator/deployment channel, then run the example
 with `TRUSTED_KEEPER_PUBLIC_KEY=G...` to explicitly trust it. Do not set the
 override to `att.signer` or copy the response value before verifying its
 provenance. An old attestation must still be checked against its old key.
+Select the **trusted deployment configuration for the specific submission**,
+not one supplied by an untrusted API. A valid signature alone does not
+prove that the attestation concerns the UUID or contract you requested.
 
 ```bash
 SUBMISSION_ID=00000000-0000-0000-0000-000000000000 node --input-type=module <<'JS'
@@ -323,7 +326,20 @@ if (signature.length !== 64 || !key.verify(message, signature))
   throw new Error("Invalid attestation signature");
 if (key.verify(Buffer.concat([message, Buffer.from(" ")]), signature))
   throw new Error("Tampered canonical string unexpectedly verified");
-console.log("Signer pinned, signature valid, payload bound to canonical bytes");
+// Bind the authenticated bytes to this request and the selected deployment.
+if (att.payload?.schema !== "verity.attestation.v2")
+  throw new Error("Unexpected attestation schema");
+if (att.payload?.subject?.submission_id !== id)
+  throw new Error("Attestation does not belong to the requested submission");
+if (typeof deployment.network_passphrase !== "string" ||
+    !deployment.network_passphrase ||
+    att.payload.network_passphrase !== deployment.network_passphrase)
+  throw new Error("Attestation network does not match the trusted deployment");
+if (typeof deployment.escrow_gate_contract_id !== "string" ||
+    !deployment.escrow_gate_contract_id ||
+    att.payload.escrow_gate_contract_id !== deployment.escrow_gate_contract_id)
+  throw new Error("Attestation contract does not match the trusted deployment");
+console.log("Signature valid; signer, submission and deployment context verified");
 JS
 ```
 
