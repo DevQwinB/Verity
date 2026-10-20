@@ -116,7 +116,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
           : null;
 
       setStep("building");
-      const { submission, unsigned_transaction_xdr } = await createSubmission({
+      const { submission, unsigned_transaction_xdr, network_passphrase } = await createSubmission({
         escrow_ref: escrowRefTrimmed,
         task_type: taskType,
         input_hash: input.content_hash,
@@ -137,7 +137,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
 
       setStep("signing");
       const signed = await signXdr(unsigned_transaction_xdr, {
-        networkPassphrase: NETWORK_PASSPHRASE,
+        networkPassphrase: network_passphrase || NETWORK_PASSPHRASE,
         address: account,
       });
 
