@@ -13,9 +13,12 @@ export function truncateMiddle(value: string, head = 6, tail = 6): string {
   return `${value.slice(0, head)}...${value.slice(-tail)}`;
 }
 
+/** Formats an ISO timestamp into a human-readable relative time (e.g. "3 minutes ago").
+ * Degrades gracefully to "\u2014" on invalid dates and never throws. */
 export function formatRelativeTime(iso: string): string {
-  const date = new Date(iso);
-  const diffMs = date.getTime() - Date.now();
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return "\u2014";
+  const diffMs = t - Date.now();
   const diffSec = Math.round(diffMs / 1000);
   const abs = Math.abs(diffSec);
   const units: [Intl.RelativeTimeFormatUnit, number][] = [
@@ -27,16 +30,28 @@ export function formatRelativeTime(iso: string): string {
     ["second", 1],
   ];
   const rtf = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
-  for (const [unit, secondsInUnit] of units) {
+  for (let i = 0; i < units.length; i++) {
+    const [unit, secondsInUnit] = units[i]!;
     if (abs >= secondsInUnit || unit === "second") {
-      return rtf.format(Math.round(diffSec / secondsInUnit), unit);
+      let chosenUnit = unit;
+      let chosenDivisor = secondsInUnit;
+      const count = Math.round(abs / secondsInUnit);
+      if (i > 0 && unit !== "month" && count * secondsInUnit >= units[i - 1]![1]) {
+        chosenUnit = units[i - 1]![0];
+        chosenDivisor = units[i - 1]![1];
+      }
+      return rtf.format(Math.round(diffSec / chosenDivisor), chosenUnit);
     }
   }
   return rtf.format(diffSec, "second");
 }
 
+/** Formats a deadline into a live countdown string (e.g. "59m 59s remaining").
+ * Degrades gracefully to "\u2014" on invalid dates and never throws. */
 export function formatCountdown(deadlineIso: string): string {
-  const ms = new Date(deadlineIso).getTime() - Date.now();
+  const t = new Date(deadlineIso).getTime();
+  if (Number.isNaN(t)) return "\u2014";
+  const ms = t - Date.now();
   if (ms <= 0) return "window closed";
   const totalSec = Math.floor(ms / 1000);
   const h = Math.floor(totalSec / 3600);
