@@ -55,7 +55,7 @@ export async function submissionsRoutes(app: FastifyInstance) {
   // specifies a per-id GET) — the dashboard has nothing to render a
   // submissions feed from without it, and faking one client-side would
   // violate the no-mocked-data requirement.
-  app.get("/v1/submissions", async (req) => {
+  app.get("/v1/submissions", async (req, reply) => {
     const query = z
       .object({
         marketplace_id: z.string().uuid().optional(),
@@ -68,14 +68,27 @@ export async function submissionsRoutes(app: FastifyInstance) {
         include_drafts: z.enum(["true", "false"]).optional(),
       })
       .parse(req.query);
-    let qb = db.selectFrom("submission").selectAll().orderBy("submitted_at", "desc").orderBy("id");
+    const limit = query.limit ?? 50;
+    const offset = query.offset ?? 0;
+    // Filters only: the page and the total are both derived from this, so the
+    // total always counts exactly the rows the filters would page through.
+    let filtered = db.selectFrom("submission");
     // A draft is a row whose submit() transaction was built but never signed
     // and relayed — it does not exist on-chain, so it is not listed by default.
-    if (query.include_drafts !== "true") qb = qb.where("chain_submission_id", "is not", null);
-    if (query.marketplace_id) qb = qb.where("marketplace_id", "=", query.marketplace_id);
-    if (query.agent_id) qb = qb.where("agent_id", "=", query.agent_id);
-    if (query.status) qb = qb.where("status", "=", query.status);
-    return qb.limit(query.limit ?? 50).offset(query.offset ?? 0).execute();
+    if (query.include_drafts !== "true") filtered = filtered.where("chain_submission_id", "is not", null);
+    if (query.marketplace_id) filtered = filtered.where("marketplace_id", "=", query.marketplace_id);
+    if (query.agent_id) filtered = filtered.where("agent_id", "=", query.agent_id);
+    if (query.status) filtered = filtered.where("status", "=", query.status);
+    const [rows, { total }] = await Promise.all([
+      filtered.selectAll().orderBy("submitted_at", "desc").orderBy("id").limit(limit).offset(offset).execute(),
+      filtered.select((eb) => eb.fn.countAll().as("total")).executeTakeFirstOrThrow(),
+    ]);
+    // Postgres returns count(*) as a bigint string. The body stays a bare
+    // array so existing clients keep working; paging metadata is in headers.
+    reply.header("x-total-count", String(Number(total)));
+    reply.header("x-limit", String(limit));
+    reply.header("x-offset", String(offset));
+    return rows;
   });
 
   // Build-sign-relay-confirm step 1: create a pending row and hand back
