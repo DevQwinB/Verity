@@ -88,12 +88,9 @@ export async function submissionsRoutes(app: FastifyInstance) {
     const existing = await db
       .selectFrom("submission")
       .selectAll()
+      .where("agent_id", "=", agent)
       .where("idempotency_key", "=", body.idempotency_key)
       .executeTakeFirst();
-    if (existing && existing.agent_id !== agent) {
-      // Never hand one account another account's submission.
-      throw new HttpError(409, "idempotency_key is already in use");
-    }
     if (existing?.chain_submission_id) {
       // Already signed and on-chain: nothing left to sign.
       return { submission: existing, unsigned_transaction_xdr: null, network_passphrase: env.NETWORK_PASSPHRASE };
