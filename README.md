@@ -322,16 +322,20 @@ createServer(async (req, res) => {
 ```
 
 Choose a public, reachable receiver URL. Only `http:` and `https:`
-URLs are accepted. The host must resolve exclusively to public addresses;
-private, loopback, and link-local destinations are rejected with HTTP 400.
-This check runs both when registering and immediately before delivery.
+URLs are accepted. The backend resolves the host and rejects addresses
+matching its non-public-address guard (including private IPv4 ranges and
+IPv6 loopback). The guard does **not** cover every non-public IP range; do
+not treat registration as a comprehensive network isolation guarantee.
+The address check runs both at registration and immediately before delivery.
 Redirects are not followed: any redirect fails the delivery.
 
 **Delivery is best-effort: one attempt, no retry.** A delivery times out
 after 30 seconds. HTTP 2xx counts as delivered; other responses, timeouts,
 redirects, and transport failures count as failed. The backend records
 delivery attempts internally but provides no delivery-history API.
-Dispatch failures are logged, not guaranteed to reach the receiver.
+Ordinary failed deliveries are recorded internally, **not** logged; only
+unexpected errors rejected by the dispatcher reach callers' error logs.
+No delivery to a receiver is guaranteed.
 
 
 ## Known limits
