@@ -772,6 +772,90 @@ fn constructor_rejects_an_invalid_config() {
 
 #[test]
 #[should_panic(expected = "Error(Contract, #4)")]
+fn constructor_rejects_small_window_above_max() {
+    let e = Env::default();
+    setup_with(
+        &e,
+        ConfigRecord {
+            window_tier_small_s: crate::MAX_WINDOW_S + 1,
+            ..default_config()
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn constructor_rejects_large_window_above_max() {
+    let e = Env::default();
+    setup_with(
+        &e,
+        ConfigRecord {
+            window_tier_large_s: crate::MAX_WINDOW_S + 1,
+            ..default_config()
+        },
+    );
+}
+
+#[test]
+fn constructor_accepts_windows_at_max() {
+    let e = Env::default();
+    let w = setup_with(
+        &e,
+        ConfigRecord {
+            window_tier_small_s: crate::MAX_WINDOW_S,
+            window_tier_large_s: crate::MAX_WINDOW_S,
+            ..default_config()
+        },
+    );
+    let cfg = w.client.get_config().unwrap();
+    assert_eq!(cfg.window_tier_small_s, crate::MAX_WINDOW_S);
+    assert_eq!(cfg.window_tier_large_s, crate::MAX_WINDOW_S);
+}
+
+#[test]
+fn update_config_rejects_windows_above_max() {
+    let e = Env::default();
+    let w = setup_with(&e, default_config());
+
+    let cfg_small = ConfigRecord {
+        window_tier_small_s: crate::MAX_WINDOW_S + 1,
+        ..default_config()
+    };
+    assert_eq!(
+        w.client.try_update_config(&w.admin, &cfg_small),
+        Err(Ok(Error::InvalidConfig))
+    );
+    assert_eq!(w.client.get_config().unwrap().window_tier_small_s, 3600);
+
+    let cfg_large = ConfigRecord {
+        window_tier_large_s: crate::MAX_WINDOW_S + 1,
+        ..default_config()
+    };
+    assert_eq!(
+        w.client.try_update_config(&w.admin, &cfg_large),
+        Err(Ok(Error::InvalidConfig))
+    );
+    assert_eq!(w.client.get_config().unwrap().window_tier_large_s, 86_400);
+}
+
+#[test]
+fn update_config_accepts_windows_at_max() {
+    let e = Env::default();
+    let w = setup_with(&e, default_config());
+
+    let cfg = ConfigRecord {
+        window_tier_small_s: crate::MAX_WINDOW_S,
+        window_tier_large_s: crate::MAX_WINDOW_S,
+        ..default_config()
+    };
+    w.client.update_config(&w.admin, &cfg);
+    let updated = w.client.get_config().unwrap();
+    assert_eq!(updated.window_tier_small_s, crate::MAX_WINDOW_S);
+    assert_eq!(updated.window_tier_large_s, crate::MAX_WINDOW_S);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
 fn constructor_rejects_a_zero_min_stake_floor() {
     let e = Env::default();
     setup_with(&e, ConfigRecord { min_stake_floor: 0, ..default_config() });
