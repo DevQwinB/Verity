@@ -227,8 +227,112 @@ GET  /v1/reports/verification-rates
 POST /v1/marketplaces, POST /v1/marketplaces/:id/webhooks
 ```
 
-Webhooks (HMAC-SHA256 in `x-verity-signature`): `submission.verified`,
-`submission.slashed`, `submission.disputed`.
+### Webhooks
+
+Webhooks notify the marketplace associated with the account that submitted the
+work. `POST /v1/submissions` finds or creates this marketplace for the
+authenticated submitting Stellar account. Alternatively,
+`POST /v1/marketplaces` (bearer token; `{"name":"My marketplace"}`) creates
+or returns that account's marketplace.
+
+Register a subscription with
+`POST /v1/marketplaces/:id/webhooks`, using a bearer token belonging to that
+marketplace's Stellar account:
+
+```json
+{
+  "url": "https://example.org/verity-webhook",
+  "secret": "replace-with-a-long-random-secret",
+  "events": ["submission.verified", "submission.slashed", "submission.disputed"]
+}
+```
+
+The request requires a valid URL, a `secret` of at least 8 characters, and
+a non-empty `events` array of strings. The marketplace ID is a UUID; only its
+own account may register a webhook (otherwise HTTP 403). A successful
+registration returns the subscription row with HTTP 201. Event names are not
+validated at registration: unknown names are accepted but never delivered.
+
+| Event | When emitted | `data` |
+| --- | --- | --- |
+| `submission.verified` | First transition into the `verified` terminal status | `submission_id`, `status: "verified"`, `tx_hash` |
+| `submission.slashed` | First transition into the `slashed` terminal status | `submission_id`, `status: "slashed"`, `tx_hash` |
+| `submission.disputed` | When a new on-chain challenge is first recorded | `submission_id`, `status: "disputed"`, `tx_hash` |
+
+The `submission_id` is Verity's submission **UUID**, not its numeric on-chain
+submission ID. `tx_hash` is the relevant finalize/resolve or challenge
+transaction hash and can be `null` if a terminal verdict is first observed
+by reconciliation. The `expired_unverified` terminal status sends **no**
+webhook. A `submission.verified` event can result from a window expiring
+without consensus; inspect the submission's `resolution_method` via
+`GET /v1/submissions/:id` to distinguish how the verdict was reached.
+
+Each delivery is an HTTP `POST` with `content-type: application/json` and
+`x-verity-signature`, containing the UTF-8 JSON serialization
+`JSON.stringify({ event: eventType, data: payload })`. For example, this is
+only a **shape example**; the identifiers below are placeholders:
+
+```json
+{
+  "event": "submission.verified",
+  "data": {
+    "submission_id": "<verity-submission-uuid>",
+    "status": "verified",
+    "tx_hash": null
+  }
+}
+```
+
+`x-verity-signature` is the **lowercase hexadecimal HMAC-SHA256** digest
+using the registration `secret` as the key and the **exact raw request-body
+bytes** as input. Verify before parsing JSON: re-serializing a parsed object
+may change the signed bytes. This minimal Node.js receiver verifies the
+header using a constant-time comparison:
+
+```js
+import { createServer } from "node:http";
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const secret = process.env.VERITY_WEBHOOK_SECRET;
+if (!secret || secret.length < 8) throw new Error("Set VERITY_WEBHOOK_SECRET");
+
+createServer(async (req, res) => {
+  if (req.method !== "POST") {
+    res.writeHead(405).end();
+    return;
+  }
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const rawBody = Buffer.concat(chunks);
+  const provided = req.headers["x-verity-signature"];
+  const expected = createHmac("sha256", secret).update(rawBody).digest();
+
+  const valid = typeof provided === "string"
+    && /^[0-9a-f]{64}$/.test(provided)
+    && timingSafeEqual(Buffer.from(provided, "hex"), expected);
+  if (!valid) {
+    res.writeHead(401).end();
+    return;
+  }
+
+  const message = JSON.parse(rawBody.toString("utf8"));
+  console.log(message.event, message.data);
+  res.writeHead(204).end();
+}).listen(8080);
+```
+
+Choose a public, reachable receiver URL. Only `http:` and `https:`
+URLs are accepted. The host must resolve exclusively to public addresses;
+private, loopback, and link-local destinations are rejected with HTTP 400.
+This check runs both when registering and immediately before delivery.
+Redirects are not followed: any redirect fails the delivery.
+
+**Delivery is best-effort: one attempt, no retry.** A delivery times out
+after 30 seconds. HTTP 2xx counts as delivered; other responses, timeouts,
+redirects, and transport failures count as failed. The backend records
+delivery attempts internally but provides no delivery-history API.
+Dispatch failures are logged, not guaranteed to reach the receiver.
+
 
 ## Known limits
 
