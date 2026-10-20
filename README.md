@@ -249,13 +249,20 @@ The response contains `payload`, `canonical`, `signature`,
 
 - `canonical` is the exact UTF-8 string that was signed: canonical JSON of
   `payload`, with object keys sorted recursively and no whitespace. The API
-  recomputes it from the stored payload. Verify these bytes directly.
+  recomputes it from the stored payload. Verify these bytes directly and
+  confirm that the response `payload` canonicalizes to the same string;
+  verifying the signature on `canonical` alone does **not** authenticate
+  a separately modified `payload`.
 - `signature` is the base64-encoded raw 64-byte ed25519 signature;
   `signature_algorithm` is `"ed25519"`.
 - `signer` is the keeper's Stellar G-address, also recorded as
   `payload.attestor.stellar_account`. Pin it to the expected
-  `keeper_public_key` in your trusted `deployments/<name>.json`; accepting an
-  arbitrary key from the response does not establish the expected signer.
+  `keeper_public_key` in your trusted `deployments/<name>.json`. If the
+  keeper rotates, **independently** verify the replacement public key with
+  your deployment operator and explicitly pin it with
+  `TRUSTED_KEEPER_PUBLIC_KEY` for new attestations. Keep the old pin for
+  historical records: the deployment JSON may retain the original key.
+  Never derive a trusted key from this unverified response.
 - `delivered_to` is `null`: the record is signed and served by the API,
   with nothing pushed to Stellar 8004 or any other registry.
 
@@ -271,6 +278,11 @@ Verdicts are `verified`, `slashed` or `expired_unverified`.
 From the repository root after `pnpm install`, run this Node.js example.
 Set `SUBMISSION_ID` to a real settled UUID. `API` defaults to the local
 backend; `DEPLOYMENT` selects the trusted deployment file (default `testnet`).
+If your keeper rotated, first verify its **new** G-address through a
+separately authenticated operator/deployment channel, then run the example
+with `TRUSTED_KEEPER_PUBLIC_KEY=G...` to explicitly trust it. Do not set the
+override to `att.signer` or copy the response value before verifying its
+provenance. An old attestation must still be checked against its old key.
 
 ```bash
 SUBMISSION_ID=00000000-0000-0000-0000-000000000000 node --input-type=module <<'JS'
@@ -289,16 +301,29 @@ const response = await fetch(`${API}/v1/submissions/${encodeURIComponent(id)}/at
 if (!response.ok) throw new Error(`Attestation HTTP ${response.status}: ${await response.text()}`);
 const att = await response.json();
 if (att.signature_algorithm !== "ed25519") throw new Error("Unexpected algorithm");
-if (!deployment.keeper_public_key || att.signer !== deployment.keeper_public_key)
+const trustedSigner = process.env.TRUSTED_KEEPER_PUBLIC_KEY ?? deployment.keeper_public_key;
+if (!trustedSigner || att.signer !== trustedSigner)
   throw new Error("Unexpected keeper signer");
 const key = Keypair.fromPublicKey(att.signer);
 const signature = Buffer.from(att.signature, "base64");
+// Mirror backend/src/chain/canonical.ts; compare before trusting att.payload.
+function canonicalJson(value) {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(",")}}`;
+}
+if (typeof att.canonical !== "string" || canonicalJson(att.payload) !== att.canonical)
+  throw new Error("Attestation payload does not match signed canonical bytes");
+if (att.payload?.attestor?.stellar_account !== att.signer)
+  throw new Error("Attestation signer does not match attestor");
 const message = Buffer.from(att.canonical, "utf8");
 if (signature.length !== 64 || !key.verify(message, signature))
   throw new Error("Invalid attestation signature");
 if (key.verify(Buffer.concat([message, Buffer.from(" ")]), signature))
   throw new Error("Tampered canonical string unexpectedly verified");
-console.log("Signature valid; tampered canonical string rejected");
+console.log("Signer pinned, signature valid, payload bound to canonical bytes");
 JS
 ```
 
