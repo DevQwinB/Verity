@@ -53,8 +53,12 @@ interface PinnedTarget {
  *
  * Returns the one address that was checked. The request is then made to
  * exactly that address, so the name cannot resolve somewhere else between
- * the check and the connection. */
-async function resolvePublicTarget(raw: string): Promise<PinnedTarget> {
+ * the check and the connection.
+ *
+ * allowPrivate skips only the non-public-address refusal, for URLs that come
+ * from the operator's own configuration. It defaults to false so a caller
+ * that forgets it fails closed. */
+async function resolveTarget(raw: string, opts: { allowPrivate: boolean } = { allowPrivate: false }): Promise<PinnedTarget> {
   let url: URL;
   try {
     url = new URL(raw);
@@ -80,7 +84,7 @@ async function resolvePublicTarget(raw: string): Promise<PinnedTarget> {
     }
   }
   if (addresses.length === 0) throw new Error(`retrieval host ${host} has no address`);
-  if (addresses.some((a) => isPrivateAddress(a.address))) {
+  if (!opts.allowPrivate && addresses.some((a) => isPrivateAddress(a.address))) {
     throw new Error(`retrieval target ${host} resolves to a non-public address`);
   }
   // IPv4 first: plenty of hosts have no IPv6 route.
@@ -157,7 +161,7 @@ export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: s
   if (!spec || typeof spec.url !== "string") {
     throw new Error('retrieval input artifact must be JSON of the form {"url": "...", "pointer"?: "/..."}');
   }
-  const target = await resolvePublicTarget(spec.url);
+  const target = await resolveTarget(spec.url);
   const res = await getPinned(target);
   // A redirect could bounce to a private address, and a moved resource is a
   // legitimate mismatch anyway: the agent declared this URL, not another.
@@ -177,12 +181,16 @@ export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: s
   return { outputHash: canonicalHash(output), output, engine: "http-refetch (public egress only, address pinned)" };
 }
 
-/** True if this host can reach the public internet at all: any HTTP answer
- * from a known-good endpoint counts. Used before blaming a target for being
- * unreachable. */
+/** True if this host can reach its known-good endpoint at all: any HTTP
+ * answer counts. Used before blaming a target for being unreachable.
+ *
+ * controlUrl comes from the operator's own configuration (by default their
+ * Soroban RPC URL, often on localhost or a private network), not from a
+ * submitter, so it may resolve to a private address. That is deliberately
+ * not true of retrieval targets: runRetrieval still refuses them. */
 export async function hasConnectivity(controlUrl: string): Promise<boolean> {
   try {
-    await getPinned(await resolvePublicTarget(controlUrl));
+    await getPinned(await resolveTarget(controlUrl, { allowPrivate: true }));
     return true;
   } catch {
     return false;
