@@ -491,12 +491,15 @@ export function startIndexer(intervalMs = 4000): { stop: () => void } {
   let timer: NodeJS.Timeout | undefined;
   const tick = async () => {
     if (stopped) return;
+    let delay = intervalMs;
     try {
-      await pollOnce();
+      // A full page means more events are already waiting (a backlog after
+      // downtime), so poll again at once; only a short page means caught up.
+      if ((await pollOnce()) >= PAGE_SIZE) delay = 0;
     } catch (err) {
       console.error("[indexer] poll failed:", err);
     }
-    if (!stopped) timer = setTimeout(tick, intervalMs);
+    if (!stopped) timer = setTimeout(tick, delay);
   };
   timer = setTimeout(tick, 0);
   return { stop: () => { stopped = true; if (timer) clearTimeout(timer); } };
