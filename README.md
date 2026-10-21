@@ -227,6 +227,8 @@ GET  /v1/reports/verification-rates
 POST /v1/marketplaces, POST /v1/marketplaces/:id/webhooks
 ```
 
+See [Webhooks](#webhooks) for registration, payloads and signature verification.
+
 ### Webhooks
 
 Webhooks notify the marketplace associated with the account that submitted the
@@ -321,11 +323,12 @@ createServer(async (req, res) => {
 }).listen(8080);
 ```
 
-Choose a public, reachable receiver URL. Only `http:` and `https:`
-URLs are accepted. The backend resolves the host and rejects addresses
-matching its non-public-address guard (including private IPv4 ranges and
-IPv6 loopback). The guard does **not** cover every non-public IP range; do
-not treat registration as a comprehensive network isolation guarantee.
+**URL rule: public addresses only.** Use a publicly reachable `http:` or
+`https:` receiver URL whose host resolves. At registration, an unresolvable
+host or an address rejected by `assertPublicHttpUrl` returns HTTP 400.
+The guard rejects private, loopback and link-local addresses it recognizes.
+Its checks do not cover every non-public IP range, so passing validation is
+not a comprehensive network isolation guarantee.
 The address check runs both at registration and immediately before delivery.
 Redirects are not followed: any redirect fails the delivery.
 
@@ -333,8 +336,9 @@ Redirects are not followed: any redirect fails the delivery.
 after 30 seconds. HTTP 2xx counts as delivered; other responses, timeouts,
 redirects, and transport failures count as failed. The backend records
 delivery attempts internally but provides no delivery-history API.
-Ordinary failed deliveries are recorded internally, **not** logged; only
-unexpected errors rejected by the dispatcher reach callers' error logs.
+Dispatch is awaited inline during verdict handling. Failed HTTP responses
+and transport errors are recorded in `webhook_delivery` and logged;
+unexpected dispatcher rejections also reach callers' error logs.
 No delivery to a receiver is guaranteed.
 
 
