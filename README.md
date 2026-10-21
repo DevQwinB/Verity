@@ -178,6 +178,101 @@ and use "Fund my testnet account" on the home page. Then:
 - Open a pending submission to challenge it while its window is open.
 - A re-executor can withdraw stake from its own page.
 
+## Writing replayable work
+
+Work submitted to Verity must be deterministic: honest re-executors independently
+reproduce the output and vote on whether it matches the claimed output hash.
+Depending on the task type, replay runs either in a sandboxed WebAssembly JavaScript
+runtime or as a guarded HTTP retrieval spot-check.
+
+### Deterministic tasks
+
+Deterministic tasks run in a sandboxed JavaScript runtime:
+
+1. **Function body shape.** The function source must be a JavaScript function body,
+   not an entire module or function declaration. It runs as `(function(input){ ... })(__input)`.
+   To return an answer, use `return`.
+2. **Arguments and global scope.** The input artifact is parsed as JSON and passed as
+   the `input` argument. It is also available as the global `__input`.
+3. **Sandbox engine.** QuickJS compiled to WebAssembly (`quickjs-emscripten`),
+   executed in an isolated worker thread with an empty environment (`env: {}`) and
+   a fresh runtime instance per replay.
+4. **Environment and globals.** `Date` and `Math.random` are explicitly deleted
+   before execution, so calling `new Date()` or `Math.random()` throws. Other `Math`
+   functions remain available. Standard platform globals such as `console`,
+   `setTimeout`, `fetch`, `process`, and `require` are absent (`typeof` each is
+   `"undefined"`).
+5. **Execution limits.**
+   - Memory: 64 MiB (`64 * 1024 * 1024` bytes).
+   - Stack: 128 KiB (`128 * 1024` bytes).
+   - Computation: 1000 interrupt checks (ticks). This provides a computation budget
+     of a few seconds of busy loops; loops that exceed this fail with `computation budget exceeded`.
+   - Output size: serialized output can be at most 1,000,000 bytes.
+   - Wall-clock timeout: 20 s host kill switch. This is a host-level safety timeout
+     rather than an engine limit; if triggered, the re-executor considers its host
+     overloaded, casts no vote, and retries later (`ReplayInfrastructureError`). It does
+     not count as a mismatch against the submission.
+6. **Failure handling.** If the function throws an exception or exceeds an engine limit
+   (memory, stack, computation budget, or output size), the re-executor produces a
+   32-zero-byte output hash, which never matches a legitimate claimed output hash and
+   results in a mismatch vote.
+7. **Return values and JSON serialization.** The return value is serialized via `JSON.stringify`:
+   - A function that returns nothing (`undefined`) yields `null`.
+   - `NaN` and `Infinity` serialize to `null`.
+   - Object properties with `undefined` values are omitted.
+   - Returning a `BigInt` throws an error and counts as a mismatch.
+   - Async functions returning a `Promise` serialize to `{}`. Write synchronous code.
+8. **Artifact upload limits.** Each artifact (function, input, claimed output) may be
+   at most 262144 bytes (`ARTIFACT_MAX_BYTES`). The API request body limit is 1 MiB.
+
+### Canonical JSON and claimed outputs
+
+9. **Hashing format.** Outputs are hashed as canonical JSON: object keys sorted
+   recursively, no whitespace, `undefined`-valued object properties omitted, and
+   hashed with SHA-256.
+10. **Dashboard input formatting.** The dashboard "Claimed output" field parses input
+    as JSON if valid; otherwise, trimmed text is treated as a JSON string and canonicalized.
+    Formatting whitespace does not affect the hash: `{"doubled": 42}` and `{ "doubled":42 }`
+    produce identical hashes. Numeric formatting follows `JSON.stringify` (e.g. `1.0` is `1`).
+11. **Worked example.**
+    - Input artifact: `{"n": 21}`
+    - Function body: `return { doubled: input.n * 2 };`
+    - Claimed output: `{"doubled": 42}`
+    - Verification locally (from `reexecutor-agent/`):
+      ```bash
+      pnpm exec tsx -e '(async () => { const { runDeterministicFunction } = await import("./src/sandbox/runner.ts"); console.log(await runDeterministicFunction("return { doubled: input.n * 2 };", { n: 21 })); process.exit(0); })()'
+      ```
+      This evaluates the function and outputs `output: { doubled: 42 }` along with its
+      canonical `outputHash`.
+
+### Retrieval tasks
+
+12. **Spec format.** The input artifact must be JSON conforming to `{"url": "...", "pointer"?: "/..."}`.
+    Invalid JSON or a missing string `url` counts as a mismatch.
+13. **HTTP request rules.** The re-executor issues a single `GET` request with
+    `accept: application/json, text/plain;q=0.9, */*;q=0.1` and no credentials, auth headers,
+    or cookies. The endpoint must be publicly accessible without authentication.
+    Only `http:` and `https:` schemes are supported. The URL must resolve to a public IP
+    address: loopback, private, and link-local IP addresses are rejected, and the request
+    connects directly to the validated IP.
+14. **Redirects and response codes.** Redirects are not followed; HTTP 3xx status codes
+    are treated as a mismatch. HTTP 4xx status codes or other non-2xx responses are also
+    mismatches. Responses with status 5xx, 408, 429, timeouts, or network errors are
+    treated as transient: the worker retries for up to `min(RETRIEVAL_RETRY_BUDGET_S, challenge window / 2)`
+    seconds (default `RETRIEVAL_RETRY_BUDGET_S` is 120 s), verifies its own network
+    connectivity, and only votes mismatch if its own connectivity is intact. Each HTTP request
+    times out after 10 s, and response bodies are capped at 1,000,000 bytes.
+15. **JSON pointers.** If the response body is JSON, an optional RFC 6901 pointer (e.g. `/data/0/price`)
+    selects the targeted value (`~1` escapes `/`, `~0` escapes `~`). The pointer must start
+    with `/`; an empty pointer `""` selects the entire document. A pointer that fails to resolve
+    or is specified on non-JSON content is a mismatch. If no pointer is specified, the full parsed
+    JSON body is used; if the body is not JSON, the raw response text string is used.
+16. **Text whitespace caveat.** The dashboard trims plain-text claimed output, whereas a
+    re-executor checks the raw untrimmed response body when no pointer is specified. An endpoint
+    returning text ending with a newline will not match trimmed text; prefer JSON responses
+    with a JSON pointer. In addition, endpoints whose content changes between the submission
+    and re-execution will produce a mismatch.
+
 ## Contracts
 
 ```bash
@@ -241,9 +336,10 @@ Webhooks (HMAC-SHA256 in `x-verity-signature`): `submission.verified`,
 - **Voter set.** Stake is free on testnet, so an open voter set could be
   captured at no cost. Deployments here run with `reexecutor_allowlist` on:
   the admin approves which staked accounts may vote.
-- **Sandbox limits.** A replayed function gets 64 MB, a small compute budget,
-  no clock and no randomness. Exceeding a limit is a mismatch. A function that
-  stalls a re-executor's host without exceeding one gets no vote from it.
+- **Sandbox limits.** Replay limits and constraints are detailed in
+  [Writing replayable work](#writing-replayable-work). Exceeding an engine
+  limit or throwing is a mismatch. A function that stalls a re-executor's host
+  without exceeding an engine limit gets no vote from it.
 - **Assignment** is deterministic and auditable but uniform, not
   stake-weighted. It only picks re-executors whose worker is online, and asks
   another when one goes quiet.
