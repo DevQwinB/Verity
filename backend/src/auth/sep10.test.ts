@@ -20,7 +20,7 @@ Object.assign(process.env, {
   NETWORK_PASSPHRASE: passphrase,
   ESCROW_GATE_CONTRACT_ID: StrKey.encodeContract(Buffer.alloc(32)),
   ZK_VERIFIER_REGISTRY_CONTRACT_ID: StrKey.encodeContract(Buffer.alloc(32)),
-  BOND_ASSET_CONTRACT_ID: "unused",
+  BOND_ASSET_CONTRACT_ID: StrKey.encodeContract(Buffer.alloc(32)),
   DATABASE_URL: "postgres://unused:unused@127.0.0.1:1/unused",
   KEEPER_SECRET_KEY: keeper.secret(),
   SEP10_SIGNING_SECRET: server.secret(),
