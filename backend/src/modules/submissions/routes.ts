@@ -222,8 +222,26 @@ export async function submissionsRoutes(app: FastifyInstance) {
       return { error: "signed transaction is not the one built for this submission" };
     }
     const { hash, returnValue } = await relaySignedXdr(body.signed_transaction_xdr);
-    const chainSubmissionId = String(returnValue);
-    const onChain = await readSubmission(chainSubmissionId);
+    // From here on the transaction is on-chain. Without a u64 id the row is
+    // left for the indexer, which matches the draft by its tx hash, and the
+    // caller is told not to resend.
+    if (typeof returnValue !== "bigint") {
+      throw new HttpError(
+        502,
+        `Transaction ${hash} was confirmed but the network returned no submission id. ` +
+          "Do not resend it; the submission will appear once the indexer has processed it."
+      );
+    }
+    const chainSubmissionId = returnValue.toString();
+    // The read-back only fills in fields the indexer also sets, so a failure
+    // here is not worth failing a landed transaction over.
+    let onChain: Awaited<ReturnType<typeof readSubmission>>;
+    try {
+      onChain = await readSubmission(chainSubmissionId);
+    } catch (err) {
+      console.warn(`[relay] could not read submission ${chainSubmissionId} back after relay; the indexer will fill it in`, err);
+      onChain = null;
+    }
 
     const row = await db
       .updateTable("submission")
