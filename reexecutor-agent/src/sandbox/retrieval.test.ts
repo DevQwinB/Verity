@@ -1,0 +1,198 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import {
+  isPrivateAddress,
+  resolvePublicTarget,
+  resolvePointer,
+  runRetrieval,
+} from "./retrieval.js";
+
+describe("isPrivateAddress", () => {
+  const privateIps = [
+    "10.0.0.1",
+    "127.0.0.1",
+    "0.0.0.0",
+    "172.16.0.1",
+    "172.31.255.255",
+    "192.168.1.1",
+    "169.254.169.254",
+    "100.64.0.1",
+    "100.127.255.255",
+    "::1",
+    "::",
+    "fc00::1",
+    "fd12::1",
+    "fe80::1",
+    "::ffff:10.0.0.1",
+    "FD00::1",
+    "::FFFF:10.0.0.1",
+  ];
+
+  for (const ip of privateIps) {
+    it(`returns true for private IP ${ip}`, () => {
+      assert.equal(isPrivateAddress(ip), true);
+    });
+  }
+
+  const publicIps = [
+    "8.8.8.8",
+    "1.1.1.1",
+    "11.0.0.1",
+    "172.15.255.255",
+    "172.32.0.1",
+    "100.63.255.255",
+    "100.128.0.1",
+    "192.169.1.1",
+    "169.253.1.1",
+    "2001:4860:4860::8888",
+    "2606:4700::1111",
+  ];
+
+  for (const ip of publicIps) {
+    it(`returns false for public IP ${ip}`, () => {
+      assert.equal(isPrivateAddress(ip), false);
+    });
+  }
+});
+
+describe("resolvePublicTarget", () => {
+  it("rejects invalid URL with exact error message", async () => {
+    await assert.rejects(
+      () => resolvePublicTarget("not a url"),
+      (err: Error) => err.message === "retrieval url is not a valid URL: not a url",
+    );
+  });
+
+  it("rejects unsupported protocols with exact error message", async () => {
+    await assert.rejects(
+      () => resolvePublicTarget("ftp://8.8.8.8/x"),
+      (err: Error) => err.message === "unsupported retrieval protocol: ftp:",
+    );
+    await assert.rejects(
+      () => resolvePublicTarget("file:///etc/hosts"),
+      (err: Error) => err.message === "unsupported retrieval protocol: file:",
+    );
+  });
+
+  it("rejects loopback and private addresses including normalised spellings", async () => {
+    const blocked = [
+      { raw: "http://127.0.0.1/", host: "127.0.0.1" },
+      { raw: "http://[::1]/", host: "::1" },
+      { raw: "http://0x7f.0.0.1/", host: "127.0.0.1" },
+      { raw: "http://2130706433/", host: "127.0.0.1" },
+      { raw: "http://10.1.2.3/", host: "10.1.2.3" },
+    ];
+
+    for (const { raw, host } of blocked) {
+      await assert.rejects(
+        () => resolvePublicTarget(raw),
+        (err: Error) =>
+          err.message === `retrieval target ${host} resolves to a non-public address`,
+      );
+    }
+  });
+
+  it("resolves public IPv4 literal target", async () => {
+    const raw = "https://8.8.8.8/path?x=1";
+    const res = await resolvePublicTarget(raw);
+    assert.equal(res.url.href, raw);
+    assert.equal(res.address, "8.8.8.8");
+    assert.equal(res.family, 4);
+  });
+
+  it("resolves public IPv6 literal target", async () => {
+    const raw = "http://[2001:4860:4860::8888]/";
+    const res = await resolvePublicTarget(raw);
+    assert.equal(res.url.href, raw);
+    assert.equal(res.address, "2001:4860:4860::8888");
+    assert.equal(res.family, 6);
+  });
+});
+
+describe("resolvePointer", () => {
+  it("returns the document itself for an empty pointer (same reference)", () => {
+    const doc = { a: 1, b: [2, 3] };
+    assert.equal(resolvePointer(doc, ""), doc);
+  });
+
+  it("throws for a pointer without a leading slash", () => {
+    assert.throws(
+      () => resolvePointer({ a: 1 }, "a/b"),
+      (err: Error) => err.message === "invalid JSON pointer: a/b",
+    );
+  });
+
+  it("resolves nested paths and array indices", () => {
+    const doc = { a: { b: [10, 20] } };
+    assert.equal(resolvePointer(doc, "/a/b/1"), 20);
+  });
+
+  it("resolves escaped ~1 to /", () => {
+    const doc = { "a/b": 1 };
+    assert.equal(resolvePointer(doc, "/a~1b"), 1);
+  });
+
+  it("resolves escaped ~0 to ~", () => {
+    const doc = { "m~n": 2 };
+    assert.equal(resolvePointer(doc, "/m~0n"), 2);
+  });
+
+  it("resolves /~01 to ~1", () => {
+    const doc = { "~1": 3 };
+    assert.equal(resolvePointer(doc, "/~01"), 3);
+  });
+
+  it("resolves / with an empty key", () => {
+    const doc = { "": 4 };
+    assert.equal(resolvePointer(doc, "/"), 4);
+  });
+
+  it("throws when a key is missing", () => {
+    assert.throws(
+      () => resolvePointer({ a: 1 }, "/missing"),
+      (err: Error) =>
+        err.message === "JSON pointer /missing does not resolve in the response",
+    );
+  });
+
+  it("throws when indexing past the end of an array", () => {
+    assert.throws(
+      () => resolvePointer([1, 2], "/5"),
+      (err: Error) =>
+        err.message === "JSON pointer /5 does not resolve in the response",
+    );
+  });
+
+  it("throws when stepping into null or a non-object", () => {
+    assert.throws(
+      () => resolvePointer({ a: null }, "/a/b"),
+      (err: Error) =>
+        err.message === "JSON pointer /a/b does not resolve in the response",
+    );
+    assert.throws(
+      () => resolvePointer({ a: "str" }, "/a/b"),
+      (err: Error) =>
+        err.message === "JSON pointer /a/b does not resolve in the response",
+    );
+  });
+});
+
+describe("runRetrieval argument shape rejections", () => {
+  it("rejects undefined or missing spec before network access", async () => {
+    await assert.rejects(
+      () => (runRetrieval as any)(undefined),
+      (err: Error) =>
+        err.message ===
+        'retrieval input artifact must be JSON of the form {"url": "...", "pointer"?: "/..."}',
+    );
+  });
+
+  it("rejects non-string url before network access", async () => {
+    await assert.rejects(
+      () => (runRetrieval as any)({ url: 5 }),
+      (err: Error) =>
+        err.message ===
+        'retrieval input artifact must be JSON of the form {"url": "...", "pointer"?: "/..."}',
+    );
+  });
+});
