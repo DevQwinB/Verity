@@ -37,8 +37,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: verity
     # Not published: only the backend talks to the database.
+    # PostgreSQL 18 stores PGDATA under /var/lib/postgresql/18/docker.
+    # Mount the parent directory so the named volume persists the cluster.
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U verity -d verity"]
       interval: 5s

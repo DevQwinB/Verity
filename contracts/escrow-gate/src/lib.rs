@@ -21,11 +21,11 @@ use verity_common::{
 
 const MAX_BPS: i128 = 10_000;
 
-// Maximum challenge window of 7 days (604_800 seconds). The longest a submission
-// legitimately has to live is its window plus, if challenged late in that window,
-// one more window for challenge expiry (roughly 2 x window = 14 days), safely
-// within the ~28.9 day entry TTL extension (BUMP_TO = 500_000 ledgers in storage.rs).
-pub const MAX_WINDOW_S: u64 = 7 * 24 * 60 * 60;
+// Maximum allowed challenge window (7 days).
+// Reasoning: the longest a submission legitimately lives is its window plus,
+// if challenged late, one further window for challenge expiry (~2x window = 14 days),
+// well inside the ~28.9 day (500,000 ledgers) persistent storage extension (`BUMP_TO` in storage.rs).
+pub const MAX_WINDOW_S: u64 = 7 * 24 * 60 * 60; // 604_800
 
 fn checked_bps(value: i128, bps: u32) -> Result<i128, Error> {
     let product = value.checked_mul(bps as i128).ok_or(Error::Overflow)?;
@@ -543,6 +543,7 @@ impl EscrowGate {
         info.open_attestations = info.open_attestations.saturating_sub(1);
         storage::set_reexecutor(&e, &reexecutor, &info);
         storage::mark_released(&e, submission_id, &reexecutor);
+        storage::bump_instance(&e);
         Ok(())
     }
 
@@ -724,6 +725,7 @@ impl EscrowGate {
             return Err(Error::NotSlashable);
         }
         storage::set_reexecutor(&e, &reexecutor, &info);
+        storage::bump_instance(&e);
         Ok(amount)
     }
 
