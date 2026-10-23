@@ -1,15 +1,26 @@
+import { describeContractError } from "./format";
+
 /** Fired when the server no longer recognises the session, so the wallet
  * provider can show the account as disconnected instead of letting every
  * action fail with "not authenticated". */
 export const SESSION_EXPIRED_EVENT = "verity:session-expired";
 
 async function json<T>(res: Response): Promise<T> {
-  const data = await res.json().catch(() => ({}));
+  const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (res.status === 401 && typeof window !== "undefined") {
     window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
     throw new Error("Your session has expired. Connect your wallet again to continue.");
   }
-  if (!res.ok) throw new Error(data.error ?? `Request failed: ${res.status}`);
+  if (!res.ok) {
+    if (typeof data.contract_error === "string") {
+      const description = describeContractError(data.contract_error);
+      if (description) {
+        throw new Error(`${description} (${data.contract_error})`);
+      }
+    }
+    const fallback = typeof data.error === "string" ? data.error : `Request failed: ${res.status}`;
+    throw new Error(fallback);
+  }
   return data as T;
 }
 
