@@ -16,7 +16,7 @@
     "quickjs-emscripten": "0.32.0"
   },
   "devDependencies": {
-    "@types/node": "^22.20.3",
+    "@types/node": "^26.6.5",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   }
