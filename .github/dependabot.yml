@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # Soroban smart contracts (Cargo workspace under contracts/)
+  - package-ecosystem: cargo
+    directory: /contracts
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    # Major versions of soroban-sdk change the contract build and necessitate
+    # a new deployment (EscrowGate has no upgrade entrypoint), so they must be
+    # deliberate manual migrations rather than automated pull requests.
+    ignore:
+      - dependency-name: soroban-sdk
+        update-types: ["version-update:semver-major"]
+
+  # Root pnpm workspace and its individual packages (excluding generated bindings)
+  - package-ecosystem: npm
+    directories: ["/", "/backend", "/db", "/frontend", "/reexecutor-agent"]
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  # GitHub Actions workflows used by CI
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

@@ -72,6 +72,11 @@ tops it up.
 
 ## 3. Start it
 
+> **Note on docker-compose.yml:** The container images build and the full stack
+> has been run from them with services started one by one, but `docker-compose.yml`
+> itself has not been executed end-to-end as the development environment lacked a
+> compose provider.
+
 ```bash
 docker compose --profile fleet up -d --build
 docker compose ps
@@ -82,9 +87,55 @@ curl -s http://127.0.0.1:3001/health
 and the indexer are all in order, and reports which deployment and contract
 this backend serves. `/health/live` only says the process is up.
 
-Without `--profile fleet` you get everything except the re-executors, which
-you can then run elsewhere with the same image and `BACKEND_URL` pointed at
-the public API.
+Without `--profile fleet` you get everything except the re-executors.
+
+### Running fewer re-executors
+
+In a default deployment, the contract requires a quorum of three re-executors
+(`quorum_min_reexecutors: 3` configured by `scripts/deploy_testnet.sh`). If fewer
+than three workers are online, no consensus can form; contested work cannot be
+resolved through re-execution and verdicts will only resolve once challenge
+windows elapse (`window_elapsed`).
+
+To start only three workers instead of all five:
+
+```bash
+docker compose --profile fleet up -d --build backend frontend reexecutor-1 reexecutor-2 reexecutor-3
+```
+
+**Restart-loop caveat:** Leaving any `REXn_SECRET_KEY` empty while its corresponding
+service is started causes that container to fail and enter a restart loop. Only
+start the specific `reexecutor-N` services for which you have configured secret keys.
+Note that `scripts/bootstrap_reexecutors.sh` automatically stakes and approves all
+five identities (`verity-public-rex1..5`).
+
+### Running a standalone re-executor worker
+
+A worker can be built and run on a separate host without the rest of the compose stack:
+
+```bash
+docker build -f reexecutor-agent/Dockerfile -t verity-reexecutor .
+docker run -d --restart unless-stopped --env-file worker.env verity-reexecutor
+```
+
+Where `worker.env` contains:
+```env
+BACKEND_URL=https://api.verity.example
+REEXECUTOR_SECRET_KEY=S...
+ESCROW_GATE_CONTRACT_ID=C...
+SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
+NETWORK_PASSPHRASE=Test SDF Network ; September 2015
+# Optional:
+POLL_INTERVAL_MS=3000
+RETRIEVAL_RETRY_BUDGET_S=120
+CONNECTIVITY_CHECK_URL=https://soroban-testnet.stellar.org
+```
+
+**Prerequisites:** The account corresponding to `REEXECUTOR_SECRET_KEY` must be
+staked above the on-chain floor (500 XLM, via dashboard under Re-executors → Register)
+and approved by the deployment admin (`scripts/approve_reexecutor.sh G...`).
+Otherwise, the worker logs that no work will be assigned and idles. No prebuilt
+image is published; it must be built from the repository.
 
 ## 4. Put HTTPS in front
 
@@ -129,28 +180,114 @@ VERITY_DEPLOYMENT=public scripts/approve_reexecutor.sh G... --revoke
 signs with one account sequence, so only one backend process may run them. To
 scale the API, run more backends with `RUN_WORKERS=false`.
 
-**Storage.** Two volumes hold state: `pgdata` and `backend_artifacts` (the
-functions and inputs agents declared). Back both up together. Postgres can be
-rebuilt from the chain only within the RPC's event retention (about 7 days);
-the artifacts cannot be rebuilt at all.
+**Backup and restore.** State is held in two Docker volumes (`pgdata` at
+`/var/lib/postgresql/data` and `backend_artifacts` at `/app/backend/.artifacts`).
+Both should be backed up together:
 
-**Contract TTL.** Contract entries expire if untouched for long enough. Every
-state-changing call extends them, so a deployment in use looks after itself.
-After a long idle spell, extend them explicitly:
+- *Postgres backup:*
+  ```bash
+  docker compose exec -T postgres pg_dump -U verity -d verity > verity_backup.sql
+  ```
+- *Postgres restore (into clean database):*
+  ```bash
+  docker compose exec -T postgres psql -U verity -d verity < verity_backup.sql
+  ```
+- *Artifacts backup:*
+  ```bash
+  docker compose run --rm --entrypoint tar backend czf - -C /app/backend/.artifacts . > artifacts_backup.tar.gz
+  ```
+- *Artifacts restore:*
+  ```bash
+  docker compose run --rm --entrypoint tar backend xzf - -C /app/backend/.artifacts < artifacts_backup.tar.gz
+  ```
+
+Postgres can be reconstructed from chain events only within the RPC's event retention
+window (about 7 days). The artifacts cannot be rebuilt from chain events at all; if
+they are lost, function replay and retrieval checking will fail.
+
+**Monitoring keeper balance.** The keeper pays transaction fees for `finalize`,
+`resolve_challenge`, and `settle`. If the keeper account runs out of XLM, the scheduler
+fails to submit transactions and logs lines like `[scheduler] finalize failed`,
+`[scheduler] resolve_challenge failed`, or `[scheduler] settlement failed`
+(visible with `docker compose logs backend`).
+
+Check the balance via Horizon:
+```bash
+curl -s https://horizon-testnet.stellar.org/accounts/<KEEPER_PUBLIC_KEY> | jq '.balances[] | select(.asset_type=="native") | .balance'
+```
+Top it up whenever it runs low:
+```bash
+stellar keys fund verity-public-keeper --network testnet
+```
+
+**Contract TTL and archival.** The command below extends the contract's instance
+TTL (which also covers contract code):
 
 ```bash
 stellar contract extend --id <ESCROW_GATE_CONTRACT_ID> --source verity-public-keeper \
   --network testnet --durability persistent --ledgers-to-extend 500000
 ```
 
+Per-key persistent storage entries (such as individual submissions and re-executors)
+are extended automatically when written or modified by transactions, setting their
+TTL to 500,000 ledgers (approximately 29 days at ~5s per ledger). If an entry is untouched
+for longer than that, Soroban archives it. To restore an archived contract instance:
+```bash
+stellar contract restore --id <ESCROW_GATE_CONTRACT_ID> --source verity-public-keeper --network testnet
+```
+Note: Restoring individual archived contract data keys requires `--key-xdr <BASE64_KEY>`,
+which requires constructing the raw XDR representation of `DataKey` (e.g. `DataKey::Submission(u64)`).
+Because constructing raw XDR storage keys by hand is impractical, ensure entries in
+active dispute are touched before their 29-day lifetime expires.
+
+**Loss of admin key.** `verity-public-deployer` is the only identity authorized to
+call `update_config` and `set_reexecutor_approved` on `EscrowGate`. `EscrowGate` has
+no admin-transfer or contract upgrade entrypoints. If the admin secret key is lost:
+- Existing submissions, challenges, and voting continue functioning according to the live configuration.
+- No new re-executors can be approved, and existing approvals cannot be revoked.
+- Configuration parameters (challenge windows, fee rates, bonds) cannot be modified.
+- Forfeited agent bonds without challengers that are paid to the admin address in `settle` will accumulate permanently in that account and cannot be recovered.
+
 **Testnet resets.** Stellar testnet is wiped periodically. After a reset the
-contracts are gone: repeat step 1 with `--force`, update `.env`, and start
+contracts are gone: repeat step 1 with `--force --replace-public` (the public-deployment guard requires `--replace-public` because replacing it abandons the old contracts), update `.env`, and start
 from an empty database (`docker compose down -v` deletes both volumes).
 
 **Upgrading.** EscrowGate has no upgrade entrypoint. A backend, dashboard or
 worker change is `git pull && docker compose --profile fleet up -d --build`.
-A contract change is a new deployment: step 1 with `--force`, then as for a
+A contract change is a new deployment: step 1 with `--force --replace-public`, then as for a
 testnet reset. Stakes on the old contract stay withdrawable from it.
+
+### Tuning
+
+The backend validates these optional settings at startup. All are positive
+integers except `REPLAY_OVERASSIGN`, which also accepts `0`.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `REEXECUTOR_LIVENESS_S` | `60` | Seconds since a worker's last assignment poll during which it counts as online. Only online, active re-executors (and approved ones when the allowlist is enabled) receive assignments. Keep this well above the agent's `POLL_INTERVAL_MS` (default `3000` ms). |
+| `REPLAY_OVERASSIGN` | `1` | Extra re-executors beyond the contract quorum for deterministic tasks or tasks escalated to full quorum; `0` disables spares. |
+| `REPLAY_REASSIGN_AFTER_S` | `120` | After this many seconds unanswered, an assignment stops counting toward quorum and another live worker is asked. The original row stays and a late vote still counts. At settlement, an unanswered assignment that had at least this long before finalisation is marked missed; younger ones are dropped without a mark. |
+| `DRAFT_TTL_S` | `3600` | Scheduler deletes drafts with no on-chain submission after this many seconds since `updated_at`; rebuilding a draft transaction restarts its age. Must outlast the built transaction's validity. |
+| `ARTIFACT_MAX_BYTES` | `262144` | Maximum decoded artifact size accepted by `POST /v1/artifacts`; larger artifacts return HTTP 413. |
+| `RATE_LIMIT_PER_MINUTE` | `300` | Requests per minute per account with a valid bearer token, otherwise per client address. `/health*` is exempt; `X-Forwarded-For` supplies the address only with `TRUST_PROXY=true`. |
+
+Outside Docker, add these settings to `backend/.env`, loaded by `dotenv`,
+and restart the backend. `backend/.env.example` shows commented defaults;
+uncomment only the values you want to override.
+
+The current `docker-compose.yml` passes a fixed `backend.environment` list
+and has no `env_file`; it does **not** forward these six variables. Adding
+them to the root `.env` or `backend/.env` alone does not configure the
+container. Defaults apply unless you also add the desired variables to the
+backend service's `environment` mapping (or a Compose override) and recreate
+the backend container. This repository's Compose file is unchanged here.
+
+The request body limit is fixed at 1,048,576 bytes (1 MiB), including the JSON
+wrapper and base64 content. Base64 uses about four bytes per three decoded
+bytes, so raising `ARTIFACT_MAX_BYTES` above roughly 780,000 bytes cannot
+increase the usable upload size past that body limit; oversized requests are
+rejected before the decoded-artifact check. The body limit is not an
+environment setting.
 
 ## What this deployment does not give you
 

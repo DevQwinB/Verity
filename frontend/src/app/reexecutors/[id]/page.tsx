@@ -1,6 +1,7 @@
+import { cache } from "react";
 import type { Metadata } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
+import { notFound, unstable_rethrow } from "next/navigation";
 import { backendGet, backendGetOrNull } from "../../../lib/server-api";
 import type { GateConfig, Reexecutor, SlashingEvent } from "../../../lib/types";
 import { Card, CardBody, CardHeader } from "../../../components/ui/card";
@@ -9,7 +10,29 @@ import { WithdrawStake } from "../../../components/withdraw-stake";
 import { stroopsToXlm, truncateMiddle, formatRelativeTime } from "../../../lib/format";
 import { TESTNET_EXPLORER_ACCOUNT, TESTNET_EXPLORER_TX } from "../../../lib/config";
 
-export const metadata: Metadata = { title: "Re-executor" };
+const loadReexecutorDetail = cache((id: string) =>
+  backendGetOrNull<{ reexecutor: Reexecutor; slashing_events: SlashingEvent[] }>(
+    `/v1/reexecutors/${id}`
+  )
+);
+
+export async function generateMetadata({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}): Promise<Metadata> {
+  try {
+    const { id } = await params;
+    const data = await loadReexecutorDetail(id);
+    if (!data) return { title: "Re-executor" };
+    return {
+      title: `Re-executor ${truncateMiddle(data.reexecutor.stellar_account, 6, 6)}`,
+    };
+  } catch (err) {
+    unstable_rethrow(err);
+    return { title: "Re-executor" };
+  }
+}
 
 export default async function ReexecutorDetailPage({
   params,
@@ -18,7 +41,7 @@ export default async function ReexecutorDetailPage({
 }) {
   const { id } = await params;
   const [data, config] = await Promise.all([
-    backendGetOrNull<{ reexecutor: Reexecutor; slashing_events: SlashingEvent[] }>(`/v1/reexecutors/${id}`),
+    loadReexecutorDetail(id),
     backendGet<GateConfig>("/v1/config"),
   ]);
   if (!data) notFound();

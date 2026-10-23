@@ -11,25 +11,7 @@ import { canonicalJson } from "../../chain/canonical.js";
 import { HttpError } from "../../http-error.js";
 import { findOrCreateMarketplaceForAccount } from "../marketplaces/routes.js";
 import { artifactExists } from "../artifacts/storage.js";
-
-const sha256Hex = z.string().regex(/^[0-9a-f]{64}$/, "must be a lowercase hex sha256 digest");
-const stroops = z.string().regex(/^\d+$/, "must be an integer amount in stroops");
-
-const submitBody = z.object({
-  escrow_ref: z.string().min(1),
-  // "unverifiable" is in the taxonomy but has no on-chain path in Phase 1 —
-  // the contract rejects it, so it is rejected here with a clear message.
-  task_type: z.enum(["deterministic", "retrieval"]),
-  input_hash: sha256Hex,
-  claimed_output_hash: sha256Hex,
-  input_ref: z.string().optional(),
-  function_hash: z.string().optional(),
-  function_ref: z.string().optional(),
-  claimed_output_ref: z.string().optional(),
-  escrow_value: stroops,
-  bond_amount: stroops,
-  idempotency_key: z.string().min(1),
-});
+import { submitBody } from "./schema.js";
 
 /** An artifact reference is the storage_ref POST /v1/artifacts returned,
  * whose last path segment is the content hash. The artifact must really be
@@ -55,7 +37,7 @@ export async function submissionsRoutes(app: FastifyInstance) {
   // specifies a per-id GET) — the dashboard has nothing to render a
   // submissions feed from without it, and faking one client-side would
   // violate the no-mocked-data requirement.
-  app.get("/v1/submissions", async (req) => {
+  app.get("/v1/submissions", async (req, reply) => {
     const query = z
       .object({
         marketplace_id: z.string().uuid().optional(),
@@ -68,14 +50,27 @@ export async function submissionsRoutes(app: FastifyInstance) {
         include_drafts: z.enum(["true", "false"]).optional(),
       })
       .parse(req.query);
-    let qb = db.selectFrom("submission").selectAll().orderBy("submitted_at", "desc").orderBy("id");
+    const limit = query.limit ?? 50;
+    const offset = query.offset ?? 0;
+    // Filters only: the page and the total are both derived from this, so the
+    // total always counts exactly the rows the filters would page through.
+    let filtered = db.selectFrom("submission");
     // A draft is a row whose submit() transaction was built but never signed
     // and relayed — it does not exist on-chain, so it is not listed by default.
-    if (query.include_drafts !== "true") qb = qb.where("chain_submission_id", "is not", null);
-    if (query.marketplace_id) qb = qb.where("marketplace_id", "=", query.marketplace_id);
-    if (query.agent_id) qb = qb.where("agent_id", "=", query.agent_id);
-    if (query.status) qb = qb.where("status", "=", query.status);
-    return qb.limit(query.limit ?? 50).offset(query.offset ?? 0).execute();
+    if (query.include_drafts !== "true") filtered = filtered.where("chain_submission_id", "is not", null);
+    if (query.marketplace_id) filtered = filtered.where("marketplace_id", "=", query.marketplace_id);
+    if (query.agent_id) filtered = filtered.where("agent_id", "=", query.agent_id);
+    if (query.status) filtered = filtered.where("status", "=", query.status);
+    const [rows, { total }] = await Promise.all([
+      filtered.selectAll().orderBy("submitted_at", "desc").orderBy("id").limit(limit).offset(offset).execute(),
+      filtered.select((eb) => eb.fn.countAll().as("total")).executeTakeFirstOrThrow(),
+    ]);
+    // Postgres returns count(*) as a bigint string. The body stays a bare
+    // array so existing clients keep working; paging metadata is in headers.
+    reply.header("x-total-count", String(Number(total)));
+    reply.header("x-limit", String(limit));
+    reply.header("x-offset", String(offset));
+    return rows;
   });
 
   // Build-sign-relay-confirm step 1: create a pending row and hand back
@@ -89,11 +84,8 @@ export async function submissionsRoutes(app: FastifyInstance) {
       .selectFrom("submission")
       .selectAll()
       .where("idempotency_key", "=", body.idempotency_key)
+      .where("agent_id", "=", agent)
       .executeTakeFirst();
-    if (existing && existing.agent_id !== agent) {
-      // Never hand one account another account's submission.
-      throw new HttpError(409, "idempotency_key is already in use");
-    }
     if (existing?.chain_submission_id) {
       // Already signed and on-chain: nothing left to sign.
       return { submission: existing, unsigned_transaction_xdr: null, network_passphrase: env.NETWORK_PASSPHRASE };
@@ -143,38 +135,66 @@ export async function submissionsRoutes(app: FastifyInstance) {
       chain_tx_hash: Buffer.from(assembled.built!.hash()).toString("hex"),
     };
 
-    if (existing) {
+    const updateExistingDraft = async (submissionId: string) => {
       // A retry of a draft that was never signed: the transaction built the
       // first time may have expired, so the draft is pointed at a fresh one.
       const row = await db
         .updateTable("submission")
         .set({ ...values, updated_at: new Date() })
-        .where("id", "=", existing.id)
+        .where("id", "=", submissionId)
         .returningAll()
         .executeTakeFirstOrThrow();
       return { submission: row, unsigned_transaction_xdr: unsignedXdr, network_passphrase: env.NETWORK_PASSPHRASE };
+    };
+
+    if (existing) {
+      return updateExistingDraft(existing.id);
     }
 
     const marketplace = await findOrCreateMarketplaceForAccount(agent);
-    const row = await db
-      .insertInto("submission")
-      .values({
-        ...values,
-        marketplace_id: marketplace.id,
-        agent_id: agent,
-        bond_asset: "native",
-        challenge_window_s: 0, // set by the contract at submit() time; filled in on relay confirm
-        idempotency_key: body.idempotency_key,
-      })
-      .returningAll()
-      .executeTakeFirstOrThrow();
+    try {
+      const row = await db
+        .insertInto("submission")
+        .values({
+          ...values,
+          marketplace_id: marketplace.id,
+          agent_id: agent,
+          bond_asset: "native",
+          challenge_window_s: 0, // set by the contract at submit() time; filled in on relay confirm
+          idempotency_key: body.idempotency_key,
+        })
+        .returningAll()
+        .executeTakeFirstOrThrow();
 
-    reply.code(201);
-    return {
-      submission: row,
-      unsigned_transaction_xdr: unsignedXdr,
-      network_passphrase: env.NETWORK_PASSPHRASE,
-    };
+      reply.code(201);
+      return {
+        submission: row,
+        unsigned_transaction_xdr: unsignedXdr,
+        network_passphrase: env.NETWORK_PASSPHRASE,
+      };
+    } catch (err: unknown) {
+      const isUniqueViolation = typeof err === "object" && err !== null && (err as { code?: string }).code === "23505";
+      if (!isUniqueViolation) {
+        throw err;
+      }
+
+      const raced = await db
+        .selectFrom("submission")
+        .selectAll()
+        .where("idempotency_key", "=", body.idempotency_key)
+        .where("agent_id", "=", agent)
+        .executeTakeFirst();
+
+      if (!raced) {
+        throw new HttpError(409, "idempotency_key is already in use");
+      }
+
+      if (raced.chain_submission_id) {
+        return { submission: raced, unsigned_transaction_xdr: null, network_passphrase: env.NETWORK_PASSPHRASE };
+      }
+
+      return updateExistingDraft(raced.id);
+    }
   });
 
   // Build-sign-relay-confirm step 2: relay the agent-signed XDR to real
@@ -202,8 +222,26 @@ export async function submissionsRoutes(app: FastifyInstance) {
       return { error: "signed transaction is not the one built for this submission" };
     }
     const { hash, returnValue } = await relaySignedXdr(body.signed_transaction_xdr);
-    const chainSubmissionId = String(returnValue);
-    const onChain = await readSubmission(chainSubmissionId);
+    // From here on the transaction is on-chain. Without a u64 id the row is
+    // left for the indexer, which matches the draft by its tx hash, and the
+    // caller is told not to resend.
+    if (typeof returnValue !== "bigint") {
+      throw new HttpError(
+        502,
+        `Transaction ${hash} was confirmed but the network returned no submission id. ` +
+          "Do not resend it; the submission will appear once the indexer has processed it."
+      );
+    }
+    const chainSubmissionId = returnValue.toString();
+    // The read-back only fills in fields the indexer also sets, so a failure
+    // here is not worth failing a landed transaction over.
+    let onChain: Awaited<ReturnType<typeof readSubmission>>;
+    try {
+      onChain = await readSubmission(chainSubmissionId);
+    } catch (err) {
+      console.warn(`[relay] could not read submission ${chainSubmissionId} back after relay; the indexer will fill it in`, err);
+      onChain = null;
+    }
 
     const row = await db
       .updateTable("submission")
