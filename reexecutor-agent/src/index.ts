@@ -12,10 +12,10 @@ const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:3001";
 const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
 const RPC_URL = process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const CONTRACT_ID = requireEnv("ESCROW_GATE_CONTRACT_ID");
-const POLL_MS = Number(process.env.POLL_INTERVAL_MS ?? 3000);
+const POLL_MS = numberEnv("POLL_INTERVAL_MS", 3000, 250);
 // How long a retrieval target may stay unreachable before this worker
 // concludes it is the target's fault (never longer than half the window).
-const RETRIEVAL_RETRY_BUDGET_S = Number(process.env.RETRIEVAL_RETRY_BUDGET_S ?? 120);
+const RETRIEVAL_RETRY_BUDGET_S = numberEnv("RETRIEVAL_RETRY_BUDGET_S", 120, 1);
 // Any endpoint this worker must be able to reach anyway. If even this fails,
 // the problem is our network, and an unreachable target proves nothing.
 const CONNECTIVITY_CHECK_URL = process.env.CONNECTIVITY_CHECK_URL ?? RPC_URL;
@@ -25,6 +25,20 @@ function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
     console.error(`[reexecutor-agent] ${name} is required (see reexecutor-agent/.env.example)`);
+    process.exit(1);
+  }
+  return value;
+}
+
+/** A numeric setting: unset or empty uses `fallback`; anything else must be a
+ * finite number >= `min`, or the agent refuses to start. A bare `Number(...)`
+ * turned a typo into NaN, i.e. a 1 ms poll loop or no retrieval retry wait. */
+function numberEnv(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < min) {
+    console.error(`[reexecutor-agent] ${name} must be a number >= ${min} (got "${raw}")`);
     process.exit(1);
   }
   return value;
@@ -103,7 +117,9 @@ const noOutput = (why: string) => ({ outputHash: NO_OUTPUT_HASH, engine: why });
 
 const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
 
-/** When this process first failed to reach a submission's retrieval target. */
+/** When this process first failed to reach a submission's retrieval target.
+ * Entries live only while the backend still lists the assignment (see
+ * `pruneToListed`). */
 const firstUnreachableAt = new Map<string, number>();
 
 /**
@@ -180,7 +196,9 @@ async function reExecute(
 
 /** Submissions this process has already voted on. The backend keeps listing
  * an assignment until its indexer sees our ReplayAttested event a few
- * seconds later; without this we would re-run and re-send in the meantime. */
+ * seconds later; without this we would re-run and re-send in the meantime.
+ * Entries live only while the backend still lists the assignment (see
+ * `pruneToListed`). */
 const attested = new Set<string>();
 
 /** Set when the contract says this account may not vote at all (stake below
@@ -194,6 +212,7 @@ async function processAssignment(a: Assignment) {
   if (!record) throw new Error("submission is not on-chain (yet)");
   if (record.finalized) {
     attested.add(a.chain_submission_id);
+    firstUnreachableAt.delete(a.chain_submission_id);
     return;
   }
 
@@ -234,11 +253,24 @@ async function processAssignment(a: Assignment) {
   firstUnreachableAt.delete(a.chain_submission_id);
 }
 
+/** Drops per-submission state for everything the backend no longer lists, so
+ * a worker that runs for weeks only holds state for its current assignments.
+ * Safe even if a pruned id is listed again later: `attest_replay` then fails
+ * with #23 AlreadyAttested, which `processAssignment` already treats as
+ * nothing to do, so the worst case is one redundant RPC call, never a second
+ * vote. */
+function pruneToListed(listed: ReadonlySet<string>) {
+  for (const id of attested) if (!listed.has(id)) attested.delete(id);
+  for (const id of firstUnreachableAt.keys()) if (!listed.has(id)) firstUnreachableAt.delete(id);
+}
+
 async function pollOnce(reexecutorId: string) {
   const { replay_assignments, spot_check_assignments } = await api<{
     replay_assignments: Assignment[];
     spot_check_assignments: Assignment[];
   }>(`/v1/reexecutors/${reexecutorId}/assignments`);
+  // Only after a successful fetch: if `api` throws, nothing is pruned.
+  pruneToListed(new Set([...replay_assignments, ...spot_check_assignments].map((a) => a.chain_submission_id)));
   // A sampled spot-check and a full replay are the same job for the worker:
   // re-derive the output, then put a bonded vote on-chain.
   // The poll above is what marks this worker online, so it runs even while
