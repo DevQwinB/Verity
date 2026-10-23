@@ -288,7 +288,10 @@ only a **shape example**; the identifiers below are placeholders:
 `x-verity-signature` is the **lowercase hexadecimal HMAC-SHA256** digest
 using the registration `secret` as the key and the **exact raw request-body
 bytes** as input. Verify before parsing JSON: re-serializing a parsed object
-may change the signed bytes. This minimal Node.js receiver verifies the
+may change the signed bytes. A valid HMAC shows that a holder of the shared
+secret authenticated these bytes; it does not prove the verdict or other
+payload data is correct. Any holder of the secret can generate signatures.
+This minimal Node.js receiver verifies the
 header using a constant-time comparison:
 
 ```js
