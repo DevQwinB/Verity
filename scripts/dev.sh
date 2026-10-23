@@ -68,7 +68,9 @@ fi
 
 if [ ! -f backend/.env ]; then
   echo "==> Creating backend/.env (gitignored)"
-  cat > backend/.env <<ENV
+  (
+    umask 077
+    cat > backend/.env <<ENV
 SOROBAN_RPC_URL=$SOROBAN_RPC_URL
 NETWORK_PASSPHRASE="$NETWORK_PASSPHRASE"
 ESCROW_GATE_CONTRACT_ID=$GATE_ID
@@ -82,6 +84,7 @@ ARTIFACT_STORAGE_DIR=./.artifacts
 KEEPER_SECRET_KEY=$(stellar keys secret "$KEEPER")
 JWT_SECRET=$(openssl rand -hex 32)
 ENV
+  )
   chmod 600 backend/.env
 fi
 
@@ -104,8 +107,12 @@ start() {
 }
 
 wait_for() {
-  local what="$1" check="$2" tries=0
+  local what="$1" check="$2" pid="${3:-}" tries=0
   until eval "$check" >/dev/null 2>&1; do
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      echo "FATAL: $what exited before it became ready" >&2
+      exit 1
+    fi
     tries=$((tries + 1))
     if [ "$tries" -gt 180 ]; then echo "FATAL: timed out waiting for $what" >&2; exit 1; fi
     sleep 1
@@ -119,7 +126,7 @@ if port_open "$PG_PORT"; then
 else
   echo "==> Starting Postgres on :$PG_PORT (data in .pgdata/)"
   start postgres db "$TSX" src/dev-postgres-daemon.ts "$ROOT_DIR/.pgdata" "" "$PG_PORT"
-  wait_for "Postgres" "port_open $PG_PORT"
+  wait_for "Postgres" "port_open $PG_PORT" "${PIDS[-1]}"
 fi
 
 echo "==> Running migrations"
@@ -148,7 +155,7 @@ start backend backend env \
   DEPLOYMENT_NAME="$DEPLOYMENT" KEEPER_SECRET_KEY="$(stellar keys secret "$KEEPER")" \
   "${JWT_OVERRIDE[@]}" \
   "$ROOT_DIR/backend/node_modules/.bin/tsx" src/index.ts
-wait_for "backend" "curl -fs http://127.0.0.1:$API_PORT/health"
+wait_for "backend" "curl -fs http://127.0.0.1:$API_PORT/health" "${PIDS[-1]}"
 
 if [ "$RUN_AGENTS" = 1 ]; then
   for alias in $REEXECUTORS; do

@@ -11,8 +11,15 @@ async function votingRules(): Promise<{ quorum: number; allowlist: boolean }> {
   return { quorum: Number(cfg.quorum_min_reexecutors), allowlist: cfg.reexecutor_allowlist };
 }
 
-function assignmentSeed(submissionId: string, chainSubmissionId: string): string {
+export function assignmentSeed(submissionId: string, chainSubmissionId: string): string {
   return createHash("sha256").update(`${submissionId}|${chainSubmissionId}`).digest("hex");
+}
+
+export function rankBySeed<T extends { stellar_account: string }>(seed: string, rows: T[]): T[] {
+  return rows
+    .map((r) => ({ r, rank: createHash("sha256").update(`${seed}|${r.stellar_account}`).digest("hex") }))
+    .sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : 0))
+    .map(({ r }) => r);
 }
 
 /**
@@ -34,10 +41,7 @@ async function rankedLiveReexecutors(seed: string, allowlist: boolean) {
     .where("last_seen_at", ">", sql<Date>`now() - (${env.REEXECUTOR_LIVENESS_S} || ' seconds')::interval`);
   if (allowlist) qb = qb.where("approved", "=", true);
   const live = await qb.execute();
-  return live
-    .map((r) => ({ r, rank: createHash("sha256").update(`${seed}|${r.stellar_account}`).digest("hex") }))
-    .sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : 0))
-    .map(({ r }) => r);
+  return rankBySeed(seed, live);
 }
 
 /** Adds up to `count` re-executors who hold no row yet in `table` for this
@@ -84,6 +88,10 @@ async function assignNext(
  * If nobody is online nothing is assigned here; topUpAssignments() picks the
  * submission up as soon as somebody is.
  */
+export function replayWantCount(quorum: number, overassign: number, held: number): number {
+  return quorum + overassign - held;
+}
+
 export async function assignReplayJobs(params: {
   submissionId: string;
   chainSubmissionId: string;
@@ -104,7 +112,7 @@ export async function assignReplayJobs(params: {
       .where("submission_id", "=", params.submissionId)
       .where("status", "!=", "missed")
       .executeTakeFirst();
-    const want = quorum + env.REPLAY_OVERASSIGN - Number(held?.count ?? 0);
+    const want = replayWantCount(quorum, env.REPLAY_OVERASSIGN, Number(held?.count ?? 0));
     await assignNext("replay", params.submissionId, seed, allowlist, want);
   } else {
     await assignNext("spot_check", params.submissionId, seed, allowlist, 1);
