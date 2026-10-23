@@ -1,11 +1,24 @@
 const STROOPS_PER_XLM = 10_000_000;
 
+/** Formats an amount in stroops (1 XLM = 10,000,000 stroops) as an XLM string, e.g.
+ * "15000000" -> "1.5". Negative amounts get a single leading minus. A string must be a
+ * base-10 integer; a number must be finite and is truncated toward zero. Anything else
+ * throws a RangeError ("Invalid stroops amount: ...") rather than showing a made-up amount. */
 export function stroopsToXlm(stroops: string | number): string {
+  const valid = typeof stroops === "string" ? /^-?\d+$/.test(stroops) : Number.isFinite(stroops);
+  if (!valid) {
+    // JSON.stringify would print NaN and Infinity as "null".
+    const shown = typeof stroops === "string" ? JSON.stringify(stroops) : String(stroops);
+    throw new RangeError(`Invalid stroops amount: ${shown}`);
+  }
   const n = typeof stroops === "string" ? BigInt(stroops) : BigInt(Math.trunc(stroops));
-  const whole = n / BigInt(STROOPS_PER_XLM);
-  const frac = n % BigInt(STROOPS_PER_XLM);
+  const negative = n < BigInt(0);
+  const abs = negative ? -n : n;
+  const whole = abs / BigInt(STROOPS_PER_XLM);
+  const frac = abs % BigInt(STROOPS_PER_XLM);
   const fracStr = frac.toString().padStart(7, "0").replace(/0+$/, "");
-  return fracStr.length > 0 ? `${whole}.${fracStr}` : whole.toString();
+  const formatted = fracStr.length > 0 ? `${whole}.${fracStr}` : whole.toString();
+  return negative ? `-${formatted}` : formatted;
 }
 
 export function truncateMiddle(value: string, head = 6, tail = 6): string {
