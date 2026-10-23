@@ -4,22 +4,35 @@ import { requireAuth } from "../../auth/plugin.js";
 import { db } from "../../db.js";
 import { assertPublicHttpUrl } from "../webhooks/url-guard.js";
 
+async function upsertMarketplace(account: string, name: string) {
+  const inserted = await db
+    .insertInto("marketplace")
+    .values({ stellar_account: account, name })
+    .onConflict((oc) => oc.column("stellar_account").doNothing())
+    .returningAll()
+    .executeTakeFirst();
+
+  if (inserted) {
+    return { row: inserted, created: true };
+  }
+
+  const existing = await db
+    .selectFrom("marketplace")
+    .selectAll()
+    .where("stellar_account", "=", account)
+    .executeTakeFirstOrThrow();
+
+  return { row: existing, created: false };
+}
+
 export async function marketplacesRoutes(app: FastifyInstance) {
   app.post("/v1/marketplaces", { preHandler: requireAuth }, async (req, reply) => {
     const body = z.object({ name: z.string().min(1) }).parse(req.body);
     const account = req.stellarAccount!;
-    const existing = await db
-      .selectFrom("marketplace")
-      .selectAll()
-      .where("stellar_account", "=", account)
-      .executeTakeFirst();
-    if (existing) return existing;
-    const row = await db
-      .insertInto("marketplace")
-      .values({ stellar_account: account, name: body.name })
-      .returningAll()
-      .executeTakeFirstOrThrow();
-    reply.code(201);
+    const { row, created } = await upsertMarketplace(account, body.name);
+    if (created) {
+      reply.code(201);
+    }
     return row;
   });
 
@@ -54,15 +67,6 @@ export async function marketplacesRoutes(app: FastifyInstance) {
 }
 
 export async function findOrCreateMarketplaceForAccount(account: string) {
-  const existing = await db
-    .selectFrom("marketplace")
-    .selectAll()
-    .where("stellar_account", "=", account)
-    .executeTakeFirst();
-  if (existing) return existing;
-  return db
-    .insertInto("marketplace")
-    .values({ stellar_account: account, name: account })
-    .returningAll()
-    .executeTakeFirstOrThrow();
+  const { row } = await upsertMarketplace(account, account);
+  return row;
 }

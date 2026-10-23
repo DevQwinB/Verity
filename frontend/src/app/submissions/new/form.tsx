@@ -19,7 +19,67 @@ function textToBase64(text: string): string {
   return btoa(binary);
 }
 
+/** Largest artifact the dashboard will try to upload, in UTF-8 bytes. The
+ * upload request carries the artifact as base64 inside JSON, and the backend
+ * rejects any request over its 1 MiB body limit (`bodyLimit: 1_048_576` in
+ * `backend/src/app.ts`) before Verity's own code runs. 1,048,576 base64
+ * characters carry at most 786,432 raw bytes; this leaves a little room for
+ * the JSON envelope. Keep it in sync with that `bodyLimit`. */
+const MAX_UPLOAD_ARTIFACT_BYTES = 786_000;
+
+/** UTF-8 size, which is what gets uploaded. `text.length` undercounts any
+ * multi-byte character. */
+function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+const formatKb = (bytes: number) => `${(bytes / 1000).toFixed(1)} KB`;
+
+function checkArtifactSize(name: string, text: string) {
+  const bytes = utf8ByteLength(text);
+  if (bytes > MAX_UPLOAD_ARTIFACT_BYTES) {
+    throw new Error(
+      `The ${name} is ${formatKb(bytes)}. The largest artifact the dashboard can upload is about ${formatKb(MAX_UPLOAD_ARTIFACT_BYTES)}.`
+    );
+  }
+}
+
 type Step = "idle" | "uploading" | "building" | "signing" | "relaying" | "done" | "error";
+
+/** A malformed retrieval spec is expensive: every re-executor fails to replay
+ * it, votes "mismatch", and the agent's own bond is slashed (see
+ * reexecutor-agent/src/sandbox/retrieval.ts). Catch what the worker would
+ * reject here, before anything is uploaded or signed. */
+function validateRetrievalSpec(value: unknown): void {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(
+      'The request spec must be a JSON object, e.g. {"url": "https://...", "pointer": "/field"}.'
+    );
+  }
+  const spec = value as Record<string, unknown>;
+  const url = spec.url;
+  if (typeof url !== "string") {
+    throw new Error('The request spec needs a "url" starting with http:// or https://.');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`"${url}" is not a valid URL. Use a full address like https://example.com/data.json.`);
+  }
+  // new URL() accepts javascript: and ftp: too; the worker only replays http(s).
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error('The "url" must start with http:// or https://.');
+  }
+  if (Object.hasOwn(spec, "pointer") && spec.pointer !== undefined) {
+    const pointer = spec.pointer;
+    if (typeof pointer !== "string" || (pointer !== "" && !pointer.startsWith("/"))) {
+      throw new Error(
+        'The "pointer" must be a JSON Pointer string: "" for the whole document, or starting with "/", e.g. "/network_passphrase".'
+      );
+    }
+  }
+}
 
 // The reference is free text that is hashed on-chain and shown in lists, so it is capped for sanity; keep it in line with any backend limit.
 const ESCROW_REF_MAX_LENGTH = 128;
@@ -87,15 +147,19 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
       );
     }
     if (taskType === "retrieval") {
-      const url = (inputValue as { url?: unknown } | null)?.url;
-      if (typeof url !== "string" || !/^https?:\/\//.test(url)) {
-        throw new Error('The request spec needs a "url" starting with http:// or https://.');
-      }
+      validateRetrievalSpec(inputValue);
     }
     if (taskType === "deterministic" && !functionContent.trim()) {
       throw new Error("A deterministic task needs the function re-executors will replay.");
     }
-    return { input: canonicalJson(inputValue), output: canonicalJson(parseJsonOrText(outputContent)) };
+    const input = canonicalJson(inputValue);
+    const output = canonicalJson(parseJsonOrText(outputContent));
+    // Checked here, before anything is uploaded, so an oversize artifact is
+    // named instead of failing the upload with a bare "Request body is too large".
+    checkArtifactSize("input", input);
+    checkArtifactSize("claimed output", output);
+    if (taskType === "deterministic") checkArtifactSize("function", functionContent);
+    return { input, output };
   }
 
   async function handleSubmit() {
@@ -116,7 +180,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
           : null;
 
       setStep("building");
-      const { submission, unsigned_transaction_xdr } = await createSubmission({
+      const { submission, unsigned_transaction_xdr, network_passphrase } = await createSubmission({
         escrow_ref: escrowRefTrimmed,
         task_type: taskType,
         input_hash: input.content_hash,
@@ -137,7 +201,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
 
       setStep("signing");
       const signed = await signXdr(unsigned_transaction_xdr, {
-        networkPassphrase: NETWORK_PASSPHRASE,
+        networkPassphrase: network_passphrase || NETWORK_PASSPHRASE,
         address: account,
       });
 

@@ -24,8 +24,17 @@ function enumTag(v: unknown): string | undefined {
   return undefined;
 }
 
-export function fromChainVerdict(v: unknown): string {
+export type ChainVerdictStatus = "pending" | "verified" | "disputed" | "slashed" | "expired_unverified";
+
+/** Maps the contract's `Verdict` enum (either decoding shape, see `enumTag`)
+ * to a submission status. `Pending` is matched explicitly; anything else —
+ * `undefined`, `null`, an unknown tag, a malformed object — throws rather
+ * than being reported as "pending", so a decode failure surfaces in the
+ * caller's error handling instead of silently reverting a verdict. */
+export function fromChainVerdict(v: unknown): ChainVerdictStatus {
   switch (enumTag(v)) {
+    case "Pending":
+      return "pending";
     case "Verified":
       return "verified";
     case "Disputed":
@@ -35,7 +44,17 @@ export function fromChainVerdict(v: unknown): string {
     case "ExpiredUnverified":
       return "expired_unverified";
     default:
-      return "pending";
+      throw new Error(`fromChainVerdict: unrecognised verdict ${describeValue(v)}`);
+  }
+}
+
+/** `JSON.stringify` for error messages, without letting a BigInt or a cycle
+ * throw a different error, and without losing `undefined`. */
+function describeValue(v: unknown): string {
+  try {
+    return JSON.stringify(v) ?? String(v);
+  } catch {
+    return String(v);
   }
 }
 

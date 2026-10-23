@@ -144,13 +144,45 @@ stellar contract extend --id <ESCROW_GATE_CONTRACT_ID> --source verity-public-ke
 ```
 
 **Testnet resets.** Stellar testnet is wiped periodically. After a reset the
-contracts are gone: repeat step 1 with `--force`, update `.env`, and start
+contracts are gone: repeat step 1 with `--force --replace-public` (the public-deployment guard requires `--replace-public` because replacing it abandons the old contracts), update `.env`, and start
 from an empty database (`docker compose down -v` deletes both volumes).
 
 **Upgrading.** EscrowGate has no upgrade entrypoint. A backend, dashboard or
 worker change is `git pull && docker compose --profile fleet up -d --build`.
-A contract change is a new deployment: step 1 with `--force`, then as for a
+A contract change is a new deployment: step 1 with `--force --replace-public`, then as for a
 testnet reset. Stakes on the old contract stay withdrawable from it.
+
+### Tuning
+
+The backend validates these optional settings at startup. All are positive
+integers except `REPLAY_OVERASSIGN`, which also accepts `0`.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `REEXECUTOR_LIVENESS_S` | `60` | Seconds since a worker's last assignment poll during which it counts as online. Only online, active re-executors (and approved ones when the allowlist is enabled) receive assignments. Keep this well above the agent's `POLL_INTERVAL_MS` (default `3000` ms). |
+| `REPLAY_OVERASSIGN` | `1` | Extra re-executors beyond the contract quorum for deterministic tasks or tasks escalated to full quorum; `0` disables spares. |
+| `REPLAY_REASSIGN_AFTER_S` | `120` | After this many seconds unanswered, an assignment stops counting toward quorum and another live worker is asked. The original row stays and a late vote still counts. At settlement, an unanswered assignment that had at least this long before finalisation is marked missed; younger ones are dropped without a mark. |
+| `DRAFT_TTL_S` | `3600` | Scheduler deletes drafts with no on-chain submission after this many seconds since `updated_at`; rebuilding a draft transaction restarts its age. Must outlast the built transaction's validity. |
+| `ARTIFACT_MAX_BYTES` | `262144` | Maximum decoded artifact size accepted by `POST /v1/artifacts`; larger artifacts return HTTP 413. |
+| `RATE_LIMIT_PER_MINUTE` | `300` | Requests per minute per account with a valid bearer token, otherwise per client address. `/health*` is exempt; `X-Forwarded-For` supplies the address only with `TRUST_PROXY=true`. |
+
+Outside Docker, add these settings to `backend/.env`, loaded by `dotenv`,
+and restart the backend. `backend/.env.example` shows commented defaults;
+uncomment only the values you want to override.
+
+The current `docker-compose.yml` passes a fixed `backend.environment` list
+and has no `env_file`; it does **not** forward these six variables. Adding
+them to the root `.env` or `backend/.env` alone does not configure the
+container. Defaults apply unless you also add the desired variables to the
+backend service's `environment` mapping (or a Compose override) and recreate
+the backend container. This repository's Compose file is unchanged here.
+
+The request body limit is fixed at 1,048,576 bytes (1 MiB), including the JSON
+wrapper and base64 content. Base64 uses about four bytes per three decoded
+bytes, so raising `ARTIFACT_MAX_BYTES` above roughly 780,000 bytes cannot
+increase the usable upload size past that body limit; oversized requests are
+rejected before the decoded-artifact check. The body limit is not an
+environment setting.
 
 ## What this deployment does not give you
 

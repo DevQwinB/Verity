@@ -1,5 +1,6 @@
 import "dotenv/config";
 import "./net.js";
+import { StrKey } from "@stellar/stellar-sdk";
 import { z } from "zod";
 
 const flag = (fallback: "true" | "false") =>
@@ -8,24 +9,42 @@ const flag = (fallback: "true" | "false") =>
     .default(fallback)
     .transform((v) => v === "true");
 
+const contractId = z
+  .string()
+  .refine((v) => StrKey.isValidContract(v), "must be a Soroban contract ID starting with C");
+
+const secretSeed = z
+  .string()
+  .refine(
+    (v) => StrKey.isValidEd25519SecretSeed(v),
+    "must be a Stellar secret key starting with S"
+  );
+
+const databaseUrl = z
+  .string()
+  .refine(
+    (v) => /^postgres(ql)?:\/\//.test(v),
+    "must be a PostgreSQL connection URL starting with postgres:// or postgresql://"
+  );
+
 const schema = z.object({
   SOROBAN_RPC_URL: z.string().url(),
   NETWORK_PASSPHRASE: z.string().min(1),
-  ESCROW_GATE_CONTRACT_ID: z.string().min(1),
-  ZK_VERIFIER_REGISTRY_CONTRACT_ID: z.string().min(1),
-  BOND_ASSET_CONTRACT_ID: z.string().min(1),
-  DATABASE_URL: z.string().min(1),
-  KEEPER_SECRET_KEY: z.string().min(1),
+  ESCROW_GATE_CONTRACT_ID: contractId,
+  ZK_VERIFIER_REGISTRY_CONTRACT_ID: contractId,
+  BOND_ASSET_CONTRACT_ID: contractId,
+  DATABASE_URL: databaseUrl,
+  KEEPER_SECRET_KEY: secretSeed,
   // Signs SEP-10 challenges. Defaults to the keeper key; give it its own so
   // the key that moves funds is not also the one answering every login.
-  SEP10_SIGNING_SECRET: z.string().min(1).optional(),
+  SEP10_SIGNING_SECRET: secretSeed.optional(),
   JWT_SECRET: z.string().min(32, "must be at least 32 characters (openssl rand -hex 32)"),
   // Host (and port) users reach the auth endpoint on, without a scheme.
   WEB_AUTH_DOMAIN: z.string().min(1),
   HOME_DOMAIN: z.string().min(1),
   // Scheme the public sees: "https" behind any real reverse proxy.
   PUBLIC_SCHEME: z.enum(["http", "https"]).default("http"),
-  PORT: z.coerce.number().default(3001),
+  PORT: z.coerce.number().int().min(1).max(65535).default(3001),
   // Shown by /health so tooling can tell which deployment it is talking to.
   DEPLOYMENT_NAME: z.string().default("testnet"),
   ARTIFACT_STORAGE_DIR: z.string().default("./.artifacts"),
@@ -52,4 +71,14 @@ const schema = z.object({
   DRAFT_TTL_S: z.coerce.number().int().positive().default(3600),
 });
 
-export const env = schema.parse(process.env);
+const parsed = schema.safeParse(process.env);
+if (!parsed.success) {
+  console.error("Invalid environment configuration:");
+  for (const issue of parsed.error.issues) {
+    const path = issue.path.join(".");
+    console.error(`  - ${path}: ${issue.message}`);
+  }
+  process.exit(1);
+}
+
+export const env = parsed.data;

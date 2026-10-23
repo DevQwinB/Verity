@@ -2,7 +2,7 @@
 
 import { requestAccess, signTransaction, isConnected, getNetwork } from "@stellar/freighter-api";
 
-export type WalletErrorCode = "not-installed" | "wrong-network" | "rejected" | "timeout";
+export type WalletErrorCode = "not-installed" | "wrong-network" | "network-unknown" | "rejected" | "timeout";
 
 export class WalletError extends Error {
   constructor(
@@ -50,7 +50,14 @@ export async function connectWallet(expectedPassphrase: string): Promise<string>
     throw new WalletError("rejected", result.error?.message ?? "Freighter access was declined.");
   }
   const network = await getNetwork();
-  if (!network.error && network.networkPassphrase !== expectedPassphrase) {
+  if (network.error) {
+    const details = network.error.message ? ` (${network.error.message})` : "";
+    throw new WalletError(
+      "network-unknown",
+      `Could not read the network from Freighter${details}. Make sure Freighter is unlocked and set to Testnet, then connect again.`
+    );
+  }
+  if (network.networkPassphrase !== expectedPassphrase) {
     throw new WalletError(
       "wrong-network",
       `Freighter is set to ${network.network || "another network"}. Switch it to Testnet and connect again.`
