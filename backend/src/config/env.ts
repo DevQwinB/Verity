@@ -38,6 +38,9 @@ const schema = z.object({
   // Signs SEP-10 challenges. Defaults to the keeper key; give it its own so
   // the key that moves funds is not also the one answering every login.
   SEP10_SIGNING_SECRET: secretSeed.optional(),
+  // Signs verdict attestations. Defaults to the keeper key; give it its own so
+  // rotating the fund-moving key does not change every future attestation's attestor.
+  ATTESTATION_SIGNING_SECRET: secretSeed.optional(),
   JWT_SECRET: z.string().min(32, "must be at least 32 characters (openssl rand -hex 32)"),
   // Host (and port) users reach the auth endpoint on, without a scheme.
   WEB_AUTH_DOMAIN: z.string().min(1),

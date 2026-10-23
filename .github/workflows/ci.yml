@@ -47,6 +47,7 @@ jobs:
       - run: pnpm --filter escrow-gate --filter zk-verifier-registry build
       - run: pnpm typecheck
       - run: pnpm --filter @verity/backend test
+      - run: pnpm --filter @verity/frontend test
       - run: pnpm lint
       - run: pnpm --filter @verity/frontend build
 
@@ -59,3 +60,64 @@ jobs:
       - run: docker build -f backend/Dockerfile -t verity-backend .
       - run: docker build -f reexecutor-agent/Dockerfile -t verity-reexecutor .
       - run: docker build -f frontend/Dockerfile -t verity-frontend .
+
+  bindings-drift:
+    name: TypeScript bindings drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+        working-directory: contracts
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts
+      # Pinned stellar-cli release (25.2.0); bump together with deliberate contract bindings regeneration.
+      - name: Install stellar-cli
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v25.2.0/stellar-cli-25.2.0-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C /usr/local/bin
+          stellar --version
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Regenerate contract bindings
+        run: ./scripts/generate_bindings.sh
+      - name: Check for bindings drift
+        run: |
+          if ! git diff --exit-code -- backend/src/chain/generated; then
+            echo "::error::Committed TypeScript contract bindings are out of date with contracts. Run ./scripts/generate_bindings.sh and commit the changes."
+            exit 1
+          fi
+
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        run: shellcheck -x scripts/approve_reexecutor.sh scripts/bootstrap_reexecutors.sh scripts/deploy_testnet.sh scripts/dev.sh scripts/export_interfaces.sh scripts/generate_bindings.sh scripts/smoke.sh
+
+  compose-config:
+    name: Docker Compose config validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ESCROW_GATE_CONTRACT_ID: CDUMMY000000000000000000000000000000000000000000000000000000
+      ZK_VERIFIER_REGISTRY_CONTRACT_ID: CDUMMY000000000000000000000000000000000000000000000000000001
+      BOND_ASSET_CONTRACT_ID: CDUMMY000000000000000000000000000000000000000000000000000002
+      POSTGRES_PASSWORD: dummy-postgres-password
+      KEEPER_SECRET_KEY: SDUMMY000000000000000000000000000000000000000000000000000000
+      SEP10_SIGNING_SECRET: SDUMMY000000000000000000000000000000000000000000000000000001
+      JWT_SECRET: dummy-jwt-secret-minimum-32-characters-long
+      WEB_AUTH_DOMAIN: localhost:3001
+      HOME_DOMAIN: localhost
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate default compose config
+        run: docker compose config -q
+      - name: Validate fleet profile compose config
+        run: docker compose --profile fleet config -q
