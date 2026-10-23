@@ -23,10 +23,15 @@ const FILTERS: Array<{ value: SubmissionStatus | null; label: string }> = [
 export default async function SubmissionsPage({
   searchParams,
 }: {
-  searchParams: Promise<{ status?: string; page?: string }>;
+  searchParams: Promise<{ status?: string | string[]; page?: string }>;
 }) {
   const params = await searchParams;
-  const status = FILTERS.find((f) => f.value === params.status)?.value ?? null;
+  const rawStatus = Array.isArray(params.status) ? params.status[0] : params.status;
+  const status = FILTERS.find((f) => f.value === rawStatus)?.value ?? null;
+  const ignoredStatus =
+    rawStatus && status === null && !FILTERS.some((f) => f.value === rawStatus)
+      ? rawStatus
+      : null;
   const page = parsePage(params.page);
 
   const query = new URLSearchParams({
@@ -78,6 +83,12 @@ export default async function SubmissionsPage({
           </Link>
         ))}
       </nav>
+
+      {ignoredStatus && (
+        <p role="status" className="text-sm text-text-secondary">
+          Unknown status filter &ldquo;{truncateMiddle(ignoredStatus, 20, 20)}&rdquo; ignored. Showing all submissions.
+        </p>
+      )}
 
       {submissions.length === 0 ? (
         <Card>

@@ -25,6 +25,51 @@ import { configRoutes } from "./modules/config/routes.js";
  * indexer is not keeping up: verdicts on the dashboard are stale. */
 const MAX_INDEXER_LAG_LEDGERS = 240;
 
+/** How long one readiness result is served before it is computed again, so
+ * a burst of /health probes costs one RPC call and two queries. */
+const READINESS_CACHE_MS = 5000;
+
+/** Health probes skip the rate limiter. Only the exact health routes do:
+ * the query string is ignored, and any other path starting with /health is
+ * limited like the rest. */
+export function isHealthPath(url: string): boolean {
+  const path = url.split("?")[0];
+  return path === "/health" || path === "/health/live";
+}
+
+type Readiness = { code: number; body: unknown };
+
+async function computeReadiness(): Promise<Readiness> {
+  const database = await check(() => sql`select 1`.execute(db));
+  let latestLedger: number | null = null;
+  const rpc = await check(async () => {
+    latestLedger = (await server.getLatestLedger()).sequence;
+  });
+  let indexerLag: number | null = null;
+  if (database && latestLedger !== null) {
+    const cursor = await db
+      .selectFrom("chain_cursor")
+      .select("last_ledger")
+      .where("contract_id", "=", env.ESCROW_GATE_CONTRACT_ID)
+      .executeTakeFirst();
+    // No cursor yet means the indexer has not run its first poll.
+    if (cursor) indexerLag = Math.max(0, latestLedger - Number(cursor.last_ledger));
+  }
+  const indexer = indexerLag === null || indexerLag <= MAX_INDEXER_LAG_LEDGERS;
+  const ok = database && rpc && indexer;
+  return {
+    code: ok ? 200 : 503,
+    body: {
+      ok,
+      deployment: env.DEPLOYMENT_NAME,
+      network_passphrase: env.NETWORK_PASSPHRASE,
+      escrow_gate_contract_id: env.ESCROW_GATE_CONTRACT_ID,
+      workers: env.RUN_WORKERS,
+      checks: { database, rpc, indexer, indexer_lag_ledgers: indexerLag },
+    },
+  };
+}
+
 async function check(fn: () => Promise<unknown>): Promise<boolean> {
   try {
     await fn();
@@ -44,7 +89,7 @@ export function buildApp() {
   app.register(rateLimit, {
     max: env.RATE_LIMIT_PER_MINUTE,
     timeWindow: "1 minute",
-    allowList: (req) => req.url.startsWith("/health"),
+    allowList: (req) => isHealthPath(req.url),
     keyGenerator: (req) => {
       const header = req.headers.authorization;
       if (header?.startsWith("Bearer ")) {
@@ -86,34 +131,29 @@ export function buildApp() {
   // Liveness: the process is up. Nothing else is implied.
   app.get("/health/live", async () => ({ ok: true }));
 
-  // Readiness: can this instance actually serve true data right now?
-  app.get("/health", async (_req, reply) => {
-    const database = await check(() => sql`select 1`.execute(db));
-    let latestLedger: number | null = null;
-    const rpc = await check(async () => {
-      latestLedger = (await server.getLatestLedger()).sequence;
-    });
-    let indexerLag: number | null = null;
-    if (database && latestLedger !== null) {
-      const cursor = await db
-        .selectFrom("chain_cursor")
-        .select("last_ledger")
-        .where("contract_id", "=", env.ESCROW_GATE_CONTRACT_ID)
-        .executeTakeFirst();
-      // No cursor yet means the indexer has not run its first poll.
-      if (cursor) indexerLag = Math.max(0, latestLedger - Number(cursor.last_ledger));
+  // Readiness: can this instance actually serve true data right now? The
+  // result is cached for READINESS_CACHE_MS, so a caller polling faster than
+  // that sees a state at most that stale. The promise itself is cached, so
+  // requests that arrive during a refresh share one computation; a failed
+  // one is dropped at once instead of being served for the whole TTL.
+  let cachedReadiness: { at: number; value: Promise<Readiness> } | null = null;
+  function readiness(): Promise<Readiness> {
+    const now = Date.now();
+    if (cachedReadiness && now - cachedReadiness.at < READINESS_CACHE_MS) {
+      return cachedReadiness.value;
     }
-    const indexer = indexerLag === null || indexerLag <= MAX_INDEXER_LAG_LEDGERS;
-    const ok = database && rpc && indexer;
-    reply.code(ok ? 200 : 503);
-    return {
-      ok,
-      deployment: env.DEPLOYMENT_NAME,
-      network_passphrase: env.NETWORK_PASSPHRASE,
-      escrow_gate_contract_id: env.ESCROW_GATE_CONTRACT_ID,
-      workers: env.RUN_WORKERS,
-      checks: { database, rpc, indexer, indexer_lag_ledgers: indexerLag },
-    };
+    const entry = { at: now, value: computeReadiness() };
+    cachedReadiness = entry;
+    entry.value.catch(() => {
+      if (cachedReadiness === entry) cachedReadiness = null;
+    });
+    return entry.value;
+  }
+
+  app.get("/health", async (_req, reply) => {
+    const { code, body } = await readiness();
+    reply.code(code);
+    return body;
   });
 
   app.register(wellKnownPlugin);
