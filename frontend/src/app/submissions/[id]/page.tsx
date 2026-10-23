@@ -48,6 +48,20 @@ async function loadArtifact(ref: string | null): Promise<string | null> {
   return artifact ? Buffer.from(artifact.content_base64, "base64").toString("utf8") : null;
 }
 
+type Loaded<T> = { ok: true; value: T } | { ok: false };
+
+/** Runs one optional read so its failure only blanks its own section. A 404/400 is still a
+ * value (null); anything else is logged and reported as not loaded. */
+async function settle<T>(what: string, work: Promise<T>): Promise<Loaded<T>> {
+  try {
+    return { ok: true, value: await work };
+  } catch (err) {
+    unstable_rethrow(err);
+    console.error(`submission page: could not load ${what}`, err);
+    return { ok: false };
+  }
+}
+
 export default async function SubmissionDetailPage({
   params,
 }: {
@@ -61,11 +75,16 @@ export default async function SubmissionDetailPage({
   const isDraft = submission.chain_submission_id === null;
 
   const [proof, attestation, inputText, functionText, outputText] = await Promise.all([
-    backendGetOrNull<ProofStatus>(`/v1/submissions/${id}/proof`),
-    detail.has_attestation ? backendGetOrNull<Attestation>(`/v1/submissions/${id}/attestation`) : null,
-    loadArtifact(submission.input_ref),
-    loadArtifact(submission.function_ref),
-    loadArtifact(submission.claimed_output_ref),
+    settle(`/v1/submissions/${id}/proof`, backendGetOrNull<ProofStatus>(`/v1/submissions/${id}/proof`)),
+    settle(
+      `/v1/submissions/${id}/attestation`,
+      detail.has_attestation
+        ? backendGetOrNull<Attestation>(`/v1/submissions/${id}/attestation`)
+        : Promise.resolve(null)
+    ),
+    settle(`artifact ${submission.input_ref}`, loadArtifact(submission.input_ref)),
+    settle(`artifact ${submission.function_ref}`, loadArtifact(submission.function_ref)),
+    settle(`artifact ${submission.claimed_output_ref}`, loadArtifact(submission.claimed_output_ref)),
   ]);
 
   const deadline = windowDeadlineIso(submission.submitted_at, submission.challenge_window_s);
@@ -162,12 +181,23 @@ export default async function SubmissionDetailPage({
           <ArtifactBlock
             label={submission.task_type === "retrieval" ? "Request spec" : "Input"}
             hash={submission.input_hash}
-            text={inputText}
+            text={inputText.ok ? inputText.value : null}
+            failed={!inputText.ok}
           />
           {submission.task_type === "deterministic" && (
-            <ArtifactBlock label="Function body" hash={submission.function_hash} text={functionText} />
+            <ArtifactBlock
+              label="Function body"
+              hash={submission.function_hash}
+              text={functionText.ok ? functionText.value : null}
+              failed={!functionText.ok}
+            />
           )}
-          <ArtifactBlock label="Claimed output" hash={submission.claimed_output_hash} text={outputText} />
+          <ArtifactBlock
+            label="Claimed output"
+            hash={submission.claimed_output_hash}
+            text={outputText.ok ? outputText.value : null}
+            failed={!outputText.ok}
+          />
         </CardBody>
       </Card>
 
@@ -319,7 +349,7 @@ export default async function SubmissionDetailPage({
         </CardBody>
       </Card>
 
-      {attestation && (
+      {attestation.ok && attestation.value && (
         <Card>
           <CardHeader>
             <h2 className="font-medium">Signed attestation</h2>
@@ -331,20 +361,33 @@ export default async function SubmissionDetailPage({
           </CardHeader>
           <CardBody className="space-y-3 text-sm">
             <dl className="grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-2">
-              {attestation.signer && (
+              {attestation.value.signer && (
                 <Fact label="Signer">
-                  <a href={TESTNET_EXPLORER_ACCOUNT(attestation.signer)} target="_blank" rel="noreferrer" className={`font-mono text-xs ${linkClass}`}>
-                    {truncateMiddle(attestation.signer, 8, 8)}
+                  <a href={TESTNET_EXPLORER_ACCOUNT(attestation.value.signer)} target="_blank" rel="noreferrer" className={`font-mono text-xs ${linkClass}`}>
+                    {truncateMiddle(attestation.value.signer, 8, 8)}
                   </a>
                 </Fact>
               )}
               <Fact label="Signature (ed25519, base64)">
-                <span className="break-all font-mono text-xs text-text-secondary">{attestation.signature}</span>
+                <span className="break-all font-mono text-xs text-text-secondary">{attestation.value.signature}</span>
               </Fact>
             </dl>
             <pre className="max-h-64 overflow-auto rounded-lg border border-border-subtle bg-surface p-3 font-mono text-xs leading-relaxed text-text-secondary">
-              {JSON.stringify(attestation.payload, null, 2)}
+              {JSON.stringify(attestation.value.payload, null, 2)}
             </pre>
+          </CardBody>
+        </Card>
+      )}
+
+      {detail.has_attestation && !attestation.ok && (
+        <Card>
+          <CardHeader>
+            <h2 className="font-medium">Signed attestation</h2>
+          </CardHeader>
+          <CardBody>
+            <p className="text-sm text-text-tertiary">
+              The signed attestation could not be loaded. Reload the page to try again.
+            </p>
           </CardBody>
         </Card>
       )}
@@ -354,11 +397,13 @@ export default async function SubmissionDetailPage({
           <h2 className="font-medium">Proof status</h2>
         </CardHeader>
         <CardBody>
-          {proof?.available ? (
+          {!proof.ok ? (
+            <p className="max-w-prose text-sm text-text-tertiary">Proof status could not be loaded right now.</p>
+          ) : proof.value?.available ? (
             <p className="text-sm text-status-verified">A ZK proof artifact is available.</p>
           ) : (
             <p className="max-w-prose text-sm text-text-secondary">
-              {proof?.reason ??
+              {proof.value?.reason ??
                 "ZK proving is not active in Phase 1. Verdicts come from bonded re-execution, not cryptographic proof."}
             </p>
           )}
@@ -396,14 +441,26 @@ function Fact({ label, children }: { label: string; children: React.ReactNode })
   );
 }
 
-function ArtifactBlock({ label, hash, text }: { label: string; hash: string | null; text: string | null }) {
+function ArtifactBlock({
+  label,
+  hash,
+  text,
+  failed,
+}: {
+  label: string;
+  hash: string | null;
+  text: string | null;
+  failed?: boolean;
+}) {
   return (
     <div>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h3 className="text-sm text-text-secondary">{label}</h3>
         {hash && <span className="font-mono text-xs text-text-tertiary">sha256 {truncateMiddle(hash, 10, 10)}</span>}
       </div>
-      {text === null ? (
+      {failed ? (
+        <p className="mt-2 text-sm text-text-tertiary">Could not be loaded right now.</p>
+      ) : text === null ? (
         <p className="mt-2 text-sm text-text-tertiary">Not stored on this deployment.</p>
       ) : (
         <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border-subtle bg-surface p-3 font-mono text-xs leading-relaxed">
