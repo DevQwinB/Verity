@@ -10,7 +10,7 @@ export async function challengesRoutes(app: FastifyInstance) {
   // the /challenges dashboard page has a real feed of open and resolved
   // challenges, joined with enough submission context to be useful, instead
   // of one-at-a-time lookups with no discovery path.
-  app.get("/v1/challenges", async (req) => {
+  app.get("/v1/challenges", async (req, reply) => {
     const query = z
       .object({
         resolved: z.enum(["true", "false"]).optional(),
@@ -18,9 +18,16 @@ export async function challengesRoutes(app: FastifyInstance) {
         offset: z.coerce.number().int().min(0).optional(),
       })
       .parse(req.query);
-    let qb = db
+    const limit = query.limit ?? 50;
+    const offset = query.offset ?? 0;
+    // Join and filters only: the page and the total are both derived from
+    // this, so the total counts exactly the rows the filters page through.
+    let filtered = db
       .selectFrom("challenge")
-      .innerJoin("submission", "submission.id", "challenge.submission_id")
+      .innerJoin("submission", "submission.id", "challenge.submission_id");
+    if (query.resolved === "true") filtered = filtered.where("challenge.resolved_at", "is not", null);
+    if (query.resolved === "false") filtered = filtered.where("challenge.resolved_at", "is", null);
+    const page = filtered
       .select([
         "challenge.id",
         "challenge.submission_id",
@@ -37,10 +44,19 @@ export async function challengesRoutes(app: FastifyInstance) {
         "submission.chain_submission_id",
       ])
       .orderBy("challenge.opened_at", "desc")
-      .orderBy("challenge.id");
-    if (query.resolved === "true") qb = qb.where("challenge.resolved_at", "is not", null);
-    if (query.resolved === "false") qb = qb.where("challenge.resolved_at", "is", null);
-    return qb.limit(query.limit ?? 50).offset(query.offset ?? 0).execute();
+      .orderBy("challenge.id")
+      .limit(limit)
+      .offset(offset);
+    const [rows, { total }] = await Promise.all([
+      page.execute(),
+      filtered.select((eb) => eb.fn.countAll().as("total")).executeTakeFirstOrThrow(),
+    ]);
+    // Postgres returns count(*) as a bigint string. The body stays a bare
+    // array so existing clients keep working; paging metadata is in headers.
+    reply.header("x-total-count", String(Number(total)));
+    reply.header("x-limit", String(limit));
+    reply.header("x-offset", String(offset));
+    return rows;
   });
 
   app.post("/v1/submissions/:id/challenge", { preHandler: requireAuth }, async (req, reply) => {

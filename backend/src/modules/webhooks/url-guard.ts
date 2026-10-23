@@ -2,7 +2,7 @@ import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
 import { HttpError } from "../../http-error.js";
 
-function isPrivateAddress(ip: string): boolean {
+export function isPrivateAddress(ip: string): boolean {
   if (ip.includes(":")) {
     const v6 = ip.toLowerCase();
     return v6 === "::1" || v6 === "::" || v6.startsWith("fc") || v6.startsWith("fd") || v6.startsWith("fe80") || v6.startsWith("::ffff:");
