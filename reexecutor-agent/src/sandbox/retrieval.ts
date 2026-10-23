@@ -136,11 +136,8 @@ function getPinned(target: PinnedTarget): Promise<{ status: number; body: string
   });
 }
 
-<<<<<<< HEAD
-=======
 const CANONICAL_ARRAY_INDEX = /^(0|[1-9]\d*)$/;
 
->>>>>>> origin/main
 export function resolvePointer(doc: unknown, pointer: string): unknown {
   if (pointer === "") return doc;
   if (!pointer.startsWith("/")) throw new Error(`invalid JSON pointer: ${pointer}`);
