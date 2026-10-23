@@ -1,6 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
-import { BACKEND_URL } from "../../../lib/config";
+import { BACKEND_READ_TIMEOUT_MS, BACKEND_URL } from "../../../lib/config";
 import { readJsonBody, SESSION_COOKIE } from "../../../lib/backend-proxy";
+
+/** The JWT's payload, or null unless it decodes to an object with a string `sub`. */
+function tokenPayload(token: unknown): { sub: string; exp?: unknown } | null {
+  if (typeof token !== "string") return null;
+  const segments = token.split(".");
+  if (segments.length !== 3) return null;
+  try {
+    const payload: unknown = JSON.parse(Buffer.from(segments[1], "base64url").toString("utf8"));
+    if (typeof payload !== "object" || payload === null) return null;
+    const { sub, exp } = payload as { sub?: unknown; exp?: unknown };
+    return typeof sub === "string" ? { sub, exp } : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Step 2 of SEP-10: the client has already signed the challenge with
@@ -12,7 +27,11 @@ import { readJsonBody, SESSION_COOKIE } from "../../../lib/backend-proxy";
 export async function POST(req: NextRequest) {
   const parsed = await readJsonBody(req);
   if (!parsed.ok) return parsed.response;
-  const body = parsed.body;
+  // The backend's POST /auth takes exactly { transaction }; nothing else is passed on.
+  const transaction = (parsed.body as { transaction?: unknown } | null)?.transaction;
+  if (typeof transaction !== "string" || transaction.length === 0) {
+    return NextResponse.json({ error: "transaction required" }, { status: 400 });
+  }
   // Pass the visitor's address on for rate limiting, as forwardedFor in
   // lib/server-api.ts does for server-rendered reads.
   const forwarded = req.headers.get("x-forwarded-for") ?? req.headers.get("x-real-ip");
@@ -24,8 +43,10 @@ export async function POST(req: NextRequest) {
         "content-type": "application/json",
         ...(forwarded ? { "x-forwarded-for": forwarded } : {}),
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ transaction }),
       cache: "no-store",
+      // Verifying the signature doesn't wait on the chain, so a read timeout is enough.
+      signal: AbortSignal.timeout(BACKEND_READ_TIMEOUT_MS),
     });
   } catch {
     return NextResponse.json({ error: "The Verity backend is not reachable right now. Try again in a moment." }, { status: 502 });
@@ -35,7 +56,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: data.error ?? "authentication failed" }, { status: res.status });
   }
 
-  const payload = JSON.parse(Buffer.from(data.token.split(".")[1], "base64url").toString("utf8"));
+  const payload = tokenPayload(data.token);
+  if (!payload) {
+    return NextResponse.json(
+      { error: "The Verity backend returned a session token this dashboard could not read." },
+      { status: 502 },
+    );
+  }
 
   // The cookie must die with the token, whatever lifetime the backend issues:
   // a cookie that outlives the JWT keeps sending a dead token (confusing
