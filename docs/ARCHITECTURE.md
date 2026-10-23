@@ -119,6 +119,31 @@ generated client but as `["Verified"]` through `scValToNative` on a raw event.
 finalised submissions to `pending`. Reuse the mappers; do not hand-roll a new
 decode.
 
+#### Indexer guarantees and gaps
+
+The indexer (`backend/src/workers/indexer.ts`) mirrors on-chain contract events into Postgres. It provides several core guarantees alongside known operational gaps:
+
+**Guarantees:**
+- **Non-overlapping polling and per-event cursor persistence:** `startIndexer(intervalMs = 4000)` polls every 4000 ms in non-overlapping ticks, requesting pages of `PAGE_SIZE = 100` events from `getEvents`. The cursor (`chain_cursor`, keyed by `ESCROW_GATE_CONTRACT_ID`) is persisted after every processed event. If a failure occurs mid-page, the next poll resumes immediately after the last successfully processed event.
+- **Idempotent event handlers:** `handleEvent` handlers upsert records against unique keys derived from on-chain identity (`chain_submission_id`, `(submission, reexecutor)` pairs, etc.). Replaying an event after a crash or restart never duplicates database rows.
+- **Contract is authoritative (chain wins):** The indexer never invents or overrides verdicts. All terminal state transitions route through `recordTerminalVerdict`, which verifies the contract's reported `resolution_method`.
+
+**Operational gaps & consequences:**
+- **100-ledger lookback on first start:** When starting on a fresh database with no stored cursor, `getCursor` begins at `Math.max(latest.sequence - 100, 1)` (roughly 100 ledgers or ~8 minutes).
+  *Consequence:* Any events emitted more than ~100 ledgers before the database was initialized are never indexed; earlier history is not shown.
+- **Direct on-chain submissions without a draft are ignored:** When processing `submission_created`, the indexer matches by `chain_submission_id` or the draft's `chain_tx_hash`. If no matching draft exists in the database, the event is ignored because there are no off-chain artifacts to fetch or replay. Similarly, drafts purged after `DRAFT_TTL_S` (3600 s) by `purgeDraftsOnce` will be ignored if their transaction confirms late.
+  *Consequence:* Submissions submitted directly on-chain without using the backend API are intentionally untracked.
+- **Events with missing parent rows are dropped:** Events such as `replay_attested`, `challenge_opened`, `challenge_resolved`, `finalized`, and `slashed` require their corresponding parent submission or re-executor rows to exist in Postgres; if absent, the event is dropped.
+  *Consequence:* If a parent record is not in the database, subsequent child events cannot be linked or backfilled through normal polling.
+- **Cursor reset after falling behind RPC retention:** If the indexer is offline longer than the RPC event retention window (~7 days), `getEvents` throws. `pollOnce` detects that `cursor.ledger < health.oldestLedger` and jumps the cursor forward to `Math.min(Math.max(cursor.ledger, health.oldestLedger + 10), health.latestLedger)`.
+  *Consequence:* Events occurring between the old cursor and the new retention boundary are permanently skipped and never read by the indexer.
+- **Five-failure give-up rule:** If processing a specific event throws an unhandled error across `MAX_EVENT_RETRIES = 5` consecutive attempts, the indexer logs an error, drops the event, and advances the cursor.
+  *Consequence:* A permanently corrupt or unprocessable event will not wedge the indexer loop forever, but that specific event's database state is skipped.
+- **Limited repair scope of `reconcileOnce`:** Every 10 seconds, `reconcileOnce` (`backend/src/workers/scheduler.ts`) checks tracked submissions in `pending` or `disputed` state and updates them if the on-chain contract is already finalised.
+  *Consequence:* A dashboard row stuck `pending` while the chain is finalised will be repaired on the next reconcile pass, but `reconcileOnce` does not backfill votes, challenges, slashes, or untracked submissions.
+- **Settlement grace period for missing votes:** When a submission is settled, `settleOnce` waits up to `SETTLE_GRACE_S = 600` seconds for all on-chain votes to be indexed. Once this grace period expires, it settles with whatever votes have been recorded.
+  *Consequence:* A missing vote row can leave an attestation listing fewer votes than the contract actually holds on-chain; unindexed voter locks must be released manually via `release_attestation_lock()`.
+
 ### Re-executor agent (`reexecutor-agent/src/`)
 
 Each agent holds one staked account's secret key and loops:

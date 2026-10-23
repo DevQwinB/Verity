@@ -178,6 +178,101 @@ and use "Fund my testnet account" on the home page. Then:
 - Open a pending submission to challenge it while its window is open.
 - A re-executor can withdraw stake from its own page.
 
+## Writing replayable work
+
+Work submitted to Verity must be deterministic: honest re-executors independently
+reproduce the output and vote on whether it matches the claimed output hash.
+Depending on the task type, replay runs either in a sandboxed WebAssembly JavaScript
+runtime or as a guarded HTTP retrieval spot-check.
+
+### Deterministic tasks
+
+Deterministic tasks run in a sandboxed JavaScript runtime:
+
+1. **Function body shape.** The function source must be a JavaScript function body,
+   not an entire module or function declaration. It runs as `(function(input){ ... })(__input)`.
+   To return an answer, use `return`.
+2. **Arguments and global scope.** The input artifact is parsed as JSON and passed as
+   the `input` argument. It is also available as the global `__input`.
+3. **Sandbox engine.** QuickJS compiled to WebAssembly (`quickjs-emscripten`),
+   executed in an isolated worker thread with an empty environment (`env: {}`) and
+   a fresh runtime instance per replay.
+4. **Environment and globals.** `Date` and `Math.random` are explicitly deleted
+   before execution, so calling `new Date()` or `Math.random()` throws. Other `Math`
+   functions remain available. Standard platform globals such as `console`,
+   `setTimeout`, `fetch`, `process`, and `require` are absent (`typeof` each is
+   `"undefined"`).
+5. **Execution limits.**
+   - Memory: 64 MiB (`64 * 1024 * 1024` bytes).
+   - Stack: 128 KiB (`128 * 1024` bytes).
+   - Computation: 1000 interrupt checks (ticks). This provides a computation budget
+     of a few seconds of busy loops; loops that exceed this fail with `computation budget exceeded`.
+   - Output size: serialized output can be at most 1,000,000 bytes.
+   - Wall-clock timeout: 20 s host kill switch. This is a host-level safety timeout
+     rather than an engine limit; if triggered, the re-executor considers its host
+     overloaded, casts no vote, and retries later (`ReplayInfrastructureError`). It does
+     not count as a mismatch against the submission.
+6. **Failure handling.** If the function throws an exception or exceeds an engine limit
+   (memory, stack, computation budget, or output size), the re-executor produces a
+   32-zero-byte output hash, which never matches a legitimate claimed output hash and
+   results in a mismatch vote.
+7. **Return values and JSON serialization.** The return value is serialized via `JSON.stringify`:
+   - A function that returns nothing (`undefined`) yields `null`.
+   - `NaN` and `Infinity` serialize to `null`.
+   - Object properties with `undefined` values are omitted.
+   - Returning a `BigInt` throws an error and counts as a mismatch.
+   - Async functions returning a `Promise` serialize to `{}`. Write synchronous code.
+8. **Artifact upload limits.** Each artifact (function, input, claimed output) may be
+   at most 262144 bytes (`ARTIFACT_MAX_BYTES`). The API request body limit is 1 MiB.
+
+### Canonical JSON and claimed outputs
+
+9. **Hashing format.** Outputs are hashed as canonical JSON: object keys sorted
+   recursively, no whitespace, `undefined`-valued object properties omitted, and
+   hashed with SHA-256.
+10. **Dashboard input formatting.** The dashboard "Claimed output" field parses input
+    as JSON if valid; otherwise, trimmed text is treated as a JSON string and canonicalized.
+    Formatting whitespace does not affect the hash: `{"doubled": 42}` and `{ "doubled":42 }`
+    produce identical hashes. Numeric formatting follows `JSON.stringify` (e.g. `1.0` is `1`).
+11. **Worked example.**
+    - Input artifact: `{"n": 21}`
+    - Function body: `return { doubled: input.n * 2 };`
+    - Claimed output: `{"doubled": 42}`
+    - Verification locally (from `reexecutor-agent/`):
+      ```bash
+      pnpm exec tsx -e '(async () => { const { runDeterministicFunction } = await import("./src/sandbox/runner.ts"); console.log(await runDeterministicFunction("return { doubled: input.n * 2 };", { n: 21 })); process.exit(0); })()'
+      ```
+      This evaluates the function and outputs `output: { doubled: 42 }` along with its
+      canonical `outputHash`.
+
+### Retrieval tasks
+
+12. **Spec format.** The input artifact must be JSON conforming to `{"url": "...", "pointer"?: "/..."}`.
+    Invalid JSON or a missing string `url` counts as a mismatch.
+13. **HTTP request rules.** The re-executor issues a single `GET` request with
+    `accept: application/json, text/plain;q=0.9, */*;q=0.1` and no credentials, auth headers,
+    or cookies. The endpoint must be publicly accessible without authentication.
+    Only `http:` and `https:` schemes are supported. The URL must resolve to a public IP
+    address: loopback, private, and link-local IP addresses are rejected, and the request
+    connects directly to the validated IP.
+14. **Redirects and response codes.** Redirects are not followed; HTTP 3xx status codes
+    are treated as a mismatch. HTTP 4xx status codes or other non-2xx responses are also
+    mismatches. Responses with status 5xx, 408, 429, timeouts, or network errors are
+    treated as transient: the worker retries for up to `min(RETRIEVAL_RETRY_BUDGET_S, challenge window / 2)`
+    seconds (default `RETRIEVAL_RETRY_BUDGET_S` is 120 s), verifies its own network
+    connectivity, and only votes mismatch if its own connectivity is intact. Each HTTP request
+    times out after 10 s, and response bodies are capped at 1,000,000 bytes.
+15. **JSON pointers.** If the response body is JSON, an optional RFC 6901 pointer (e.g. `/data/0/price`)
+    selects the targeted value (`~1` escapes `/`, `~0` escapes `~`). The pointer must start
+    with `/`; an empty pointer `""` selects the entire document. A pointer that fails to resolve
+    or is specified on non-JSON content is a mismatch. If no pointer is specified, the full parsed
+    JSON body is used; if the body is not JSON, the raw response text string is used.
+16. **Text whitespace caveat.** The dashboard trims plain-text claimed output, whereas a
+    re-executor checks the raw untrimmed response body when no pointer is specified. An endpoint
+    returning text ending with a newline will not match trimmed text; prefer JSON responses
+    with a JSON pointer. In addition, endpoints whose content changes between the submission
+    and re-execution will produce a mismatch.
+
 ## Contracts
 
 ```bash
@@ -227,8 +322,245 @@ GET  /v1/reports/verification-rates
 POST /v1/marketplaces, POST /v1/marketplaces/:id/webhooks
 ```
 
-Webhooks (HMAC-SHA256 in `x-verity-signature`): `submission.verified`,
-`submission.slashed`, `submission.disputed`.
+See [Webhooks](#webhooks) for registration, payloads and signature verification.
+
+### Webhooks
+
+Webhooks notify the marketplace associated with the account that submitted the
+work. `POST /v1/submissions` finds or creates this marketplace for the
+authenticated submitting Stellar account. Alternatively,
+`POST /v1/marketplaces` (bearer token; `{"name":"My marketplace"}`) creates
+or returns that account's marketplace.
+
+Register a subscription with
+`POST /v1/marketplaces/:id/webhooks`, using a bearer token belonging to that
+marketplace's Stellar account:
+
+```json
+{
+  "url": "https://example.org/verity-webhook",
+  "secret": "replace-with-a-long-random-secret",
+  "events": ["submission.verified", "submission.slashed", "submission.disputed"]
+}
+```
+
+The request requires a valid URL, a `secret` of at least 8 characters, and
+a non-empty `events` array of strings. The marketplace ID is a UUID; only its
+own account may register a webhook (otherwise HTTP 403). A successful
+registration returns the subscription row with HTTP 201. Event names are not
+validated at registration: unknown names are accepted but never delivered.
+
+| Event | When emitted | `data` |
+| --- | --- | --- |
+| `submission.verified` | First transition into the `verified` terminal status | `submission_id`, `status: "verified"`, `tx_hash` |
+| `submission.slashed` | First transition into the `slashed` terminal status | `submission_id`, `status: "slashed"`, `tx_hash` |
+| `submission.disputed` | When a new on-chain challenge is first recorded | `submission_id`, `status: "disputed"`, `tx_hash` |
+
+The `submission_id` is Verity's submission **UUID**, not its numeric on-chain
+submission ID. `tx_hash` is the relevant finalize/resolve or challenge
+transaction hash and can be `null` if a terminal verdict is first observed
+by reconciliation. The `expired_unverified` terminal status sends **no**
+webhook. A `submission.verified` event can result from a window expiring
+without consensus; inspect the submission's `resolution_method` via
+`GET /v1/submissions/:id` to distinguish how the verdict was reached.
+
+Each delivery is an HTTP `POST` with `content-type: application/json` and
+`x-verity-signature`, containing the UTF-8 JSON serialization
+`JSON.stringify({ event: eventType, data: payload })`. For example, this is
+only a **shape example**; the identifiers below are placeholders:
+
+```json
+{
+  "event": "submission.verified",
+  "data": {
+    "submission_id": "<verity-submission-uuid>",
+    "status": "verified",
+    "tx_hash": null
+  }
+}
+```
+
+`x-verity-signature` is the **lowercase hexadecimal HMAC-SHA256** digest
+using the registration `secret` as the key and the **exact raw request-body
+bytes** as input. Verify before parsing JSON: re-serializing a parsed object
+may change the signed bytes. A valid HMAC shows that a holder of the shared
+secret authenticated these bytes; it does not prove the verdict or other
+payload data is correct. Any holder of the secret can generate signatures.
+This minimal Node.js receiver verifies the
+header using a constant-time comparison:
+
+```js
+import { createServer } from "node:http";
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const secret = process.env.VERITY_WEBHOOK_SECRET;
+if (!secret || secret.length < 8) throw new Error("Set VERITY_WEBHOOK_SECRET");
+
+createServer(async (req, res) => {
+  if (req.method !== "POST") {
+    res.writeHead(405).end();
+    return;
+  }
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const rawBody = Buffer.concat(chunks);
+  const provided = req.headers["x-verity-signature"];
+  const expected = createHmac("sha256", secret).update(rawBody).digest();
+
+  const valid = typeof provided === "string"
+    && /^[0-9a-f]{64}$/.test(provided)
+    && timingSafeEqual(Buffer.from(provided, "hex"), expected);
+  if (!valid) {
+    res.writeHead(401).end();
+    return;
+  }
+
+  const message = JSON.parse(rawBody.toString("utf8"));
+  console.log(message.event, message.data);
+  res.writeHead(204).end();
+}).listen(8080);
+```
+
+**URL rule: public addresses only.** Use a publicly reachable `http:` or
+`https:` receiver URL whose host resolves. At registration, an unresolvable
+host or an address rejected by `assertPublicHttpUrl` returns HTTP 400.
+The guard rejects private, loopback and link-local addresses it recognizes.
+Its checks do not cover every non-public IP range, so passing validation is
+not a comprehensive network isolation guarantee.
+The address check runs both at registration and immediately before delivery.
+Redirects are not followed: any redirect fails the delivery.
+
+**Delivery is best-effort: one attempt, no retry.** A delivery times out
+after 30 seconds. HTTP 2xx counts as delivered; other responses, timeouts,
+redirects, and transport failures count as failed. The backend records
+delivery attempts internally but provides no delivery-history API.
+Dispatch is awaited inline during verdict handling. Failed HTTP responses
+and transport errors are recorded in `webhook_delivery` and logged;
+unexpected dispatcher rejections also reach callers' error logs.
+No delivery to a receiver is guaranteed.
+
+
+### Verify an attestation
+
+Fetch `GET /v1/submissions/:id/attestation` using Verity's submission UUID,
+not the on-chain submission ID. Replace the example UUID below with a real
+settled submission from your backend:
+
+```bash
+curl --fail-with-body http://localhost:3001/v1/submissions/00000000-0000-0000-0000-000000000000/attestation
+```
+
+A non-UUID ID returns HTTP 400. HTTP 404 means no attestation exists yet:
+it is issued in the settlement pass after a terminal verdict and release of
+indexed attestation locks, not immediately on finalisation.
+
+The response contains `payload`, `canonical`, `signature`,
+`signature_algorithm`, `signer`, `delivered_to` and `issued_at`:
+
+- `canonical` is the exact UTF-8 string that was signed: canonical JSON of
+  `payload`, with object keys sorted recursively and no whitespace. The API
+  recomputes it from the stored payload. Verify these bytes directly and
+  confirm that the response `payload` canonicalizes to the same string;
+  verifying the signature on `canonical` alone does **not** authenticate
+  a separately modified `payload`.
+- `signature` is the base64-encoded raw 64-byte ed25519 signature;
+  `signature_algorithm` is `"ed25519"`.
+- `signer` is the keeper's Stellar G-address, also recorded as
+  `payload.attestor.stellar_account`. Pin it to the expected
+  `keeper_public_key` in your trusted `deployments/<name>.json`. If the
+  keeper rotates, **independently** verify the replacement public key with
+  your deployment operator and explicitly pin it with
+  `TRUSTED_KEEPER_PUBLIC_KEY` for new attestations. Keep the old pin for
+  historical records: the deployment JSON may retain the original key.
+  Never derive a trusted key from this unverified response.
+- `delivered_to` is `null`: the record is signed and served by the API,
+  with nothing pushed to Stellar 8004 or any other registry.
+
+The signed `verity.attestation.v2` payload identifies the network and
+EscrowGate contract, attestor, subject (agent, escrow reference, Verity UUID
+and chain submission ID), claim (task type, verdict, resolution method and
+indexed attestations), submit/finalise transaction hashes and `issued_at`.
+Each claim attestation contains `reexecutor`, `matched` and `tx_hash`.
+Verdicts are `verified`, `slashed` or `expired_unverified`.
+`payload.issued_at` is inside the signed bytes; the response-level
+`issued_at` is the database export time and is **not** signed.
+
+From the repository root after `pnpm install`, run this Node.js example.
+Set `SUBMISSION_ID` to a real settled UUID. `API` defaults to the local
+backend; `DEPLOYMENT` selects the trusted deployment file (default `testnet`).
+If your keeper rotated, first verify its **new** G-address through a
+separately authenticated operator/deployment channel, then run the example
+with `TRUSTED_KEEPER_PUBLIC_KEY=G...` to explicitly trust it. Do not set the
+override to `att.signer` or copy the response value before verifying its
+provenance. An old attestation must still be checked against its old key.
+Select the **trusted deployment configuration for the specific submission**,
+not one supplied by an untrusted API. A valid signature alone does not
+prove that the attestation concerns the UUID or contract you requested.
+
+```bash
+SUBMISSION_ID=00000000-0000-0000-0000-000000000000 node --input-type=module <<'JS'
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+const require = createRequire(new URL("./backend/package.json", import.meta.url));
+const { Keypair } = require("@stellar/stellar-sdk");
+
+const API = process.env.API ?? "http://localhost:3001";
+const id = process.env.SUBMISSION_ID;
+if (!id) throw new Error("Set SUBMISSION_ID to a settled Verity submission UUID");
+const deployment = JSON.parse(readFileSync(
+  `deployments/${process.env.DEPLOYMENT ?? "testnet"}.json`, "utf8"
+));
+const response = await fetch(`${API}/v1/submissions/${encodeURIComponent(id)}/attestation`);
+if (!response.ok) throw new Error(`Attestation HTTP ${response.status}: ${await response.text()}`);
+const att = await response.json();
+if (att.signature_algorithm !== "ed25519") throw new Error("Unexpected algorithm");
+const trustedSigner = process.env.TRUSTED_KEEPER_PUBLIC_KEY ?? deployment.keeper_public_key;
+if (!trustedSigner || att.signer !== trustedSigner)
+  throw new Error("Unexpected keeper signer");
+const key = Keypair.fromPublicKey(att.signer);
+const signature = Buffer.from(att.signature, "base64");
+// Mirror backend/src/chain/canonical.ts; compare before trusting att.payload.
+function canonicalJson(value) {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(",")}}`;
+}
+if (typeof att.canonical !== "string" || canonicalJson(att.payload) !== att.canonical)
+  throw new Error("Attestation payload does not match signed canonical bytes");
+if (att.payload?.attestor?.stellar_account !== att.signer)
+  throw new Error("Attestation signer does not match attestor");
+const message = Buffer.from(att.canonical, "utf8");
+if (signature.length !== 64 || !key.verify(message, signature))
+  throw new Error("Invalid attestation signature");
+if (key.verify(Buffer.concat([message, Buffer.from(" ")]), signature))
+  throw new Error("Tampered canonical string unexpectedly verified");
+// Bind the authenticated bytes to this request and the selected deployment.
+if (att.payload?.schema !== "verity.attestation.v2")
+  throw new Error("Unexpected attestation schema");
+if (att.payload?.subject?.submission_id !== id)
+  throw new Error("Attestation does not belong to the requested submission");
+if (typeof deployment.network_passphrase !== "string" ||
+    !deployment.network_passphrase ||
+    att.payload.network_passphrase !== deployment.network_passphrase)
+  throw new Error("Attestation network does not match the trusted deployment");
+if (typeof deployment.escrow_gate_contract_id !== "string" ||
+    !deployment.escrow_gate_contract_id ||
+    att.payload.escrow_gate_contract_id !== deployment.escrow_gate_contract_id)
+  throw new Error("Attestation contract does not match the trusted deployment");
+console.log("Signature valid; signer, submission and deployment context verified");
+JS
+```
+
+A valid signature shows that Verity's keeper key attested to these verdict
+record bytes; it is not a cryptographic proof of correctness. Check the
+signed record's `finalize_tx_hash` and the contract for the verdict itself:
+the contract is the authority. `claim.attestations` contains only votes the
+backend indexed as `confirmed_onchain`, ordered by transaction hash. If the
+indexer is missing votes, settlement waits up to 600 seconds, then may issue
+the record with incomplete evidence. Read the on-chain submission for the
+full tally.
 
 ## Known limits
 
@@ -241,9 +573,10 @@ Webhooks (HMAC-SHA256 in `x-verity-signature`): `submission.verified`,
 - **Voter set.** Stake is free on testnet, so an open voter set could be
   captured at no cost. Deployments here run with `reexecutor_allowlist` on:
   the admin approves which staked accounts may vote.
-- **Sandbox limits.** A replayed function gets 64 MB, a small compute budget,
-  no clock and no randomness. Exceeding a limit is a mismatch. A function that
-  stalls a re-executor's host without exceeding one gets no vote from it.
+- **Sandbox limits.** Replay limits and constraints are detailed in
+  [Writing replayable work](#writing-replayable-work). Exceeding an engine
+  limit or throwing is a mismatch. A function that stalls a re-executor's host
+  without exceeding an engine limit gets no vote from it.
 - **Assignment** is deterministic and auditable but uniform, not
   stake-weighted. It only picks re-executors whose worker is online, and asks
   another when one goes quiet.

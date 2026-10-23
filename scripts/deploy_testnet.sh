@@ -13,6 +13,8 @@
 #   --public            mark the deployment as one real users are on; the dev
 #                       runner and smoke test will refuse to touch it
 #   --force             replace an existing deployments/<name>.json
+#   --replace-public    required in addition to --force when replacing a deployment
+#                       record marked "public": true
 #   VERITY_GATE_CONFIG  full EscrowGate ConfigRecord JSON, to override defaults
 set -euo pipefail
 
@@ -23,10 +25,12 @@ source "$ROOT_DIR/scripts/_deployment.sh"
 
 PUBLIC=false
 FORCE=0
+REPLACE_PUBLIC=0
 for arg in "$@"; do
   case "$arg" in
     --public) PUBLIC=true ;;
     --force) FORCE=1 ;;
+    --replace-public) REPLACE_PUBLIC=1 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
@@ -35,6 +39,14 @@ if [ -f "$DEPLOY_JSON" ] && [ "$FORCE" != 1 ]; then
   echo "FATAL: $DEPLOY_JSON already exists." >&2
   echo "       Deploying again creates new contracts and orphans every stake and" >&2
   echo "       submission on the current ones. Re-run with --force if that is intended." >&2
+  exit 1
+fi
+
+if [ -f "$DEPLOY_JSON" ] && deployment_is_public && [ "$REPLACE_PUBLIC" != 1 ]; then
+  echo "FATAL: $DEPLOY_JSON is marked public." >&2
+  echo "       Replacing it creates new contracts and abandons all existing stakes and" >&2
+  echo "       submissions on the public contracts. Re-run with --force --replace-public" >&2
+  echo "       if you genuinely intend to replace the public deployment." >&2
   exit 1
 fi
 
@@ -88,6 +100,22 @@ WASM_DIR="$CONTRACTS_DIR/target/wasm32v1-none/release"
 GATE_WASM="$WASM_DIR/escrow_gate.wasm"
 REGISTRY_WASM="$WASM_DIR/zk_verifier_registry.wasm"
 
+RECOVERY_FILE="$(mktemp "${TMPDIR:-/tmp}/verity-$DEPLOYMENT-deploy.XXXXXX")"
+cleanup_recovery() {
+  local exit_code=$?
+  if [ "$exit_code" -ne 0 ] && [ -s "$RECOVERY_FILE" ]; then
+    echo "======================================================================" >&2
+    echo "FATAL: Deployment failed after deploying one or more contracts!" >&2
+    echo "Contract IDs saved to recovery file: $RECOVERY_FILE" >&2
+    echo "Contents:" >&2
+    cat "$RECOVERY_FILE" >&2
+    echo "======================================================================" >&2
+  elif [ "$exit_code" -eq 0 ]; then
+    rm -f "$RECOVERY_FILE"
+  fi
+}
+trap cleanup_recovery EXIT
+
 echo "==> Deploying EscrowGate"
 GATE_ID=$(stellar contract deploy \
   --wasm "$GATE_WASM" \
@@ -98,6 +126,7 @@ GATE_ID=$(stellar contract deploy \
   --bond_asset "$NATIVE_SAC" \
   --config "$GATE_CONFIG")
 echo "EscrowGate contract id: $GATE_ID"
+echo "escrow_gate_contract_id=$GATE_ID" >> "$RECOVERY_FILE"
 
 # EscrowGate does not consult the registry in Phase 1 (resolve_challenge
 # rejects ZkProof); it is deployed as the anchor Phase 2 verifiers register in.
@@ -109,6 +138,7 @@ REGISTRY_ID=$(stellar contract deploy \
   -- \
   --admin "$DEPLOYER_ADDR")
 echo "ZKVerifierRegistry contract id: $REGISTRY_ID"
+echo "zk_verifier_registry_contract_id=$REGISTRY_ID" >> "$RECOVERY_FILE"
 
 echo "==> Asserting ZKVerifierRegistry is genuinely empty (Phase 1 requirement)"
 LIST_OUT=$(stellar contract invoke \
@@ -130,10 +160,13 @@ BOOTSTRAP_JSON="${BOOTSTRAP_JSON%,}]"
 
 CHALLENGER_JSON=""
 if [ "$DEPLOYMENT" = testnet ]; then
-  CHALLENGER_JSON="  \"challenger_public_key\": \"$(stellar keys address challenger1)\","$'\n'
+  CHALLENGER_ADDR=$(stellar keys address challenger1)
+  CHALLENGER_JSON="  \"challenger_public_key\": \"$CHALLENGER_ADDR\","$'\n'
 fi
 
-cat > "$DEPLOY_JSON" <<EOF
+KEEPER_ADDR=$(stellar keys address "$KEEPER")
+
+cat > "$DEPLOY_JSON.tmp" <<EOF
 {
   "deployment": "$DEPLOYMENT",
   "public": $PUBLIC,
@@ -143,11 +176,12 @@ cat > "$DEPLOY_JSON" <<EOF
   "zk_verifier_registry_contract_id": "$REGISTRY_ID",
   "native_xlm_sac_address": "$NATIVE_SAC",
   "deployer_public_key": "$DEPLOYER_ADDR",
-  "keeper_public_key": "$(stellar keys address "$KEEPER")",
+  "keeper_public_key": "$KEEPER_ADDR",
 ${CHALLENGER_JSON}  "bootstrap_reexecutors": $BOOTSTRAP_JSON,
   "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
+mv "$DEPLOY_JSON.tmp" "$DEPLOY_JSON"
 echo "==> Wrote $DEPLOY_JSON"
 echo ""
 echo "Secret keys for all generated identities live in ~/.config/stellar/identity/*.toml"

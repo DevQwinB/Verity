@@ -19,10 +19,13 @@ const MAX_BODY_BYTES = 1_000_000;
 const TIMEOUT_MS = 10_000;
 
 /**
- * The target could not be reached, or answered in a way that says "try
- * again" (5xx, 408, 429). That may be the target, or it may be this host's
- * network — and a vote is irreversible — so the caller retries for a while
- * and then checks its own connectivity before concluding anything.
+ * The target could not be reached (DNS failure including ENOTFOUND, network error),
+ * or answered in a way that says "try again" or is inconclusive (>= 500, 408,
+ * 429, 401, 403, 451). That may be the target, or it may be this host's
+ * resolver, network or IP range — and a vote is irreversible — so the caller
+ * retries for a while and then checks its own connectivity before concluding
+ * anything (after the retry budget a still-failing target is voted as a
+ * mismatch).
  */
 export class RetrievalTransientError extends Error {}
 
@@ -73,9 +76,9 @@ async function resolvePublicTarget(raw: string): Promise<PinnedTarget> {
       addresses = await lookup(host, { all: true });
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      // The name does not exist: that is an answer. Anything else (timeout,
-      // server failure) is the resolver, not the target.
-      if (code === "ENOTFOUND") throw new Error(`retrieval host ${host} does not exist`);
+      // The resolver on this host can answer NXDOMAIN wrongly (e.g. captive
+      // portal or flaky DNS), and a vote is irreversible: treat failure to resolve
+      // as inconclusive rather than an immediate mismatch.
       throw new RetrievalTransientError(`could not resolve ${host}: ${code ?? (err as Error).message}`);
     }
   }
@@ -148,10 +151,21 @@ function resolvePointer(doc: unknown, pointer: string): unknown {
 }
 
 /**
+ * Returns true if an HTTP status indicates an inconclusive result (e.g. rate limit,
+ * transient server error, or client IP-specific restriction like WAF/geo-block:
+ * 401, 403, 408, 429, 451, or >= 500).
+ */
+export function isInconclusiveStatus(status: number): boolean {
+  return status >= 500 || status === 408 || status === 429 || status === 401 || status === 403 || status === 451;
+}
+
+/**
  * Re-issues the declared request. Throws a plain Error for an outcome that
  * settles the question against the submission (bad spec, private target,
- * redirect, 4xx, oversize, pointer that does not resolve), and a
- * RetrievalTransientError for one that does not.
+ * redirect, definitive 4xx like 404/410, oversize, pointer that does not resolve), and a
+ * RetrievalTransientError for one that is inconclusive (unresolvable host, target
+ * unreachable, >= 500, 408, 429, 401, 403, 451).
+ * After the retry budget a still-failing target is voted as a mismatch.
  */
 export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: string; output: unknown; engine: string }> {
   if (!spec || typeof spec.url !== "string") {
@@ -162,7 +176,7 @@ export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: s
   // A redirect could bounce to a private address, and a moved resource is a
   // legitimate mismatch anyway: the agent declared this URL, not another.
   if (res.status >= 300 && res.status < 400) throw new Error(`retrieval target redirected (HTTP ${res.status})`);
-  if (res.status >= 500 || res.status === 408 || res.status === 429) {
+  if (isInconclusiveStatus(res.status)) {
     throw new RetrievalTransientError(`retrieval target answered HTTP ${res.status}`);
   }
   if (res.status < 200 || res.status >= 300) throw new Error(`retrieval target answered HTTP ${res.status}`);
