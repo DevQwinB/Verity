@@ -5,14 +5,18 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   contracts:
-    name: Contracts (cargo test)
+    name: Contracts (clippy, wasm build, test)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: contracts
@@ -23,11 +27,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: contracts
-      - run: cargo test
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo build --locked --release --target wasm32v1-none -p escrow-gate -p zk-verifier-registry
+      - run: cargo test --locked
 
   typescript:
     name: TypeScript (typecheck, lint, build)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -46,6 +53,7 @@ jobs:
   images:
     name: Container images build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: docker build -f backend/Dockerfile -t verity-backend .

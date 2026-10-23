@@ -21,7 +21,7 @@ Object.assign(process.env, {
   NETWORK_PASSPHRASE: Networks.TESTNET,
   ESCROW_GATE_CONTRACT_ID: GATE,
   ZK_VERIFIER_REGISTRY_CONTRACT_ID: StrKey.encodeContract(Buffer.alloc(32)),
-  BOND_ASSET_CONTRACT_ID: "unused",
+  BOND_ASSET_CONTRACT_ID: StrKey.encodeContract(Buffer.alloc(32)),
   DATABASE_URL: "postgres://unused:unused@127.0.0.1:1/unused",
   KEEPER_SECRET_KEY: Keypair.random().secret(),
   JWT_SECRET: "a".repeat(32),

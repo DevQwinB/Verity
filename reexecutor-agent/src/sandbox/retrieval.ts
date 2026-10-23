@@ -19,12 +19,13 @@ const MAX_BODY_BYTES = 1_000_000;
 const TIMEOUT_MS = 10_000;
 
 /**
- * The target could not be reached, or answered in a way that says "try
- * again" or is inconclusive (>= 500, 408, 429, 401, 403, 451). That may be
- * the target, or it may be this host's network or IP range — and a vote is
- * irreversible — so the caller retries for a while and then checks its own
- * connectivity before concluding anything (after the retry budget a
- * still-failing target is voted as a mismatch).
+ * The target could not be reached (DNS failure including ENOTFOUND, network error),
+ * or answered in a way that says "try again" or is inconclusive (>= 500, 408,
+ * 429, 401, 403, 451). That may be the target, or it may be this host's
+ * resolver, network or IP range — and a vote is irreversible — so the caller
+ * retries for a while and then checks its own connectivity before concluding
+ * anything (after the retry budget a still-failing target is voted as a
+ * mismatch).
  */
 export class RetrievalTransientError extends Error {}
 
@@ -75,9 +76,9 @@ async function resolvePublicTarget(raw: string): Promise<PinnedTarget> {
       addresses = await lookup(host, { all: true });
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      // The name does not exist: that is an answer. Anything else (timeout,
-      // server failure) is the resolver, not the target.
-      if (code === "ENOTFOUND") throw new Error(`retrieval host ${host} does not exist`);
+      // The resolver on this host can answer NXDOMAIN wrongly (e.g. captive
+      // portal or flaky DNS), and a vote is irreversible: treat failure to resolve
+      // as inconclusive rather than an immediate mismatch.
       throw new RetrievalTransientError(`could not resolve ${host}: ${code ?? (err as Error).message}`);
     }
   }
@@ -162,7 +163,8 @@ export function isInconclusiveStatus(status: number): boolean {
  * Re-issues the declared request. Throws a plain Error for an outcome that
  * settles the question against the submission (bad spec, private target,
  * redirect, definitive 4xx like 404/410, oversize, pointer that does not resolve), and a
- * RetrievalTransientError for one that is inconclusive (>= 500, 408, 429, 401, 403, 451).
+ * RetrievalTransientError for one that is inconclusive (unresolvable host, target
+ * unreachable, >= 500, 408, 429, 401, 403, 451).
  * After the retry budget a still-failing target is voted as a mismatch.
  */
 export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: string; output: unknown; engine: string }> {
