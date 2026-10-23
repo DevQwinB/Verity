@@ -26,6 +26,53 @@ fi
 DEPLOYER_ADDR=$(stellar keys address "$DEPLOYER")
 echo "==> EscrowGate: $GATE_ID (deployment '$DEPLOYMENT')"
 
+cfg_output=$(stellar contract invoke \
+  --id "$GATE_ID" --source "$DEPLOYER" --network "$NETWORK" \
+  -- get_config)
+
+min_floor_raw=$(echo "$cfg_output" | grep -o '"min_stake_floor": *"[0-9]*"' | grep -o '[0-9]*' || true)
+if [ -z "$min_floor_raw" ]; then
+  # Fallback for integer JSON without quotes
+  min_floor_raw=$(echo "$cfg_output" | grep -o '"min_stake_floor": *[0-9]*' | grep -o '[0-9]*' || true)
+fi
+
+if [ -z "$min_floor_raw" ]; then
+  echo "FATAL: could not parse min_stake_floor from get_config output: $cfg_output" >&2
+  exit 1
+fi
+
+TARGET_STAKE="$STAKE_AMOUNT"
+if [ "$min_floor_raw" -gt "$TARGET_STAKE" ]; then
+  TARGET_STAKE="$min_floor_raw"
+fi
+echo "==> Target stake per re-executor: $TARGET_STAKE stroops (min_stake_floor: $min_floor_raw)"
+
+read_stake() {
+  local raw="$1"
+  local alias_name="$2"
+  # Clean un-registered cases: null, empty string, or "null" literal
+  local trimmed
+  trimmed=$(echo "$raw" | tr -d '[:space:]')
+  if [ -z "$trimmed" ] || [ "$trimmed" = "null" ]; then
+    echo "0"
+    return 0
+  fi
+
+  local parsed
+  parsed=$(echo "$raw" | grep -o '"stake_amount": *"[0-9]*"' | grep -o '[0-9]*' || true)
+  if [ -z "$parsed" ]; then
+    parsed=$(echo "$raw" | grep -o '"stake_amount": *[0-9]*' | grep -o '[0-9]*' || true)
+  fi
+
+  if [ -z "$parsed" ]; then
+    echo "FATAL: could not parse stake_amount for '$alias_name' from output: $raw" >&2
+    return 1
+  fi
+
+  echo "$parsed"
+  return 0
+}
+
 for name in "${BOOTSTRAP_REEXECUTORS[@]}"; do
   if ! addr=$(stellar keys address "$name" 2>/dev/null); then
     echo "FATAL: no stellar-cli identity '$name' — run scripts/deploy_testnet.sh first" >&2
@@ -35,14 +82,16 @@ for name in "${BOOTSTRAP_REEXECUTORS[@]}"; do
   info=$(stellar contract invoke \
     --id "$GATE_ID" --source "$name" --network "$NETWORK" \
     -- reexecutor_info --reexecutor "$addr")
-  current=$(echo "$info" | grep -o '"stake_amount": *"[0-9]*"' | grep -o '[0-9]*' || true)
-  if [ "${current:-0}" -ge "$STAKE_AMOUNT" ]; then
+
+  current=$(read_stake "$info" "$name")
+  if [ "$current" -ge "$TARGET_STAKE" ]; then
     echo "==> $name ($addr) already staked ${current} stroops"
   else
-    echo "==> Staking $name ($addr) for $STAKE_AMOUNT stroops"
+    shortfall=$((TARGET_STAKE - current))
+    echo "==> Staking $name ($addr) for $shortfall stroops (current: $current, target: $TARGET_STAKE)"
     stellar contract invoke \
       --id "$GATE_ID" --source "$name" --network "$NETWORK" \
-      -- register_reexecutor --reexecutor "$addr" --stake_amount "$STAKE_AMOUNT"
+      -- register_reexecutor --reexecutor "$addr" --stake_amount "$shortfall"
   fi
 
   echo "==> Approving $name as a voter"
@@ -54,6 +103,15 @@ for name in "${BOOTSTRAP_REEXECUTORS[@]}"; do
     --id "$GATE_ID" --source "$name" --network "$NETWORK" \
     -- reexecutor_info --reexecutor "$addr")
   echo "    on-chain state: $info"
+
+  if ! echo "$info" | grep -q '"active": *true'; then
+    echo "FATAL: re-executor '$name' ($addr) is not active after bootstrap (state: $info)" >&2
+    exit 1
+  fi
+  if ! echo "$info" | grep -q '"approved": *true'; then
+    echo "FATAL: re-executor '$name' ($addr) is not approved after bootstrap (state: $info)" >&2
+    exit 1
+  fi
 done
 
 echo "Done. The bootstrap re-executors are staked, active and approved on EscrowGate ($GATE_ID)."

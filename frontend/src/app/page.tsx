@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { unstable_rethrow } from "next/navigation";
 import { backendGet } from "../lib/server-api";
 import type { GateConfig, Reexecutor, Submission, VerificationRatesReport } from "../lib/types";
 import { buttonClasses } from "../components/ui/button";
@@ -9,20 +10,44 @@ import { bpsToPercent, formatDuration, formatRelativeTime, stroopsToXlm, truncat
 
 const linkClass = "text-accent underline-offset-2 hover:underline";
 
+type Settled<T> = { ok: true; value: T } | { ok: false };
+
+/** Lets a decorative panel fail on its own instead of taking the page down.
+ * Framework signals must pass through: `backendGet` reaches `headers()`, and
+ * Next marks a route dynamic by throwing from it, so swallowing that signal
+ * here would break the build and dynamic rendering. */
+async function settle<T>(promise: Promise<T>): Promise<Settled<T>> {
+  try {
+    return { ok: true, value: await promise };
+  } catch (err) {
+    unstable_rethrow(err);
+    console.error("home page panel read failed:", err);
+    return { ok: false };
+  }
+}
+
 /**
  * The front door. Everything a first-time visitor is shown here is read live:
  * the latest submissions, the counts, and the rules (quorum, window, bond and
- * slash rates) straight from the contract. There is no illustrative data.
+ * slash rates) straight from the contract. There is no illustrative data —
+ * so a panel whose read failed says so, instead of showing a number that
+ * looks real. Only the contract rules (`config`) are required: most of the
+ * page's prose is derived from them, and without them there is nothing
+ * truthful to render, so that failure still reaches the error screen.
  */
 export default async function HomePage() {
   const [latest, report, reexecutors, config] = await Promise.all([
-    backendGet<Submission[]>("/v1/submissions?limit=4"),
-    backendGet<VerificationRatesReport>("/v1/reports/verification-rates"),
-    backendGet<Reexecutor[]>("/v1/reexecutors"),
+    settle(backendGet<Submission[]>("/v1/submissions?limit=4")),
+    settle(backendGet<VerificationRatesReport>("/v1/reports/verification-rates")),
+    settle(backendGet<Reexecutor[]>("/v1/reexecutors")),
     backendGet<GateConfig>("/v1/config"),
   ]);
-  const totalSubmissions = report.by_marketplace_task_status.reduce((sum, row) => sum + Number(row.count), 0);
-  const online = reexecutors.filter((r) => r.online && r.can_vote).length;
+  const totalSubmissions = report.ok
+    ? report.value.by_marketplace_task_status.reduce((sum, row) => sum + Number(row.count), 0)
+    : null;
+  const online = reexecutors.ok
+    ? reexecutors.value.filter((r) => r.online && r.can_vote).length
+    : null;
 
   return (
     <div className="space-y-20">
@@ -50,7 +75,13 @@ export default async function HomePage() {
             <h2 className="text-sm font-medium">Latest on-chain</h2>
             <span className="font-mono text-xs text-text-tertiary">live from the indexer</span>
           </div>
-          {latest.length === 0 ? (
+          {!latest.ok ? (
+            <div className="px-5 py-10">
+              <p className="text-sm text-text-secondary">
+                The latest submissions could not be loaded. Reload to try again.
+              </p>
+            </div>
+          ) : latest.value.length === 0 ? (
             <div className="px-5 py-10">
               <p className="text-sm text-text-secondary">Nothing has been submitted on this deployment yet.</p>
               <p className="mt-2 max-w-[44ch] text-sm text-text-tertiary">
@@ -60,7 +91,7 @@ export default async function HomePage() {
             </div>
           ) : (
             <ul className="divide-y divide-border-subtle">
-              {latest.map((s) => (
+              {latest.value.map((s) => (
                 <li key={s.id}>
                   <Link
                     href={`/submissions/${s.id}`}
@@ -83,13 +114,25 @@ export default async function HomePage() {
 
       <section aria-label="This deployment right now">
         <dl className="grid grid-cols-2 gap-x-8 gap-y-8 border-y border-border-subtle py-8 lg:grid-cols-4">
-          <Figure label="Submissions on-chain" value={String(totalSubmissions)} />
+          <Figure
+            label="Submissions on-chain"
+            value={totalSubmissions === null ? "Unavailable" : String(totalSubmissions)}
+            note={totalSubmissions === null ? "this figure could not be read" : undefined}
+          />
           <Figure
             label="Re-executors online"
-            value={String(online)}
-            note={`${reexecutors.length} staked, quorum is ${config.quorum_min_reexecutors}`}
+            value={online === null ? "Unavailable" : String(online)}
+            note={
+              reexecutors.ok
+                ? `${reexecutors.value.length} staked, quorum is ${config.quorum_min_reexecutors}`
+                : "this figure could not be read"
+            }
           />
-          <Figure label="Re-executor slashes" value={String(report.slashing_events_total)} />
+          <Figure
+            label="Re-executor slashes"
+            value={report.ok ? String(report.value.slashing_events_total) : "Unavailable"}
+            note={report.ok ? undefined : "this figure could not be read"}
+          />
           <Figure
             label="Challenge window"
             value={formatDuration(config.window_tier_small_s)}

@@ -6,10 +6,16 @@ export async function GET(req: NextRequest) {
   if (!account) {
     return NextResponse.json({ error: "account query param required" }, { status: 400 });
   }
+  // Pass the visitor's address on for rate limiting, as forwardedFor in
+  // lib/server-api.ts does for server-rendered reads.
+  const forwarded = req.headers.get("x-forwarded-for") ?? req.headers.get("x-real-ip");
   try {
     const res = await fetch(
       `${BACKEND_URL}/auth?account=${encodeURIComponent(account)}`,
-      { cache: "no-store" }
+      {
+        headers: forwarded ? { "x-forwarded-for": forwarded } : {},
+        cache: "no-store",
+      }
     );
     const data = await res.json().catch(() => ({}));
     return NextResponse.json(data, { status: res.status });

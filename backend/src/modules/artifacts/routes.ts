@@ -13,16 +13,30 @@ export async function artifactsRoutes(app: FastifyInstance) {
         content_type: z.string().optional(),
       })
       .parse(req.body);
+
+    const isBase64 =
+      body.content_base64.length % 4 === 0 &&
+      /^[A-Za-z0-9+/]+={0,2}$/.test(body.content_base64);
+    if (!isBase64) {
+      reply.code(400);
+      return { error: "content_base64 is not valid base64" };
+    }
+
     const content = Buffer.from(body.content_base64, "base64");
+    if (content.byteLength === 0) {
+      reply.code(400);
+      return { error: "artifact content cannot be empty" };
+    }
+
     if (content.byteLength > env.ARTIFACT_MAX_BYTES) {
       reply.code(413);
       return { error: `artifact is larger than the ${env.ARTIFACT_MAX_BYTES}-byte limit` };
     }
-    const { contentHash, storageRef } = await storeArtifact(content);
+    const { contentHash } = await storeArtifact(content);
     reply.code(201);
     return {
       content_hash: contentHash,
-      storage_ref: storageRef,
+      storage_ref: contentHash,
       size_bytes: content.byteLength,
       content_type: body.content_type ?? null,
     };
