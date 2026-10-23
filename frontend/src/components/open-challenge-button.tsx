@@ -9,6 +9,9 @@ import { signXdr } from "../lib/wallet";
 import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../lib/config";
 import { stroopsToXlm, xlmToStroops } from "../lib/format";
 
+const POLL_EVERY_MS = 3000;
+const GIVE_UP_AFTER_MS = 60_000;
+
 /**
  * Opens a bonded challenge. Rendered only for a pending, on-chain submission;
  * the window itself is checked here against the clock, because it can close
@@ -30,6 +33,7 @@ export function OpenChallengeButton({
   const [busy, setBusy] = useState<null | "building" | "signing" | "relaying">(null);
   const [error, setError] = useState<string | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
+  const [stalled, setStalled] = useState(false);
   const [windowOpen, setWindowOpen] = useState(() => Date.now() < new Date(deadlineIso).getTime());
 
   useEffect(() => {
@@ -39,11 +43,20 @@ export function OpenChallengeButton({
 
   // The challenge row is written by the chain indexer a few seconds after
   // the transaction lands. Keep re-reading until the page shows it (at which
-  // point this component is replaced by the challenge itself).
+  // point this component is replaced by the challenge itself). Cap polling
+  // to GIVE_UP_AFTER_MS so a stalled indexer does not poll forever.
   useEffect(() => {
     if (!txHash) return;
-    const id = setInterval(() => router.refresh(), 3000);
-    return () => clearInterval(id);
+    const pollId = setInterval(() => router.refresh(), POLL_EVERY_MS);
+    const timeoutId = setTimeout(() => {
+      clearInterval(pollId);
+      setStalled(true);
+    }, GIVE_UP_AFTER_MS);
+
+    return () => {
+      clearInterval(pollId);
+      clearTimeout(timeoutId);
+    };
   }, [txHash, router]);
 
   async function handleChallenge() {
@@ -68,6 +81,7 @@ export function OpenChallengeButton({
       });
       setBusy("relaying");
       const { tx_hash } = await relayChallenge(submissionId, signed);
+      setStalled(false);
       setTxHash(tx_hash);
     } catch (err) {
       setError(err instanceof Error ? err.message : "The challenge could not be opened.");
@@ -79,7 +93,11 @@ export function OpenChallengeButton({
   if (txHash) {
     return (
       <div className="space-y-2 text-sm" role="status">
-        <p>Challenge transaction confirmed on testnet. Waiting for the indexer to record it…</p>
+        <p>
+          {stalled
+            ? "Still waiting for the indexer to record the challenge. Reload the page later, or check the transaction on stellar.expert."
+            : "Challenge transaction confirmed on testnet. Waiting for the indexer to record it…"}
+        </p>
         <a
           href={TESTNET_EXPLORER_TX(txHash)}
           target="_blank"

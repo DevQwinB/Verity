@@ -1,9 +1,11 @@
+import { cache } from "react";
 import type { Metadata } from "next";
 import Link from "next/link";
-import { notFound } from "next/navigation";
+import { notFound, unstable_rethrow } from "next/navigation";
 import { backendGetOrNull } from "../../../lib/server-api";
 import type { Artifact, Attestation, SubmissionDetail, ProofStatus } from "../../../lib/types";
 import { Card, CardBody, CardHeader } from "../../../components/ui/card";
+import { Badge } from "../../../components/ui/badge";
 import { VerdictBadge } from "../../../components/verdict-badge";
 import { AutoRefresh } from "../../../components/auto-refresh";
 import { stroopsToXlm, truncateMiddle, formatDuration, formatRelativeTime, windowDeadlineIso } from "../../../lib/format";
@@ -11,7 +13,29 @@ import { TESTNET_EXPLORER_ACCOUNT, TESTNET_EXPLORER_TX } from "../../../lib/conf
 import { ChallengeWindowCountdown } from "../../../components/challenge-window-countdown";
 import { OpenChallengeButton } from "../../../components/open-challenge-button";
 
-export const metadata: Metadata = { title: "Submission" };
+const loadSubmissionDetail = cache((id: string) =>
+  backendGetOrNull<SubmissionDetail>(`/v1/submissions/${id}`)
+);
+
+export async function generateMetadata({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}): Promise<Metadata> {
+  try {
+    const { id } = await params;
+    const detail = await loadSubmissionDetail(id);
+    if (!detail) return { title: "Submission" };
+    const title =
+      detail.submission.chain_submission_id != null
+        ? `Submission #${detail.submission.chain_submission_id}`
+        : "Unsigned draft";
+    return { title };
+  } catch (err) {
+    unstable_rethrow(err);
+    return { title: "Submission" };
+  }
+}
 
 const linkClass = "text-accent underline-offset-2 hover:underline";
 
@@ -30,9 +54,11 @@ export default async function SubmissionDetailPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
-  const detail = await backendGetOrNull<SubmissionDetail>(`/v1/submissions/${id}`);
+  const detail = await loadSubmissionDetail(id);
   if (!detail) notFound();
   const { submission, replays, spot_checks, challenge } = detail;
+
+  const isDraft = submission.chain_submission_id === null;
 
   const [proof, attestation, inputText, functionText, outputText] = await Promise.all([
     backendGetOrNull<ProofStatus>(`/v1/submissions/${id}/proof`),
@@ -45,7 +71,7 @@ export default async function SubmissionDetailPage({
   const deadline = windowDeadlineIso(submission.submitted_at, submission.challenge_window_s);
   const open = submission.status === "pending" || submission.status === "disputed";
   // Keep reading until the verdict is in and its settlement has been recorded.
-  const live = open || (submission.chain_submission_id !== null && !submission.settled_at);
+  const live = !isDraft && (open || (submission.chain_submission_id !== null && !submission.settled_at));
   const votes = replays.filter((r) => r.status === "confirmed_onchain");
 
   return (
@@ -62,21 +88,32 @@ export default async function SubmissionDetailPage({
           </h1>
           <p className="mt-1 break-words text-sm text-text-secondary">{submission.escrow_ref}</p>
         </div>
-        <VerdictBadge
-          status={submission.status}
-          resolutionMethod={submission.resolution_method}
-          hasChallenge={challenge !== null}
-          align="end"
-        />
+        {isDraft ? (
+          <div className="flex flex-col items-end text-right gap-1">
+            <Badge tone="neutral">Not submitted on-chain</Badge>
+            <p className="max-w-xs text-xs text-text-tertiary">
+              This draft was never signed. Reload this page if you have just signed it.
+            </p>
+          </div>
+        ) : (
+          <VerdictBadge
+            status={submission.status}
+            resolutionMethod={submission.resolution_method}
+            hasChallenge={challenge !== null}
+            align="end"
+          />
+        )}
       </div>
 
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <Stat label="Task type" value={submission.task_type} capitalize />
         <Stat label="Agent bond" value={`${stroopsToXlm(submission.bond_amount)} XLM`} mono />
-        <Stat label="Submitted" value={formatRelativeTime(submission.submitted_at)} />
+        <Stat label={isDraft ? "Drafted" : "Submitted"} value={formatRelativeTime(submission.submitted_at)} />
         <Card>
           <CardBody>
-            {submission.status === "pending" && !challenge ? (
+            {isDraft ? (
+              <StatBody label="Challenge window" value="Not started" />
+            ) : submission.status === "pending" && !challenge ? (
               <ChallengeWindowCountdown deadlineIso={deadline} />
             ) : (
               <StatBody label="Challenge window" value={formatDuration(submission.challenge_window_s)} />
@@ -146,11 +183,13 @@ export default async function SubmissionDetailPage({
         <CardBody className="p-0">
           {replays.length === 0 ? (
             <p className="px-5 py-8 text-center text-sm text-text-tertiary">
-              {submission.task_type === "retrieval"
-                ? "A retrieval task is spot-checked first. It is only replayed by a full quorum if that check fails or someone challenges it."
-                : open
-                  ? "No re-executor has been assigned yet. Assignment waits for one to be online."
-                  : "No re-executor replayed this submission."}
+              {isDraft
+                ? "Not on-chain yet, so no re-executor can be assigned."
+                : submission.task_type === "retrieval"
+                  ? "A retrieval task is spot-checked first. It is only replayed by a full quorum if that check fails or someone challenges it."
+                  : open
+                    ? "No re-executor has been assigned yet. Assignment waits for one to be online."
+                    : "No re-executor replayed this submission."}
             </p>
           ) : (
             <ul className="divide-y divide-border-subtle">
@@ -195,7 +234,11 @@ export default async function SubmissionDetailPage({
           <CardBody className="p-0">
             {spot_checks.length === 0 ? (
               <p className="px-5 py-8 text-center text-sm text-text-tertiary">
-                {open ? "Waiting for a re-executor to be online to sample this." : "This submission was not sampled."}
+                {isDraft
+                  ? "Not on-chain yet, so nothing has been sampled."
+                  : open
+                    ? "Waiting for a re-executor to be online to sample this."
+                    : "This submission was not sampled."}
               </p>
             ) : (
               <ul className="divide-y divide-border-subtle">
