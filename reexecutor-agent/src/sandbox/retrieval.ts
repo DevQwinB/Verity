@@ -136,16 +136,32 @@ function getPinned(target: PinnedTarget): Promise<{ status: number; body: string
   });
 }
 
-function resolvePointer(doc: unknown, pointer: string): unknown {
+const CANONICAL_ARRAY_INDEX = /^(0|[1-9]\d*)$/;
+
+export function resolvePointer(doc: unknown, pointer: string): unknown {
   if (pointer === "") return doc;
   if (!pointer.startsWith("/")) throw new Error(`invalid JSON pointer: ${pointer}`);
   let node: any = doc;
   for (const raw of pointer.slice(1).split("/")) {
     const key = raw.replace(/~1/g, "/").replace(/~0/g, "~");
-    if (node === null || typeof node !== "object" || !(key in node)) {
+    if (node === null || typeof node !== "object") {
       throw new Error(`JSON pointer ${pointer} does not resolve in the response`);
     }
-    node = node[key];
+    if (Array.isArray(node)) {
+      if (!CANONICAL_ARRAY_INDEX.test(key)) {
+        throw new Error(`JSON pointer ${pointer} does not resolve in the response`);
+      }
+      const index = Number(key);
+      if (index >= node.length) {
+        throw new Error(`JSON pointer ${pointer} does not resolve in the response`);
+      }
+      node = node[index];
+    } else {
+      if (!Object.hasOwn(node, key)) {
+        throw new Error(`JSON pointer ${pointer} does not resolve in the response`);
+      }
+      node = node[key];
+    }
   }
   return node;
 }
