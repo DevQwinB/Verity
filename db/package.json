@@ -13,13 +13,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "kysely": "^0.29.6",
-    "pg": "^8.23.0",
+    "kysely": "^0.29.7",
+    "pg": "^8.23.1",
     "embedded-postgres": "18.4.0-beta.17"
   },
   "devDependencies": {
     "@types/pg": "^8.23.1",
-    "tsx": "^4.23.13",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   }
 }
