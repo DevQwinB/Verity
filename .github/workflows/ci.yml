@@ -21,7 +21,7 @@ jobs:
       run:
         working-directory: contracts
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The toolchain and wasm target are pinned in contracts/rust-toolchain.toml.
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -36,7 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -56,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: docker build -f backend/Dockerfile -t verity-backend .
       - run: docker build -f reexecutor-agent/Dockerfile -t verity-reexecutor .
       - run: docker build -f frontend/Dockerfile -t verity-frontend .
@@ -66,7 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup show
         working-directory: contracts
       - uses: Swatinem/rust-cache@v2
@@ -97,7 +97,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run shellcheck
         run: shellcheck -x scripts/approve_reexecutor.sh scripts/bootstrap_reexecutors.sh scripts/deploy_testnet.sh scripts/dev.sh scripts/export_interfaces.sh scripts/generate_bindings.sh scripts/smoke.sh
 
@@ -116,7 +116,7 @@ jobs:
       WEB_AUTH_DOMAIN: localhost:3001
       HOME_DOMAIN: localhost
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate default compose config
         run: docker compose config -q
       - name: Validate fleet profile compose config
