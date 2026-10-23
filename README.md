@@ -422,7 +422,7 @@ without consensus; inspect the submission's `resolution_method` via
 `GET /v1/submissions/:id` to distinguish how the verdict was reached.
 
 Each delivery is an HTTP `POST` with `content-type: application/json` and
-`x-verity-signature`, containing the UTF-8 JSON serialization
+three headers (`x-verity-delivery`, `x-verity-timestamp`, `x-verity-signature`), containing the UTF-8 JSON serialization
 `JSON.stringify({ event: eventType, data: payload })`. For example, this is
 only a **shape example**; the identifiers below are placeholders:
 
@@ -437,13 +437,17 @@ only a **shape example**; the identifiers below are placeholders:
 }
 ```
 
-`x-verity-signature` is the **lowercase hexadecimal HMAC-SHA256** digest
-using the registration `secret` as the key and the **exact raw request-body
-bytes** as input. Verify before parsing JSON: re-serializing a parsed object
-may change the signed bytes. A valid HMAC shows that a holder of the shared
-secret authenticated these bytes; it does not prove the verdict or other
-payload data is correct. Any holder of the secret can generate signatures.
-This minimal Node.js receiver verifies the
+`x-verity-delivery` is the delivery UUID and `x-verity-timestamp` is the Unix
+time, in whole seconds, when the request was sent. `x-verity-signature` is the
+**lowercase hexadecimal HMAC-SHA256** digest using the registration `secret` as
+the key over the string `${timestamp}.${deliveryId}.${rawBody}`, where
+`rawBody` is the **exact raw request body**. Verify before parsing JSON:
+re-serializing a parsed object may change the signed bytes. Reject deliveries
+whose timestamp is outside a tolerance window (for example 5 minutes) to stop
+replays, and use the delivery id to deduplicate. A valid HMAC shows that a
+holder of the shared secret authenticated these bytes; it does not prove the
+verdict or other payload data is correct. Any holder of the secret can
+generate signatures. This minimal Node.js receiver verifies the
 header using a constant-time comparison:
 
 ```js
@@ -462,7 +466,17 @@ createServer(async (req, res) => {
   for await (const chunk of req) chunks.push(chunk);
   const rawBody = Buffer.concat(chunks);
   const provided = req.headers["x-verity-signature"];
-  const expected = createHmac("sha256", secret).update(rawBody).digest();
+  const timestamp = req.headers["x-verity-timestamp"];
+  const deliveryId = req.headers["x-verity-delivery"];
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (typeof timestamp !== "string" || typeof deliveryId !== "string" || !(age <= 300)) {
+    res.writeHead(401).end();
+    return;
+  }
+  const expected = createHmac("sha256", secret)
+    .update(`${timestamp}.${deliveryId}.`)
+    .update(rawBody)
+    .digest();
 
   const valid = typeof provided === "string"
     && /^[0-9a-f]{64}$/.test(provided)

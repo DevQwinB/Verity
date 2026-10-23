@@ -1,7 +1,14 @@
+import { Keypair } from "@stellar/stellar-sdk";
 import { db } from "../../db.js";
 import { env } from "../../config/env.js";
 import { keeperKeypair } from "../../chain/keeper.js";
 import { canonicalJson } from "../../chain/canonical.js";
+
+/** Signing keypair for verdict attestations. Falls back to keeperKeypair when
+ * ATTESTATION_SIGNING_SECRET is unset. */
+const attestationKeypair: Keypair = env.ATTESTATION_SIGNING_SECRET
+  ? Keypair.fromSecret(env.ATTESTATION_SIGNING_SECRET)
+  : keeperKeypair;
 
 /** Where an attestation has been delivered. Stellar 8004's ingestion schema
  * is not published (PRD §16 open question 3), so nothing is pushed anywhere:
@@ -10,8 +17,8 @@ import { canonicalJson } from "../../chain/canonical.js";
 export const ATTESTATION_TARGET = "none";
 
 /**
- * A versioned payload describing a submission's terminal verdict, signed with
- * Verity's keeper key. Every field is read from the mirrored chain state; the
+ * A versioned payload describing a submission's terminal verdict, signed by
+ * Verity. Every field is read from the mirrored chain state; the
  * evidence is the list of on-chain attestation transactions, which anyone can
  * check independently.
  *
@@ -41,7 +48,7 @@ export async function exportAttestation(submissionId: string): Promise<boolean> 
     schema: "verity.attestation.v2",
     network_passphrase: env.NETWORK_PASSPHRASE,
     escrow_gate_contract_id: env.ESCROW_GATE_CONTRACT_ID,
-    attestor: { type: "verity-verification-layer", stellar_account: keeperKeypair.publicKey() },
+    attestor: { type: "verity-verification-layer", stellar_account: attestationKeypair.publicKey() },
     subject: {
       agent_stellar_account: submission.agent_id,
       escrow_ref: submission.escrow_ref,
@@ -64,7 +71,7 @@ export async function exportAttestation(submissionId: string): Promise<boolean> 
   };
 
   const canonical = canonicalJson(payload);
-  const signature = Buffer.from(keeperKeypair.sign(Buffer.from(canonical))).toString("base64");
+  const signature = Buffer.from(attestationKeypair.sign(Buffer.from(canonical))).toString("base64");
 
   // One attestation per submission: nothing is inserted when one already exists.
   const inserted = await db

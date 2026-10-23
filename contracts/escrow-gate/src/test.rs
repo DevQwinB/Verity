@@ -772,6 +772,90 @@ fn constructor_rejects_an_invalid_config() {
 
 #[test]
 #[should_panic(expected = "Error(Contract, #4)")]
+fn constructor_rejects_small_window_above_max() {
+    let e = Env::default();
+    setup_with(
+        &e,
+        ConfigRecord {
+            window_tier_small_s: crate::MAX_WINDOW_S + 1,
+            ..default_config()
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn constructor_rejects_large_window_above_max() {
+    let e = Env::default();
+    setup_with(
+        &e,
+        ConfigRecord {
+            window_tier_large_s: crate::MAX_WINDOW_S + 1,
+            ..default_config()
+        },
+    );
+}
+
+#[test]
+fn constructor_accepts_windows_at_max() {
+    let e = Env::default();
+    let w = setup_with(
+        &e,
+        ConfigRecord {
+            window_tier_small_s: crate::MAX_WINDOW_S,
+            window_tier_large_s: crate::MAX_WINDOW_S,
+            ..default_config()
+        },
+    );
+    let cfg = w.client.get_config().unwrap();
+    assert_eq!(cfg.window_tier_small_s, crate::MAX_WINDOW_S);
+    assert_eq!(cfg.window_tier_large_s, crate::MAX_WINDOW_S);
+}
+
+#[test]
+fn update_config_rejects_each_window_tier_above_max() {
+    let e = Env::default();
+    let w = setup_with(&e, default_config());
+
+    let cfg_small = ConfigRecord {
+        window_tier_small_s: crate::MAX_WINDOW_S + 1,
+        ..default_config()
+    };
+    assert_eq!(
+        w.client.try_update_config(&w.admin, &cfg_small),
+        Err(Ok(Error::InvalidConfig))
+    );
+    assert_eq!(w.client.get_config().unwrap().window_tier_small_s, 3600);
+
+    let cfg_large = ConfigRecord {
+        window_tier_large_s: crate::MAX_WINDOW_S + 1,
+        ..default_config()
+    };
+    assert_eq!(
+        w.client.try_update_config(&w.admin, &cfg_large),
+        Err(Ok(Error::InvalidConfig))
+    );
+    assert_eq!(w.client.get_config().unwrap().window_tier_large_s, 86_400);
+}
+
+#[test]
+fn update_config_accepts_windows_at_max() {
+    let e = Env::default();
+    let w = setup_with(&e, default_config());
+
+    let cfg = ConfigRecord {
+        window_tier_small_s: crate::MAX_WINDOW_S,
+        window_tier_large_s: crate::MAX_WINDOW_S,
+        ..default_config()
+    };
+    w.client.update_config(&w.admin, &cfg);
+    let updated = w.client.get_config().unwrap();
+    assert_eq!(updated.window_tier_small_s, crate::MAX_WINDOW_S);
+    assert_eq!(updated.window_tier_large_s, crate::MAX_WINDOW_S);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
 fn constructor_rejects_a_zero_min_stake_floor() {
     let e = Env::default();
     setup_with(&e, ConfigRecord { min_stake_floor: 0, ..default_config() });
@@ -1299,6 +1383,232 @@ fn update_config_reports_not_initialized_without_a_stored_admin() {
     let cfg = ConfigRecord { quorum_min_reexecutors: 5, ..default_config() };
     assert_eq!(w.client.try_update_config(&w.admin, &cfg), Err(Ok(Error::NotInitialized)));
     assert_config_eq(&w.client.get_config().unwrap(), &default_config());
+}
+
+// ---- config snapshot ----
+
+#[test]
+fn snapshot_quorum_min_reexecutors_preserved_after_update_config() {
+    // A submission created under default quorum (3) finalizes once 3 re-executors
+    // vote matching, even after update_config increases live quorum to 5.
+    // If live config were read, it would stay Pending.
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!(sub.cfg_quorum_min_reexecutors, 3);
+
+    w.client.update_config(
+        &w.admin,
+        &ConfigRecord {
+            quorum_min_reexecutors: 5,
+            ..default_config()
+        },
+    );
+
+    let rex1 = Address::generate(&e);
+    let rex2 = Address::generate(&e);
+    let rex3 = Address::generate(&e);
+    for r in [&rex1, &rex2, &rex3] {
+        register_rex(&w, r);
+        w.client.attest_replay(r, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+    }
+
+    assert_eq!(w.client.finalize(&id), Verdict::Verified);
+    let fin = w.client.get_submission(&id).unwrap();
+    assert_eq!(fin.resolution_method, ResolutionMethod::ReexecutionConsensus);
+}
+
+#[test]
+fn snapshot_quorum_supermajority_bps_preserved_after_update_config() {
+    // 2 out of 3 votes with equal stake is 66.7%, which exceeds A's 66% (6600 bps),
+    // but would fail under B's 90% (9000 bps).
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!(sub.cfg_quorum_supermajority_bps, 6600);
+
+    w.client.update_config(
+        &w.admin,
+        &ConfigRecord {
+            quorum_supermajority_bps: 9000,
+            ..default_config()
+        },
+    );
+
+    let rex1 = Address::generate(&e);
+    let rex2 = Address::generate(&e);
+    let rex3 = Address::generate(&e);
+    register_rex(&w, &rex1);
+    register_rex(&w, &rex2);
+    register_rex(&w, &rex3);
+
+    w.client.attest_replay(&rex1, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+    w.client.attest_replay(&rex2, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+    w.client.attest_replay(&rex3, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+
+    assert_eq!(w.client.finalize(&id), Verdict::Verified);
+}
+
+#[test]
+fn snapshot_challenger_bond_min_bps_preserved_after_update_config() {
+    // Submission 1 created under A (500 bps = 50 XLM on 1000 XLM escrow) accepts 50 XLM bond.
+    // After update to B (2000 bps = 200 XLM), submission 1 still accepts 50 XLM bond.
+    // Submission 2 created after update requires 200 XLM (50 XLM rejected with BondTooLow).
+    let e = Env::default();
+    let w = setup(&e);
+    let agent1 = Address::generate(&e);
+    let id1 = submit_default(&w, &agent1);
+
+    let sub1 = w.client.get_submission(&id1).unwrap();
+    assert_eq!(sub1.cfg_challenger_bond_min_bps, 500);
+
+    w.client.update_config(
+        &w.admin,
+        &ConfigRecord {
+            challenger_bond_min_bps: 2000,
+            ..default_config()
+        },
+    );
+
+    // Existing submission under A accepts 50 XLM bond
+    let challenger1 = Address::generate(&e);
+    fund(&w, &challenger1, 1000 * XLM);
+    w.client.open_challenge(&challenger1, &id1, &(50 * XLM));
+
+    // New submission after update follows B (2000 bps)
+    let agent2 = Address::generate(&e);
+    fund(&w, &agent2, 1000 * XLM);
+    let id2 = w.client.submit(
+        &agent2,
+        &BytesN::from_array(&e, &[1u8; 32]),
+        &(1000 * XLM),
+        &TaskType::Deterministic,
+        &BytesN::from_array(&e, &[2u8; 32]),
+        &BytesN::from_array(&e, &[3u8; 32]),
+        &(50 * XLM),
+    );
+    let sub2 = w.client.get_submission(&id2).unwrap();
+    assert_eq!(sub2.cfg_challenger_bond_min_bps, 2000);
+
+    let challenger2 = Address::generate(&e);
+    fund(&w, &challenger2, 1000 * XLM);
+    assert_eq!(
+        w.client.try_open_challenge(&challenger2, &id2, &(50 * XLM)),
+        Err(Ok(Error::BondTooLow))
+    );
+    w.client.open_challenge(&challenger2, &id2, &(200 * XLM));
+}
+
+#[test]
+fn snapshot_slash_split_challenger_bps_preserved_after_update_config() {
+    // Under A, challenger gets 20% (2000 bps) of agent bond (10 XLM of 50 XLM), admin gets 40 XLM.
+    // Update changes live split to 50% (5000 bps). If live config were read, challenger would get 25 XLM.
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!(sub.cfg_slash_split_challenger_bps, 2000);
+
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    w.client.open_challenge(&challenger, &id, &(50 * XLM));
+
+    let rex1 = Address::generate(&e);
+    let rex2 = Address::generate(&e);
+    let rex3 = Address::generate(&e);
+    for r in [&rex1, &rex2, &rex3] {
+        register_rex(&w, r);
+        w.client.attest_replay(r, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    }
+
+    w.client.update_config(
+        &w.admin,
+        &ConfigRecord {
+            slash_split_challenger_bps: 5000,
+            ..default_config()
+        },
+    );
+
+    let verdict = w.client.resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus);
+    assert_eq!(verdict, Verdict::Slashed);
+
+    assert_eq!(w.token.balance(&challenger), 1000 * XLM + 10 * XLM);
+    assert_eq!(w.token.balance(&w.admin), 40 * XLM);
+}
+
+#[test]
+fn snapshot_reexecutor_slash_bps_preserved_after_update_config() {
+    // Under A, re-executor slash is 10% (1000 bps) = 60 XLM of 600 XLM stake.
+    // Update changes live slash to 50% (5000 bps) = 300 XLM.
+    // The snapshot ensures slash(&wrong, &id) slashes 60 XLM, not 300 XLM.
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!(sub.cfg_reexecutor_slash_bps, 1000);
+
+    let rex1 = Address::generate(&e);
+    let rex2 = Address::generate(&e);
+    let rex3 = Address::generate(&e);
+    register_rex(&w, &rex1);
+    register_rex(&w, &rex2);
+    register_rex(&w, &rex3);
+
+    w.client.attest_replay(&rex1, &id, &BytesN::from_array(&e, &[9u8; 32]), &true);
+    w.client.attest_replay(&rex2, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    w.client.attest_replay(&rex3, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+
+    assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+
+    w.client.update_config(
+        &w.admin,
+        &ConfigRecord {
+            reexecutor_slash_bps: 5000,
+            ..default_config()
+        },
+    );
+
+    assert_eq!(w.client.slash(&rex1, &id), 60 * XLM);
+    assert_eq!(w.client.reexecutor_info(&rex1).unwrap().stake_amount, 540 * XLM);
+}
+
+#[test]
+fn snapshot_challenge_window_s_preserved_after_update_config() {
+    // Under A, small window is 3600s. Update changes window_tier_small_s to 7200s.
+    // Advancing ledger timestamp by 3601s finalizes the submission under A's window.
+    // If live config were read (7200s), it would fail with ChallengeWindowOpen.
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!(sub.challenge_window_s, 3600);
+
+    w.client.update_config(
+        &w.admin,
+        &ConfigRecord {
+            window_tier_small_s: 7200,
+            ..default_config()
+        },
+    );
+
+    e.ledger().set_timestamp(3601);
+
+    assert_eq!(w.client.finalize(&id), Verdict::Verified);
+    let fin = w.client.get_submission(&id).unwrap();
+    assert_eq!(fin.resolution_method, ResolutionMethod::WindowElapsed);
+    assert_eq!(fin.challenge_window_s, 3600);
 }
 
 mod proptest_model;

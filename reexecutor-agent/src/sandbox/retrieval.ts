@@ -29,7 +29,7 @@ const TIMEOUT_MS = 10_000;
  */
 export class RetrievalTransientError extends Error {}
 
-function isPrivateAddress(ip: string): boolean {
+export function isPrivateAddress(ip: string): boolean {
   if (ip.includes(":")) {
     const v6 = ip.toLowerCase();
     return v6 === "::1" || v6 === "::" || v6.startsWith("fc") || v6.startsWith("fd") || v6.startsWith("fe80") || v6.startsWith("::ffff:");
@@ -61,7 +61,7 @@ interface PinnedTarget {
  * allowPrivate skips only the non-public-address refusal, for URLs that come
  * from the operator's own configuration. It defaults to false so a caller
  * that forgets it fails closed. */
-async function resolveTarget(raw: string, opts: { allowPrivate: boolean } = { allowPrivate: false }): Promise<PinnedTarget> {
+export async function resolvePublicTarget(raw: string, opts: { allowPrivate: boolean } = { allowPrivate: false }): Promise<PinnedTarget> {
   let url: URL;
   try {
     url = new URL(raw);
@@ -140,16 +140,32 @@ function getPinned(target: PinnedTarget): Promise<{ status: number; body: string
   });
 }
 
-function resolvePointer(doc: unknown, pointer: string): unknown {
+const CANONICAL_ARRAY_INDEX = /^(0|[1-9]\d*)$/;
+
+export function resolvePointer(doc: unknown, pointer: string): unknown {
   if (pointer === "") return doc;
   if (!pointer.startsWith("/")) throw new Error(`invalid JSON pointer: ${pointer}`);
   let node: any = doc;
   for (const raw of pointer.slice(1).split("/")) {
     const key = raw.replace(/~1/g, "/").replace(/~0/g, "~");
-    if (node === null || typeof node !== "object" || !(key in node)) {
+    if (node === null || typeof node !== "object") {
       throw new Error(`JSON pointer ${pointer} does not resolve in the response`);
     }
-    node = node[key];
+    if (Array.isArray(node)) {
+      if (!CANONICAL_ARRAY_INDEX.test(key)) {
+        throw new Error(`JSON pointer ${pointer} does not resolve in the response`);
+      }
+      const index = Number(key);
+      if (index >= node.length) {
+        throw new Error(`JSON pointer ${pointer} does not resolve in the response`);
+      }
+      node = node[index];
+    } else {
+      if (!Object.hasOwn(node, key)) {
+        throw new Error(`JSON pointer ${pointer} does not resolve in the response`);
+      }
+      node = node[key];
+    }
   }
   return node;
 }
@@ -175,7 +191,7 @@ export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: s
   if (!spec || typeof spec.url !== "string") {
     throw new Error('retrieval input artifact must be JSON of the form {"url": "...", "pointer"?: "/..."}');
   }
-  const target = await resolveTarget(spec.url);
+  const target = await resolvePublicTarget(spec.url);
   const res = await getPinned(target);
   // A redirect could bounce to a private address, and a moved resource is a
   // legitimate mismatch anyway: the agent declared this URL, not another.
@@ -204,7 +220,7 @@ export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: s
  * not true of retrieval targets: runRetrieval still refuses them. */
 export async function hasConnectivity(controlUrl: string): Promise<boolean> {
   try {
-    await getPinned(await resolveTarget(controlUrl, { allowPrivate: true }));
+    await getPinned(await resolvePublicTarget(controlUrl, { allowPrivate: true }));
     return true;
   } catch {
     return false;
