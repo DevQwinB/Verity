@@ -458,16 +458,18 @@ export async function pollOnce(): Promise<number> {
 
   let processed = 0;
   for (const ev of res.events) {
-    const topic = ev.topic.map((t) => scValToNative(t));
-    const value = scValToNative(ev.value);
+    let topic: unknown[] = [];
     try {
+      topic = ev.topic.map((t) => scValToNative(t));
+      const value = scValToNative(ev.value);
       await handleEvent(topic, value, ev.ledger, ev.txHash);
       stuckEvent = null;
     } catch (err) {
       const failures = stuckEvent?.id === ev.id ? stuckEvent.failures + 1 : 1;
       stuckEvent = { id: ev.id, failures };
       if (failures < MAX_EVENT_RETRIES) throw err;
-      console.error(`[indexer] skipping event ${ev.id} (${String(topic[0])}) after ${failures} failures:`, err);
+      const eventName = topic[0] !== undefined && topic[0] !== null ? String(topic[0]) : "undecodable";
+      console.error(`[indexer] skipping event ${ev.id} (ledger ${ev.ledger}, ${eventName}) after ${failures} failures:`, err);
       stuckEvent = null;
     }
     // Persist per event: a failure mid-page resumes after the last success.
