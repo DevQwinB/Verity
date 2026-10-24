@@ -20,7 +20,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/_deployment.sh
 source "$ROOT_DIR/scripts/_deployment.sh"
+require_commands stellar curl node
 require_deployment
+assert_identities_match
 refuse_public_deployment "The smoke test writes real test submissions on-chain and must never run against it."
 
 API_PORT="${VERITY_API_PORT:-3001}"
@@ -37,7 +39,7 @@ for alias in "$AGENT_ALIAS" "$CHALLENGER_ALIAS"; do
   fi
 done
 
-if ! curl -fs "http://127.0.0.1:$API_PORT/health/live" >/dev/null; then
+if ! curl -fs --connect-timeout 2 --max-time 5 "http://127.0.0.1:$API_PORT/health/live" >/dev/null; then
   echo "FATAL: no Verity backend on :$API_PORT — start the stack with 'pnpm dev' first" >&2
   exit 1
 fi
@@ -54,8 +56,12 @@ if [ "$PROFILE" = quorum ]; then
     stellar keys generate "$ROGUE_ALIAS" --network "$NETWORK" --fund
   fi
   ROGUE_ADDR="$(stellar keys address "$ROGUE_ALIAS")"
-  ROGUE_INFO="$(stellar contract invoke --id "$GATE_ID" --source "$ROGUE_ALIAS" --network "$NETWORK" \
-    -- reexecutor_info --reexecutor "$ROGUE_ADDR" 2>/dev/null || true)"
+  # A failed read must not look like "not staked": staking again adds another 1,000 XLM.
+  if ! ROGUE_INFO="$(stellar contract invoke --id "$GATE_ID" --source "$ROGUE_ALIAS" --network "$NETWORK" \
+    -- reexecutor_info --reexecutor "$ROGUE_ADDR" 2>/dev/null)"; then
+    echo "FATAL: could not read '$ROGUE_ALIAS' state from the RPC; not staking. Re-run once the RPC answers." >&2
+    exit 1
+  fi
   if ! echo "$ROGUE_INFO" | grep -q '"active": *true'; then
     echo "==> Staking '$ROGUE_ALIAS' (1,000 XLM)"
     stellar keys fund "$ROGUE_ALIAS" --network "$NETWORK" >/dev/null 2>&1 || true

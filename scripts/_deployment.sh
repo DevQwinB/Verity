@@ -41,9 +41,36 @@ DEPLOYER="${ALIAS_PREFIX}deployer"
 KEEPER="${ALIAS_PREFIX}keeper"
 BOOTSTRAP_REEXECUTORS=("${ALIAS_PREFIX}rex1" "${ALIAS_PREFIX}rex2" "${ALIAS_PREFIX}rex3" "${ALIAS_PREFIX}rex4" "${ALIAS_PREFIX}rex5")
 
-json_field() { grep -o "\"$1\": *\"[^\"]*\"" "$DEPLOY_JSON" | cut -d'"' -f4; }
+# The record is flattened onto one line and matched with optional whitespace
+# around ":" and ",", so pretty-printing deployments/<name>.json (or a space
+# before a colon) does not change what these return.
+_deployment_flat() { tr -d '\n\r' < "$DEPLOY_JSON"; }
 
-deployment_is_public() { grep -q '"public": *true' "$DEPLOY_JSON"; }
+json_field() {
+  _deployment_flat | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+deployment_is_public() { _deployment_flat | grep -E '"public"[[:space:]]*:[[:space:]]*true' >/dev/null; }
+
+# The public key recorded for a bootstrap re-executor alias, or nothing.
+recorded_reexecutor_key() {
+  _deployment_flat \
+    | grep -o "\"alias\"[[:space:]]*:[[:space:]]*\"$1\"[^}]*\"public_key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+    | sed 's/.*"\([^"]*\)"$/\1/' || true
+}
+
+# Exits non-zero naming every missing tool, instead of a bare
+# "command not found" partway through a run.
+require_commands() {
+  local missing=() cmd
+  for cmd in "$@"; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "FATAL: missing required tool(s): ${missing[*]} — install them and re-run" >&2
+    exit 1
+  fi
+}
 
 require_deployment() {
   if [ ! -f "$DEPLOY_JSON" ]; then
@@ -67,9 +94,11 @@ assert_identities_match() {
     problems=1
   fi
   for alias in "${BOOTSTRAP_REEXECUTORS[@]}"; do
-    recorded="$(grep -o "{\"alias\":\"$alias\",\"public_key\":\"[^\"]*\"" "$DEPLOY_JSON" | cut -d'"' -f8)"
+    recorded="$(recorded_reexecutor_key "$alias")"
     current="$(stellar keys address "$alias" 2>/dev/null || true)"
-    if [ -n "$recorded" ] && [ -n "$current" ] && [ "$recorded" != "$current" ]; then
+    if [ -z "$recorded" ]; then
+      echo "WARN: deployment '$DEPLOYMENT' records no key for '$alias', so that identity is not checked." >&2
+    elif [ -n "$current" ] && [ "$recorded" != "$current" ]; then
       echo "FATAL: keystore identity '$alias' is $current, but deployment '$DEPLOYMENT' staked $recorded under that name." >&2
       problems=1
     fi
