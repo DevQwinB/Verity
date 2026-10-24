@@ -48,6 +48,20 @@ async function loadArtifact(ref: string | null): Promise<string | null> {
   return artifact ? Buffer.from(artifact.content_base64, "base64").toString("utf8") : null;
 }
 
+type Loaded<T> = { ok: true; value: T } | { ok: false };
+
+/** Runs a secondary read so that its failure only empties its own section
+ * instead of taking down the whole page. */
+async function settle<T>(work: Promise<T>, what: string): Promise<Loaded<T>> {
+  try {
+    return { ok: true, value: await work };
+  } catch (err) {
+    unstable_rethrow(err);
+    console.error(`submission page: could not load ${what}`, err);
+    return { ok: false };
+  }
+}
+
 export default async function SubmissionDetailPage({
   params,
 }: {
@@ -60,13 +74,20 @@ export default async function SubmissionDetailPage({
 
   const isDraft = submission.chain_submission_id === null;
 
-  const [proof, attestation, inputText, functionText, outputText] = await Promise.all([
-    backendGetOrNull<ProofStatus>(`/v1/submissions/${id}/proof`),
-    detail.has_attestation ? backendGetOrNull<Attestation>(`/v1/submissions/${id}/attestation`) : null,
-    loadArtifact(submission.input_ref),
-    loadArtifact(submission.function_ref),
-    loadArtifact(submission.claimed_output_ref),
+  const [proofResult, attestationResult, inputResult, functionResult, outputResult] = await Promise.all([
+    settle(backendGetOrNull<ProofStatus>(`/v1/submissions/${id}/proof`), `/v1/submissions/${id}/proof`),
+    settle(
+      detail.has_attestation
+        ? backendGetOrNull<Attestation>(`/v1/submissions/${id}/attestation`)
+        : Promise.resolve(null),
+      `/v1/submissions/${id}/attestation`
+    ),
+    settle(loadArtifact(submission.input_ref), `artifact ${submission.input_ref}`),
+    settle(loadArtifact(submission.function_ref), `artifact ${submission.function_ref}`),
+    settle(loadArtifact(submission.claimed_output_ref), `artifact ${submission.claimed_output_ref}`),
   ]);
+  const proof = proofResult.ok ? proofResult.value : null;
+  const attestation = attestationResult.ok ? attestationResult.value : null;
 
   const deadline = windowDeadlineIso(submission.submitted_at, submission.challenge_window_s);
   const open = submission.status === "pending" || submission.status === "disputed";
@@ -162,12 +183,12 @@ export default async function SubmissionDetailPage({
           <ArtifactBlock
             label={submission.task_type === "retrieval" ? "Request spec" : "Input"}
             hash={submission.input_hash}
-            text={inputText}
+            result={inputResult}
           />
           {submission.task_type === "deterministic" && (
-            <ArtifactBlock label="Function body" hash={submission.function_hash} text={functionText} />
+            <ArtifactBlock label="Function body" hash={submission.function_hash} result={functionResult} />
           )}
-          <ArtifactBlock label="Claimed output" hash={submission.claimed_output_hash} text={outputText} />
+          <ArtifactBlock label="Claimed output" hash={submission.claimed_output_hash} result={outputResult} />
         </CardBody>
       </Card>
 
@@ -319,6 +340,19 @@ export default async function SubmissionDetailPage({
         </CardBody>
       </Card>
 
+      {detail.has_attestation && !attestationResult.ok && (
+        <Card>
+          <CardHeader>
+            <h2 className="font-medium">Signed attestation</h2>
+          </CardHeader>
+          <CardBody>
+            <p className="text-sm text-text-tertiary">
+              The signed attestation could not be loaded. Reload the page to try again.
+            </p>
+          </CardBody>
+        </Card>
+      )}
+
       {attestation && (
         <Card>
           <CardHeader>
@@ -354,7 +388,9 @@ export default async function SubmissionDetailPage({
           <h2 className="font-medium">Proof status</h2>
         </CardHeader>
         <CardBody>
-          {proof?.available ? (
+          {!proofResult.ok ? (
+            <p className="text-sm text-text-tertiary">Proof status could not be loaded right now.</p>
+          ) : proof?.available ? (
             <p className="text-sm text-status-verified">A ZK proof artifact is available.</p>
           ) : (
             <p className="max-w-prose text-sm text-text-secondary">
@@ -396,14 +432,17 @@ function Fact({ label, children }: { label: string; children: React.ReactNode })
   );
 }
 
-function ArtifactBlock({ label, hash, text }: { label: string; hash: string | null; text: string | null }) {
+function ArtifactBlock({ label, hash, result }: { label: string; hash: string | null; result: Loaded<string | null> }) {
+  const text = result.ok ? result.value : null;
   return (
     <div>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h3 className="text-sm text-text-secondary">{label}</h3>
         {hash && <span className="font-mono text-xs text-text-tertiary">sha256 {truncateMiddle(hash, 10, 10)}</span>}
       </div>
-      {text === null ? (
+      {!result.ok ? (
+        <p className="mt-2 text-sm text-text-tertiary">Could not be loaded right now.</p>
+      ) : text === null ? (
         <p className="mt-2 text-sm text-text-tertiary">Not stored on this deployment.</p>
       ) : (
         <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border-subtle bg-surface p-3 font-mono text-xs leading-relaxed">
