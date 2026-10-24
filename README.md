@@ -323,7 +323,9 @@ call it was built for.
 | `GET /v1/taxonomy` | — | |
 | `GET /v1/reports/verification-rates` | — | |
 | `POST /v1/marketplaces` | Bearer | |
-| `POST /v1/marketplaces/:id/webhooks` | Bearer | 403 for another account's marketplace |
+| `POST /v1/marketplaces/:id/webhooks` | Bearer | 400 for an unknown event name; 403 for another account's marketplace |
+| `GET /v1/marketplaces/:id/webhooks` | Bearer | your subscriptions, without `secret`; 403 for another account's marketplace |
+| `PATCH /v1/marketplaces/:id/webhooks/:webhookId` | Bearer | `{"active": boolean}`; 403 for another account's marketplace, 404 for an unknown webhook |
 
 ### Authentication and token lifetime
 
@@ -402,10 +404,19 @@ marketplace's Stellar account:
 ```
 
 The request requires a valid URL, a `secret` of at least 8 characters, and
-a non-empty `events` array of strings. The marketplace ID is a UUID; only its
-own account may register a webhook (otherwise HTTP 403). A successful
-registration returns the subscription row with HTTP 201. Event names are not
-validated at registration: unknown names are accepted but never delivered.
+a non-empty `events` array drawn from `submission.verified`,
+`submission.slashed` and `submission.disputed`; any other name is rejected
+with HTTP 400 and duplicates are stored once. The marketplace ID is a UUID;
+only its own account may register a webhook (otherwise HTTP 403). A
+successful registration returns the subscription row with HTTP 201.
+
+`GET /v1/marketplaces/:id/webhooks` lists the marketplace's subscriptions
+(`id`, `url`, `events`, `active`, `created_at`; the `secret` is never
+returned). `PATCH /v1/marketplaces/:id/webhooks/:webhookId` with
+`{"active": false}` stops deliveries to a subscription and `{"active": true}`
+resumes them; it returns the updated subscription, or HTTP 404 if that
+webhook does not exist on this marketplace. Both require the marketplace's own
+account (otherwise HTTP 403).
 
 | Event | When emitted | `data` |
 | --- | --- | --- |
