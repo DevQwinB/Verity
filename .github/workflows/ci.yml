@@ -46,6 +46,7 @@ jobs:
       # The backend and the re-executor import the contract bindings' build output.
       - run: pnpm --filter escrow-gate --filter zk-verifier-registry build
       - run: pnpm typecheck
+      - run: pnpm --filter @verity/reexecutor-agent test
       - run: pnpm --filter @verity/backend test
       - run: pnpm --filter @verity/frontend test
       - run: pnpm lint
