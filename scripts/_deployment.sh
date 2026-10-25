@@ -46,8 +46,16 @@ BOOTSTRAP_REEXECUTORS=("${ALIAS_PREFIX}rex1" "${ALIAS_PREFIX}rex2" "${ALIAS_PREF
 # before a colon) does not change what these return.
 _deployment_flat() { tr -d '\n\r' < "$DEPLOY_JSON"; }
 
+# Prints the string value of a top-level key. A missing key says so and fails;
+# under `set -e` the caller would otherwise stop with no message at all.
 json_field() {
-  _deployment_flat | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed 's/.*"\([^"]*\)"$/\1/'
+  local value
+  value="$(_deployment_flat | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed 's/.*"\([^"]*\)"$/\1/' || true)"
+  if [ -z "$value" ]; then
+    echo "FATAL: '$1' not found in $DEPLOY_JSON" >&2
+    return 1
+  fi
+  printf '%s\n' "$value"
 }
 
 deployment_is_public() { _deployment_flat | grep -E '"public"[[:space:]]*:[[:space:]]*true' >/dev/null; }
@@ -87,7 +95,7 @@ require_deployment() {
 # keeper is reported and the keystore's current one is used.
 assert_identities_match() {
   local problems=0 recorded current alias
-  recorded="$(json_field deployer_public_key)"
+  recorded="$(json_field deployer_public_key 2>/dev/null || true)"
   current="$(stellar keys address "$DEPLOYER" 2>/dev/null || true)"
   if [ -n "$recorded" ] && [ "$recorded" != "$current" ]; then
     echo "FATAL: keystore identity '$DEPLOYER' is ${current:-missing}, but the admin of deployment '$DEPLOYMENT' is $recorded." >&2
@@ -108,7 +116,7 @@ assert_identities_match() {
     echo "       original key into the keystore, or redeploy (scripts/deploy_testnet.sh --force)." >&2
     exit 1
   fi
-  recorded="$(json_field keeper_public_key)"
+  recorded="$(json_field keeper_public_key 2>/dev/null || true)"
   current="$(stellar keys address "$KEEPER" 2>/dev/null || true)"
   if [ -n "$recorded" ] && [ -n "$current" ] && [ "$recorded" != "$current" ]; then
     echo "WARN: keystore identity '$KEEPER' is $current, not the $recorded recorded at deploy time." >&2
