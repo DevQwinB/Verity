@@ -411,10 +411,12 @@ impl EscrowGate {
         Ok(())
     }
 
-    /// Blocked below min_stake_floor while any of this reexecutor's
-    /// attestations sit on a not-yet-finalized submission — see
-    /// release_attestation_lock. A reexecutor with zero open attestations
-    /// may withdraw in full, deactivating themselves.
+    /// Blocked entirely while any of this reexecutor's attestations sit on a
+    /// not-yet-finalized submission — see release_attestation_lock. A vote is
+    /// weighted by the full stake at the moment it is cast, but a slash takes a
+    /// share of the stake at slash time, so any stake allowed to leave before
+    /// then would be weight that was never at risk. A reexecutor with zero
+    /// open attestations may withdraw in full, deactivating themselves.
     pub fn withdraw_stake(e: Env, reexecutor: Address, amount: i128) -> Result<(), Error> {
         reexecutor.require_auth();
         if amount <= 0 {
@@ -428,7 +430,7 @@ impl EscrowGate {
         if new_stake < 0 {
             return Err(Error::InvalidAmount);
         }
-        if info.open_attestations > 0 && new_stake < cfg.min_stake_floor {
+        if info.open_attestations > 0 {
             return Err(Error::StakeLockedByOpenAttestation);
         }
 
