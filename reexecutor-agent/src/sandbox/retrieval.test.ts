@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { describe, it, test } from "node:test";
-import { RetrievalTransientError, hasConnectivity, isInconclusiveStatus, isPrivateAddress, resolvePointer, resolvePublicTarget, runRetrieval } from "./retrieval.js";
+import { RetrievalTransientError, getPinned, hasConnectivity, isInconclusiveStatus, isPrivateAddress, resolvePointer, resolvePublicTarget, runRetrieval } from "./retrieval.js";
 
 describe("isInconclusiveStatus", () => {
   const testCases: Array<{ status: number; expected: boolean }> = [
@@ -501,5 +501,30 @@ test("runRetrieval still refuses a loopback target", async () => {
     await assert.rejects(runRetrieval({ url }), /non-public address/);
   } finally {
     await close(server);
+  }
+});
+
+test("getPinned gives up on a server that keeps dripping bytes past the overall deadline", async () => {
+  // Each chunk arrives well inside the 10 s idle timeout, so only the overall
+  // deadline can end this request.
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/plain" });
+    const timer = setInterval(() => res.write("x"), 50);
+    res.on("close", () => clearInterval(timer));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address() as { port: number };
+    const target = await resolvePublicTarget(`http://127.0.0.1:${port}/`, { allowPrivate: true });
+    const started = Date.now();
+    await assert.rejects(getPinned(target, 300), (err: Error) => {
+      assert.ok(err instanceof RetrievalTransientError);
+      assert.match(err.message, /not finished within/);
+      return true;
+    });
+    assert.ok(Date.now() - started < 3000);
+  } finally {
+    server.closeAllConnections();
+    server.close();
   }
 });
