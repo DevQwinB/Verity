@@ -654,7 +654,7 @@ fn challenge_with_consensus_cannot_be_expired_around() {
 // ---- withdraw / release_attestation_lock bookkeeping ----
 
 #[test]
-fn withdraw_is_blocked_below_floor_while_attestation_is_open_then_unlocks_after_finalize() {
+fn withdraw_is_blocked_while_attestation_is_open_then_unlocks_after_finalize() {
     let e = Env::default();
     let w = setup(&e);
     let agent = Address::generate(&e);
@@ -664,20 +664,21 @@ fn withdraw_is_blocked_below_floor_while_attestation_is_open_then_unlocks_after_
     register_rex(&w, &rex1); // stake = 600 XLM, floor = 500 XLM
     w.client.attest_replay(&rex1, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
 
-    // Withdrawing 150 XLM would drop stake to 450, below the 500 floor,
-    // while this attestation is still open on an unfinalized submission.
-    let res = w.client.try_withdraw_stake(&rex1, &(150 * XLM));
-    assert!(matches!(res, Err(Ok(Error::StakeLockedByOpenAttestation))));
-
-    // Withdrawing down to exactly the floor (100 XLM) is fine.
-    w.client.withdraw_stake(&rex1, &(100 * XLM));
+    // The vote carried the full 600 XLM of weight, so none of it may leave
+    // while the attestation is open — not even the 100 XLM above the floor,
+    // or a voter could cast a heavy vote and keep only the floor at risk.
+    for amount in [150 * XLM, 100 * XLM, 1] {
+        let res = w.client.try_withdraw_stake(&rex1, &amount);
+        assert!(matches!(res, Err(Ok(Error::StakeLockedByOpenAttestation))));
+    }
+    assert_eq!(w.client.reexecutor_info(&rex1).unwrap().stake_amount, 600 * XLM);
 
     e.ledger().set_timestamp(e.ledger().timestamp() + 3601);
     w.client.finalize(&id);
 
     w.client.release_attestation_lock(&id, &rex1);
     // Now fully unlocked — can withdraw everything.
-    w.client.withdraw_stake(&rex1, &(500 * XLM));
+    w.client.withdraw_stake(&rex1, &(600 * XLM));
     let info = w.client.reexecutor_info(&rex1).unwrap();
     assert_eq!(info.stake_amount, 0);
 }
