@@ -328,7 +328,7 @@ fn slash_succeeds_against_a_provably_wrong_voter_after_mismatch_consensus() {
     register_rex(&w, &rex1);
     register_rex(&w, &rex2);
     register_rex(&w, &rex3);
-    w.client.attest_replay(&rex1, &id, &BytesN::from_array(&e, &[9u8; 32]), &true);
+    w.client.attest_replay(&rex1, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
     w.client.attest_replay(&rex2, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
     w.client.attest_replay(&rex3, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
 
@@ -362,7 +362,7 @@ fn releasing_the_lock_slashes_a_wrong_voter_first() {
     for r in [&wrong, &right1, &right2] {
         register_rex(&w, r);
     }
-    w.client.attest_replay(&wrong, &id, &BytesN::from_array(&e, &[9u8; 32]), &true);
+    w.client.attest_replay(&wrong, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
     w.client.attest_replay(&right1, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
     w.client.attest_replay(&right2, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
     assert_eq!(w.client.finalize(&id), Verdict::Slashed);
@@ -400,7 +400,7 @@ fn reexecutor_slash_pays_only_a_challenger_who_won() {
 
     let backer = Address::generate(&e);
     register_rex(&w, &backer);
-    w.client.attest_replay(&backer, &id, &BytesN::from_array(&e, &[9u8; 32]), &true);
+    w.client.attest_replay(&backer, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
     for _ in 0..3 {
         let r = Address::generate(&e);
         register_rex(&w, &r);
@@ -965,7 +965,7 @@ fn zero_slash_bps_disables_reexecutor_slashing() {
 
     let wrong = Address::generate(&e);
     register_rex(&w, &wrong);
-    w.client.attest_replay(&wrong, &id, &BytesN::from_array(&e, &[9u8; 32]), &true);
+    w.client.attest_replay(&wrong, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
     for _ in 0..2 {
         let r = Address::generate(&e);
         register_rex(&w, &r);
@@ -1020,7 +1020,7 @@ fn slash_extends_instance_ttl() {
     for r in [&wrong, &rex2, &rex3] {
         register_rex(&w, r);
     }
-    w.client.attest_replay(&wrong, &id, &BytesN::from_array(&e, &[9u8; 32]), &true);
+    w.client.attest_replay(&wrong, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
     w.client.attest_replay(&rex2, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
     w.client.attest_replay(&rex3, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
 
@@ -1219,7 +1219,8 @@ fn resolving_a_challenge_without_a_bonded_consensus_is_rejected() {
     for matched in [true, true, false] {
         let r = Address::generate(&e);
         register_rex(&w, &r);
-        w.client.attest_replay(&r, &id, &BytesN::from_array(&e, &[9u8; 32]), &matched);
+        let hash = BytesN::from_array(&e, &[if matched { 3u8 } else { 9u8 }; 32]);
+        w.client.attest_replay(&r, &id, &hash, &matched);
     }
     assert_eq!(
         w.client.try_resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
@@ -1565,7 +1566,7 @@ fn snapshot_reexecutor_slash_bps_preserved_after_update_config() {
     register_rex(&w, &rex2);
     register_rex(&w, &rex3);
 
-    w.client.attest_replay(&rex1, &id, &BytesN::from_array(&e, &[9u8; 32]), &true);
+    w.client.attest_replay(&rex1, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
     w.client.attest_replay(&rex2, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
     w.client.attest_replay(&rex3, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
 
@@ -1752,3 +1753,112 @@ fn retrieval_task_with_no_votes_is_verified_by_default_once_the_window_elapses()
 }
 
 mod proptest_model;
+
+// ---- vote and submission input validation ----
+
+#[test]
+fn an_all_zero_claimed_output_hash_is_rejected() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    fund(&w, &agent, 1000 * XLM);
+    let res = w.client.try_submit(
+        &agent,
+        &BytesN::from_array(&e, &[1u8; 32]),
+        &(1000 * XLM),
+        &TaskType::Deterministic,
+        &BytesN::from_array(&e, &[2u8; 32]),
+        &BytesN::from_array(&e, &[0u8; 32]),
+        &(50 * XLM),
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidOutputHash)));
+}
+
+#[test]
+fn the_submitting_agent_cannot_attest_its_own_submission() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    register_rex(&w, &agent);
+
+    let claimed = BytesN::from_array(&e, &[3u8; 32]);
+    assert_eq!(
+        w.client.try_attest_replay(&agent, &id, &claimed, &true),
+        Err(Ok(Error::AgentCannotAttest))
+    );
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!(sub.match_votes, 0);
+    assert_eq!(w.client.reexecutor_info(&agent).unwrap().open_attestations, 0);
+}
+
+#[test]
+fn a_vote_must_agree_with_the_hash_it_reports() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex);
+
+    let claimed = BytesN::from_array(&e, &[3u8; 32]);
+    let other = BytesN::from_array(&e, &[9u8; 32]);
+    // Reporting a different output while claiming it matches, and the reverse.
+    assert_eq!(
+        w.client.try_attest_replay(&rex, &id, &other, &true),
+        Err(Ok(Error::VoteContradictsHash))
+    );
+    assert_eq!(
+        w.client.try_attest_replay(&rex, &id, &claimed, &false),
+        Err(Ok(Error::VoteContradictsHash))
+    );
+    // Neither attempt was recorded, so the honest vote still goes through.
+    assert_eq!(w.client.reexecutor_info(&rex).unwrap().open_attestations, 0);
+    w.client.attest_replay(&rex, &id, &claimed, &true);
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!((sub.match_votes, sub.mismatch_votes), (1, 0));
+}
+
+#[test]
+fn a_no_output_vote_counts_as_a_mismatch() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex);
+
+    // What an honest re-executor reports when the function cannot be run.
+    w.client.attest_replay(&rex, &id, &BytesN::from_array(&e, &[0u8; 32]), &false);
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!((sub.match_votes, sub.mismatch_votes), (0, 1));
+}
+
+#[test]
+fn a_challenge_with_a_zero_bond_is_rejected_even_when_the_minimum_rounds_to_zero() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    fund(&w, &agent, 1000 * XLM);
+    // 1 stroop of escrow at 5% rounds the minimum bond down to zero.
+    let id = w.client.submit(
+        &agent,
+        &BytesN::from_array(&e, &[1u8; 32]),
+        &1,
+        &TaskType::Deterministic,
+        &BytesN::from_array(&e, &[2u8; 32]),
+        &BytesN::from_array(&e, &[3u8; 32]),
+        &1,
+    );
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 10 * XLM);
+    assert_eq!(
+        w.client.try_open_challenge(&challenger, &id, &0),
+        Err(Ok(Error::BondTooLow))
+    );
+    assert_eq!(
+        w.client.try_open_challenge(&challenger, &id, &-5),
+        Err(Ok(Error::BondTooLow))
+    );
+    assert!(w.client.get_challenge(&id).is_none());
+}
