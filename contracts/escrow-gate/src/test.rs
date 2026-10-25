@@ -1611,4 +1611,143 @@ fn snapshot_challenge_window_s_preserved_after_update_config() {
     assert_eq!(fin.challenge_window_s, 3600);
 }
 
+// ---- challenge-window boundaries, tier cutoff and Retrieval tasks ----
+
+fn submit_with(w: &World, agent: &Address, escrow_value: i128, bond: i128, task_type: TaskType) -> u64 {
+    fund(w, agent, bond);
+    w.client.submit(
+        agent,
+        &BytesN::from_array(&w.e, &[1u8; 32]),
+        &escrow_value,
+        &task_type,
+        &BytesN::from_array(&w.e, &[2u8; 32]),
+        &BytesN::from_array(&w.e, &[3u8; 32]),
+        &bond,
+    )
+}
+
+/// Submits the default 1,000 XLM Deterministic work, moves the clock
+/// `offset` seconds past the submit time, and tries to open a challenge.
+fn open_challenge_after(offset: u64) -> Result<(), Error> {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let start = e.ledger().timestamp();
+    let id = submit_default(&w, &agent);
+
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 50 * XLM);
+    e.ledger().set_timestamp(start + offset);
+    match w.client.try_open_challenge(&challenger, &id, &(50 * XLM)) {
+        Ok(Ok(_)) => Ok(()),
+        Err(Ok(err)) => Err(err),
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+/// Submits work with the given escrow value (bond at exactly 5 percent), moves
+/// the clock `offset` seconds past the submit time and finalizes with no votes
+/// and no challenge. Returns the verdict and the stored submission.
+fn finalize_after(
+    escrow_value: i128,
+    bond: i128,
+    task_type: TaskType,
+    offset: u64,
+) -> (Verdict, verity_common::SubmissionRecord) {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let start = e.ledger().timestamp();
+    let id = submit_with(&w, &agent, escrow_value, bond, task_type);
+    e.ledger().set_timestamp(start + offset);
+    let verdict = w.client.finalize(&id);
+    (verdict, w.client.get_submission(&id).unwrap())
+}
+
+#[test]
+fn open_challenge_is_accepted_one_second_before_the_window_closes() {
+    assert_eq!(open_challenge_after(3599), Ok(()));
+}
+
+#[test]
+fn open_challenge_closes_exactly_at_the_window_deadline() {
+    assert_eq!(open_challenge_after(3600), Err(Error::ChallengeWindowClosed));
+}
+
+#[test]
+fn open_challenge_stays_closed_one_second_after_the_deadline() {
+    assert_eq!(open_challenge_after(3601), Err(Error::ChallengeWindowClosed));
+}
+
+#[test]
+fn finalize_stays_pending_one_second_before_the_window_closes() {
+    let (verdict, sub) = finalize_after(1000 * XLM, 50 * XLM, TaskType::Deterministic, 3599);
+    assert_eq!(verdict, Verdict::Pending);
+    assert!(!sub.finalized);
+}
+
+#[test]
+fn finalize_verifies_by_default_exactly_at_the_window_deadline() {
+    let (verdict, sub) = finalize_after(1000 * XLM, 50 * XLM, TaskType::Deterministic, 3600);
+    assert_eq!(verdict, Verdict::Verified);
+    assert!(sub.finalized);
+    assert_eq!(sub.resolution_method, ResolutionMethod::WindowElapsed);
+}
+
+#[test]
+fn finalize_verifies_by_default_one_second_after_the_deadline() {
+    let (verdict, sub) = finalize_after(1000 * XLM, 50 * XLM, TaskType::Deterministic, 3601);
+    assert_eq!(verdict, Verdict::Verified);
+    assert_eq!(sub.resolution_method, ResolutionMethod::WindowElapsed);
+}
+
+#[test]
+fn escrow_value_just_below_the_ceiling_gets_the_small_window() {
+    let ceiling = default_config().window_tier_small_ceiling;
+    let (_, sub) = finalize_after(ceiling - 1, 5_000 * XLM, TaskType::Deterministic, 0);
+    assert_eq!(sub.challenge_window_s, 3600);
+}
+
+#[test]
+fn escrow_value_at_the_ceiling_gets_the_large_window() {
+    let ceiling = default_config().window_tier_small_ceiling;
+    let (_, sub) = finalize_after(ceiling, 5_000 * XLM, TaskType::Deterministic, 0);
+    assert_eq!(sub.challenge_window_s, 86_400);
+}
+
+#[test]
+fn large_tier_window_closes_exactly_at_86400_seconds() {
+    let ceiling = default_config().window_tier_small_ceiling;
+
+    let (verdict, sub) = finalize_after(ceiling, 5_000 * XLM, TaskType::Deterministic, 86_399);
+    assert_eq!(verdict, Verdict::Pending);
+    assert!(!sub.finalized);
+
+    let (verdict, sub) = finalize_after(ceiling, 5_000 * XLM, TaskType::Deterministic, 86_400);
+    assert_eq!(verdict, Verdict::Verified);
+    assert_eq!(sub.resolution_method, ResolutionMethod::WindowElapsed);
+}
+
+#[test]
+fn retrieval_task_with_no_votes_is_verified_by_default_once_the_window_elapses() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let start = e.ledger().timestamp();
+    let id = submit_with(&w, &agent, 1000 * XLM, 50 * XLM, TaskType::Retrieval);
+    assert_eq!(w.token.balance(&agent), 0);
+
+    e.ledger().set_timestamp(start + 3599);
+    assert_eq!(w.client.finalize(&id), Verdict::Pending);
+    assert_eq!(w.token.balance(&agent), 0);
+
+    e.ledger().set_timestamp(start + 3600);
+    assert_eq!(w.client.finalize(&id), Verdict::Verified);
+    assert_eq!(w.token.balance(&agent), 50 * XLM);
+    assert_eq!(
+        w.client.get_submission(&id).unwrap().resolution_method,
+        ResolutionMethod::WindowElapsed
+    );
+}
+
 mod proptest_model;
