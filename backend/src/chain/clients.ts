@@ -1,5 +1,4 @@
 import { Client as EscrowGateClient } from "escrow-gate";
-import { Client as ZkRegistryClient } from "zk-verifier-registry";
 import { env } from "../config/env.js";
 import { keeperPublicKey, keeperSigner } from "./keeper.js";
 
@@ -19,26 +18,11 @@ export function escrowGateFor(publicKey: string) {
   });
 }
 
-export function zkRegistryFor(publicKey: string) {
-  return new ZkRegistryClient({
-    ...base,
-    contractId: env.ZK_VERIFIER_REGISTRY_CONTRACT_ID,
-    publicKey,
-  });
-}
-
 /** Verity's own keeper-signed client, for server-initiated calls
  * (finalize sweeps, slash, resolve_challenge) that carry no user key. */
 export const escrowGateAsKeeper = new EscrowGateClient({
   ...base,
   contractId: env.ESCROW_GATE_CONTRACT_ID,
-  publicKey: keeperPublicKey,
-  ...keeperSigner,
-});
-
-export const zkRegistryAsKeeper = new ZkRegistryClient({
-  ...base,
-  contractId: env.ZK_VERIFIER_REGISTRY_CONTRACT_ID,
   publicKey: keeperPublicKey,
   ...keeperSigner,
 });

@@ -73,7 +73,7 @@ export async function relaySignedXdr(
   signedXdr: string
 ): Promise<{ hash: string; status: "SUCCESS"; returnValue: unknown }> {
   const tx = TransactionBuilder.fromXDR(signedXdr, env.NETWORK_PASSPHRASE);
-  const sendResult = await server.sendTransaction(tx as any);
+  const sendResult = await server.sendTransaction(tx);
   if (sendResult.status === "ERROR") {
     const code = sendResult.errorResult?.result.type ?? "unknown";
     throw new HttpError(422, `The network rejected the transaction (${code}).`);
