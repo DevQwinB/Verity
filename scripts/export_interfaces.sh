@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Exports the frozen EscrowGate / ZKVerifierRegistry contract interfaces as
-# JSON so the backend team generates typed TS bindings
-# (`stellar contract bindings typescript`) instead of hand-rolling XDR.
+# Exports the EscrowGate / ZKVerifierRegistry / example marketplace contract
+# interfaces as JSON snapshots in deployments/interfaces/, a readable reference
+# for integrators. The backend's typed bindings are generated from the built
+# wasm by scripts/generate_bindings.sh, not from these files.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -109,6 +109,9 @@ http://localhost:3000 and the API on http://localhost:3001. The README's
 pnpm test:contracts                                   # cargo test in contracts/
 pnpm --filter escrow-gate --filter zk-verifier-registry build   # bindings build output, needed by typecheck
 pnpm typecheck                                        # every package
+pnpm --filter @verity/backend test                    # backend unit tests
+pnpm --filter @verity/frontend test                   # dashboard unit tests
+pnpm --filter @verity/reexecutor-agent test           # sandbox, canonical JSON, retrieval
 pnpm lint                                             # frontend ESLint
 pnpm --filter @verity/frontend build                  # dashboard builds
 ```
@@ -139,9 +142,9 @@ For contract changes also run `cargo fmt` and `cargo clippy` inside
   `SMOKE_PROFILE=underquorum pnpm smoke` (with `VERITY_REEXECUTORS="rex1 rex2"`)
   wait out real challenge windows; run them for changes that touch
   finalisation, expiry or assignment.
-- **TypeScript unit tests** are thin today. Adding focused tests for pure
-  logic (canonical JSON, consensus arithmetic, assignment ranking, the URL
-  guard) is welcome and a good first contribution.
+- **TypeScript unit tests** live next to the code as `*.test.ts` (backend,
+  re-executor agent) and `*.test.mjs` (dashboard) and run with
+  `pnpm --filter <package> test`. New pure logic should come with a test.
 
 ### Changing a contract interface
 
@@ -149,7 +152,9 @@ For contract changes also run `cargo fmt` and `cargo clippy` inside
 2. Regenerate the TypeScript bindings:
    `scripts/generate_bindings.sh` (builds the wasm, writes
    `backend/src/chain/generated/`). Commit the result.
-3. Refresh the frozen interface JSON with `scripts/export_interfaces.sh` if
+3. Refresh the interface snapshots in `deployments/interfaces/` with
+   `scripts/export_interfaces.sh` (it needs the release wasm: run
+   `cargo build --release --target wasm32v1-none` in `contracts/` first) if
    the PR changes a public entrypoint.
 4. Redeploy to your own deployment to try it
    (`VERITY_DEPLOYMENT=<name> scripts/deploy_testnet.sh --force`). Do not

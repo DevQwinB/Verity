@@ -20,6 +20,7 @@ Closes #
 
 - [ ] `pnpm test:contracts`
 - [ ] `pnpm typecheck` and `pnpm lint`
+- [ ] `pnpm --filter <package> test` for each TypeScript package you touched (backend, frontend, reexecutor-agent)
 - [ ] `pnpm smoke` against a local `pnpm dev` (needed for backend, agent or contract-flow changes)
 - [ ] Slow smoke modes (`SMOKE_SLOW=1`, `SMOKE_PROFILE=underquorum`), for changes to finalisation, expiry or assignment
 - [ ] Container image rebuilt, for Dockerfile or dependency changes

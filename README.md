@@ -256,9 +256,9 @@ Deterministic tasks run in a sandboxed JavaScript runtime:
     address: loopback, private, and link-local IP addresses are rejected, and the request
     connects directly to the validated IP.
 14. **Redirects and response codes.** Redirects are not followed; HTTP 3xx status codes
-    are treated as a mismatch. HTTP 4xx status codes or other non-2xx responses are also
-    mismatches. Responses with status 5xx, 408, 429, timeouts, or network errors are
-    treated as transient: the worker retries for up to `min(RETRIEVAL_RETRY_BUDGET_S, challenge window / 2)`
+    are treated as a mismatch. Definitive 4xx statuses (for example 404 or 410) and other
+    non-2xx responses are also mismatches. Statuses 401, 403, 408, 429, 451 and anything
+    from 500 up, DNS failures, timeouts, and network errors are treated as transient: the worker retries for up to `min(RETRIEVAL_RETRY_BUDGET_S, challenge window / 2)`
     seconds (default `RETRIEVAL_RETRY_BUDGET_S` is 120 s), verifies its own network
     connectivity, and only votes mismatch if its own connectivity is intact. Each HTTP request
     times out after 10 s, and response bodies are capped at 1,000,000 bytes.
@@ -352,7 +352,7 @@ Every error body is `{ "error": "<message>" }`, with one addition:
 |---|---|---|
 | 400 | request validation | `{ "error": "<path>: <message>; …" }` (one entry per invalid field) |
 | 400/403/404 | hand-written route checks | `{ "error": … }` — e.g. 404 `{ "error": "not found" }`, 403 `{ "error": "forbidden" }` on the ownership checks above |
-| 400/403/422/504 | relay checks | `{ "error": … }` |
+| 400/403/422/502/503/504 | relay checks | `{ "error": … }` |
 | 413 | artifact over `ARTIFACT_MAX_BYTES` (default 262144; request bodies cap at 1 MiB) | `{ "error": … }` |
 | 422 | the contract rejected the transaction | `{ "error": "EscrowGate rejected the transaction: <ErrorName>", "contract_error": "<ErrorName>" }` |
 | 500 | anything unexpected | `{ "error": "internal error" }` |
@@ -513,12 +513,13 @@ The address check runs both at registration and immediately before delivery.
 Redirects are not followed: any redirect fails the delivery.
 
 **Delivery is best-effort: one attempt, no retry.** A delivery times out
-after 30 seconds. HTTP 2xx counts as delivered; other responses, timeouts,
+after 5 seconds. HTTP 2xx counts as delivered; other responses, timeouts,
 redirects, and transport failures count as failed. The backend records
 delivery attempts internally but provides no delivery-history API.
-Dispatch is awaited inline during verdict handling. Failed HTTP responses
-and transport errors are recorded in `webhook_delivery` and logged;
-unexpected dispatcher rejections also reach callers' error logs.
+Deliveries run in the background after the verdict is recorded and never
+block verdict handling. Failed HTTP responses and transport errors are
+recorded in `webhook_delivery` and logged by the dispatcher; a delivery still
+in flight when the process exits stays `pending`.
 No delivery to a receiver is guaranteed.
 
 
@@ -547,10 +548,12 @@ The response contains `payload`, `canonical`, `signature`,
   a separately modified `payload`.
 - `signature` is the base64-encoded raw 64-byte ed25519 signature;
   `signature_algorithm` is `"ed25519"`.
-- `signer` is the keeper's Stellar G-address, also recorded as
-  `payload.attestor.stellar_account`. Pin it to the expected
-  `keeper_public_key` in your trusted `deployments/<name>.json`. If the
-  keeper rotates, **independently** verify the replacement public key with
+- `signer` is the attestation signing key's Stellar G-address, also recorded as
+  `payload.attestor.stellar_account`. It is the keeper unless the operator set
+  `ATTESTATION_SIGNING_SECRET`, in which case it is that separate key. Pin it to
+  the key your deployment operator publishes (the `keeper_public_key` in your
+  trusted `deployments/<name>.json` when no separate key is set). If the
+  signing key rotates, **independently** verify the replacement public key with
   your deployment operator and explicitly pin it with
   `TRUSTED_KEEPER_PUBLIC_KEY` for new attestations. Keep the old pin for
   historical records: the deployment JSON may retain the original key.
