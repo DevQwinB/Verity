@@ -17,6 +17,10 @@ export interface RetrievalSpec {
 
 const MAX_BODY_BYTES = 1_000_000;
 const TIMEOUT_MS = 10_000;
+/** Hard cap on one whole request. TIMEOUT_MS only trips on silence, so a
+ * server dripping a byte every few seconds would otherwise hold the worker
+ * (and its heartbeat) for as long as it likes. */
+const TOTAL_TIMEOUT_MS = 30_000;
 
 /**
  * The target could not be reached (DNS failure including ENOTFOUND, network error),
@@ -98,7 +102,7 @@ export async function resolvePublicTarget(raw: string, opts: { allowPrivate: boo
 /** One GET to the pinned address, never following redirects. Resolves with
  * any HTTP response; rejects with RetrievalTransientError when no response
  * could be obtained. */
-function getPinned(target: PinnedTarget): Promise<{ status: number; body: string }> {
+export function getPinned(target: PinnedTarget, totalTimeoutMs = TOTAL_TIMEOUT_MS): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const transport = target.url.protocol === "https:" ? https : http;
     const req = transport.get(
@@ -134,6 +138,11 @@ function getPinned(target: PinnedTarget): Promise<{ status: number; body: string
       }
     );
     req.on("timeout", () => req.destroy(new RetrievalTransientError(`no response within ${TIMEOUT_MS / 1000}s`)));
+    const deadline = setTimeout(
+      () => req.destroy(new RetrievalTransientError(`not finished within ${totalTimeoutMs / 1000}s`)),
+      totalTimeoutMs
+    );
+    req.on("close", () => clearTimeout(deadline));
     req.on("error", (err) =>
       reject(err instanceof RetrievalTransientError ? err : new RetrievalTransientError(`request failed: ${err.message}`))
     );

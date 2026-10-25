@@ -7,6 +7,8 @@ import { Client as EscrowGateClient } from "escrow-gate";
 import type { SubmissionRecord } from "escrow-gate";
 import { REPLAY_ENGINE, ReplayInfrastructureError, runDeterministicFunction } from "./sandbox/runner.js";
 import { hasConnectivity, RetrievalTransientError, runRetrieval } from "./sandbox/retrieval.js";
+import { assertSep10Challenge } from "./sep10.js";
+import { NO_OUTPUT_HASH, voteMatches } from "./vote.js";
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:3001";
 const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
@@ -60,8 +62,10 @@ let token: string | null = null;
 
 async function login(): Promise<string> {
   const challengeRes = await fetch(`${BACKEND_URL}/auth?account=${publicKey}`);
+  if (!challengeRes.ok) throw new Error(`SEP-10 challenge request failed: HTTP ${challengeRes.status}`);
   const { transaction } = (await challengeRes.json()) as { transaction: string };
   const tx = TransactionBuilder.fromXDR(transaction, NETWORK_PASSPHRASE);
+  assertSep10Challenge(tx, publicKey);
   tx.sign(keypair);
   const verifyRes = await fetch(`${BACKEND_URL}/auth`, {
     method: "POST",
@@ -108,11 +112,6 @@ interface Assignment {
   chain_submission_id: string;
 }
 
-/** 32 zero bytes: the recorded output hash when the declared work could not
- * be reproduced at all (it threw, exceeded the sandbox's limits, or its
- * artifacts are missing or malformed). That is itself a mismatch with
- * whatever the agent claimed. */
-const NO_OUTPUT_HASH = "0".repeat(64);
 const noOutput = (why: string) => ({ outputHash: NO_OUTPUT_HASH, engine: why });
 
 const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
@@ -219,7 +218,7 @@ async function processAssignment(a: Assignment) {
   console.log(`${tag} re-executing ${record.task_type.tag.toLowerCase()} submission #${a.chain_submission_id}`);
   const { outputHash, engine } = await reExecute(a, record);
   const claimed = hex(record.claimed_output_hash);
-  const matched = outputHash === claimed;
+  const matched = voteMatches(outputHash, claimed);
   console.log(`${tag}   engine=${engine}`);
   console.log(`${tag}   output=${outputHash} claimed=${claimed} matched=${matched}`);
 
