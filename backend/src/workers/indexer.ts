@@ -13,6 +13,7 @@ import { escrowGateAsKeeper } from "../chain/clients.js";
 import { consensusOutcome, finalizeOnChain, minChallengerBond, readSubmission } from "../chain/actions.js";
 import { dispatchWebhook } from "../modules/webhooks/dispatcher.js";
 import { recordTerminalVerdict } from "../modules/submissions/verdict.js";
+import { isTransientError } from "./transient.js";
 
 const CONTRACT_ID = env.ESCROW_GATE_CONTRACT_ID;
 
@@ -425,8 +426,10 @@ export async function maybeEarlyFinalize(submissionRowId: string, chainSubmissio
   await recordTerminalVerdict(submissionRowId, status, txHash);
 }
 
-/** Consecutive failures on the same event, so one permanently unprocessable
- * event cannot wedge the indexer forever (transient RPC/DB errors retry). */
+/** Consecutive deterministic failures on the same event, so one permanently
+ * unprocessable event cannot wedge the indexer forever. Transient failures
+ * (network, database or RPC unavailable) never count: the event is retried
+ * until the dependency recovers, because skipping it would lose a verdict. */
 let stuckEvent: { id: string; failures: number } | null = null;
 const MAX_EVENT_RETRIES = 5;
 
@@ -465,6 +468,7 @@ export async function pollOnce(): Promise<number> {
       await handleEvent(topic, value, ev.ledger, ev.txHash);
       stuckEvent = null;
     } catch (err) {
+      if (isTransientError(err)) throw err;
       const failures = stuckEvent?.id === ev.id ? stuckEvent.failures + 1 : 1;
       stuckEvent = { id: ev.id, failures };
       if (failures < MAX_EVENT_RETRIES) throw err;
