@@ -54,6 +54,8 @@ export interface SubmissionTable {
   finalize_tx_hash: string | null;
   escrow_value: string | null;
   min_challenger_bond: string | null;
+  /** Last time the relay endpoint broadcast this draft's signed transaction. */
+  relay_started_at: Timestamp | null;
   created_at: GeneratedTimestamp;
   updated_at: GeneratedTimestamp;
 }

@@ -5,13 +5,34 @@ import { db } from "../../db.js";
 import { escrowGateFor } from "../../chain/clients.js";
 import { minChallengerBond, readSubmission } from "../../chain/actions.js";
 import { env } from "../../config/env.js";
-import { parseGateCall, relaySignedXdr } from "../../chain/rpc.js";
+import { parseGateCall, relaySignedXdr, server } from "../../chain/rpc.js";
 import { bufFromHex, sha256Bytes, toChainTaskType } from "../../chain/mappers.js";
 import { canonicalJson } from "../../chain/canonical.js";
 import { HttpError } from "../../http-error.js";
 import { findOrCreateMarketplaceForAccount } from "../marketplaces/routes.js";
 import { artifactExists } from "../artifacts/storage.js";
 import { submitBody } from "./schema.js";
+import { decideSupersede, type ChainTxStatus } from "./supersede.js";
+
+/** Decides whether a retry may replace an unconfirmed draft's transaction.
+ * Returns the response to send when it may not (the earlier transaction is
+ * already on-chain), throws 409 while it may still land, and returns null
+ * when the draft is free to be rebuilt. */
+async function holdBackUnconfirmedDraft(draft: { relay_started_at: Date | null; chain_tx_hash: string | null }) {
+  if (!draft.relay_started_at || !draft.chain_tx_hash) return null;
+  const { status } = await server.getTransaction(draft.chain_tx_hash);
+  const decision = decideSupersede({
+    relayStartedAt: draft.relay_started_at,
+    chainStatus: status as ChainTxStatus,
+  });
+  if (decision === "rebuild") return null;
+  if (decision === "landed") return "landed" as const;
+  throw new HttpError(
+    409,
+    "An earlier attempt for this idempotency_key was already sent to the network and may still confirm. " +
+      "Retry in a few minutes; it will resolve to that submission if it lands."
+  );
+}
 
 /** An artifact reference is the storage_ref POST /v1/artifacts returned,
  * whose last path segment is the content hash. The artifact must really be
@@ -88,6 +109,10 @@ export async function submissionsRoutes(app: FastifyInstance) {
       .executeTakeFirst();
     if (existing?.chain_submission_id) {
       // Already signed and on-chain: nothing left to sign.
+      return { submission: existing, unsigned_transaction_xdr: null, network_passphrase: env.NETWORK_PASSPHRASE };
+    }
+    if (existing && (await holdBackUnconfirmedDraft(existing)) === "landed") {
+      // The relayed transaction is on-chain; the indexer attaches the id.
       return { submission: existing, unsigned_transaction_xdr: null, network_passphrase: env.NETWORK_PASSPHRASE };
     }
 
@@ -189,7 +214,7 @@ export async function submissionsRoutes(app: FastifyInstance) {
         throw new HttpError(409, "idempotency_key is already in use");
       }
 
-      if (raced.chain_submission_id) {
+      if (raced.chain_submission_id || (await holdBackUnconfirmedDraft(raced)) === "landed") {
         return { submission: raced, unsigned_transaction_xdr: null, network_passphrase: env.NETWORK_PASSPHRASE };
       }
 
@@ -221,7 +246,20 @@ export async function submissionsRoutes(app: FastifyInstance) {
       reply.code(400);
       return { error: "signed transaction is not the one built for this submission" };
     }
-    const { hash, returnValue } = await relaySignedXdr(body.signed_transaction_xdr);
+    await db.updateTable("submission").set({ relay_started_at: new Date() }).where("id", "=", draft.id).execute();
+    let relayed: Awaited<ReturnType<typeof relaySignedXdr>>;
+    try {
+      relayed = await relaySignedXdr(body.signed_transaction_xdr);
+    } catch (err) {
+      // 422 (rejected or failed on-chain) and 503 (not accepted) mean this
+      // transaction cannot land, so the draft may be rebuilt at once. A 504
+      // timeout leaves it marked: the transaction may still confirm.
+      if (err instanceof HttpError && (err.statusCode === 422 || err.statusCode === 503)) {
+        await db.updateTable("submission").set({ relay_started_at: null }).where("id", "=", draft.id).execute();
+      }
+      throw err;
+    }
+    const { hash, returnValue } = relayed;
     // From here on the transaction is on-chain. Without a u64 id the row is
     // left for the indexer, which matches the draft by its tx hash, and the
     // caller is told not to resend.
