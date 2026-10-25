@@ -152,7 +152,10 @@ const CONTRACT_ERROR_DESCRIPTIONS: Record<string, string> = {
   SubmissionNotFound: "The contract has no record of this submission.",
   InvalidAmount: "The amount must be greater than zero and cannot exceed available stake.",
   StakeLockedByOpenAttestation:
-    "Stake is locked while the re-executor has open attestations and cannot be withdrawn below the minimum until they settle.",
+    "Stake is locked while the re-executor has open attestations. None of it can be withdrawn until those submissions settle.",
+  InvalidOutputHash: "The claimed output hash cannot be all zeros; that value is reserved for \"no output\".",
+  VoteContradictsHash: "The vote disagrees with the output hash it reports.",
+  AgentCannotAttest: "The agent that made a submission cannot vote on it.",
   ReexecutorNotActive:
     "This account is not an active re-executor or its stake is below the minimum threshold.",
 };

@@ -306,6 +306,12 @@ impl EscrowGate {
         if escrow_value <= 0 {
             return Err(Error::InvalidEscrowValue);
         }
+        // All zeros is what a re-executor reports when it could not produce
+        // an output at all; a claim of it would make that honest "no output"
+        // vote indistinguishable from agreement with the claim.
+        if output_hash == BytesN::from_array(&e, &[0u8; 32]) {
+            return Err(Error::InvalidOutputHash);
+        }
         // v1 only covers deterministic-replayable and statistically
         // spot-checkable retrieval tasks (PRD §5/§3 scope). Open-ended/
         // subjective tasks have no on-chain verification path in Phase 1.
@@ -482,6 +488,16 @@ impl EscrowGate {
         if sub.finalized {
             return Err(Error::ChallengeWindowClosed);
         }
+        // The agent being checked cannot vote on its own work.
+        if reexecutor == sub.agent {
+            return Err(Error::AgentCannotAttest);
+        }
+        // `matched` is the tally's only input, but the hash it was derived
+        // from is public: a vote claiming a match must report the claimed
+        // hash, and one claiming a mismatch must report a different one.
+        if matched != (output_hash == sub.claimed_output_hash) {
+            return Err(Error::VoteContradictsHash);
+        }
 
         storage::mark_attested(&e, submission_id, &reexecutor, matched);
         info.open_attestations = info.open_attestations.saturating_add(1);
@@ -569,7 +585,9 @@ impl EscrowGate {
             return Err(Error::ChallengeAlreadyOpen);
         }
         let min_bond = checked_bps(sub.escrow_value, sub.cfg_challenger_bond_min_bps)?;
-        if bond < min_bond {
+        // Mirrors submit(): the proportional minimum rounds down to zero for
+        // a tiny escrow, and a challenge with nothing at stake is free.
+        if bond <= 0 || bond < min_bond {
             return Err(Error::BondTooLow);
         }
 

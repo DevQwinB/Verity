@@ -176,7 +176,8 @@ and use "Fund my testnet account" on the home page. Then:
   (see `reexecutor-agent/.env.example`); work is only assigned to accounts
   whose worker is polling.
 - Open a pending submission to challenge it while its window is open.
-- A re-executor can withdraw stake from its own page.
+- A re-executor can withdraw stake from its own page, but not while any of its
+  votes sits on a submission that has not settled.
 
 ## Writing replayable work
 

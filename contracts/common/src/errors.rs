@@ -15,6 +15,7 @@ pub enum Error {
     BondTooLow = 11,
     InvalidTaskType = 12,
     InvalidEscrowValue = 13,
+    InvalidOutputHash = 14,
 
     ReexecutorNotActive = 20,
     StakeBelowFloor = 21,
@@ -24,6 +25,8 @@ pub enum Error {
     AttestationAlreadyReleased = 25,
     SubmissionNotFinalized = 26,
     ReexecutorNotApproved = 27,
+    VoteContradictsHash = 28,
+    AgentCannotAttest = 29,
 
     ChallengeAlreadyOpen = 30,
     ChallengeNotFound = 31,

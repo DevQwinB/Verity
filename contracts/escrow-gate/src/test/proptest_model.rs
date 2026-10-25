@@ -80,7 +80,9 @@ fn run_case(votes: Vec<(i64, bool)>) {
         let rex = Address::generate(&e);
         token_admin.mint(&rex, &(stake + 1));
         client.register_reexecutor(&rex, &stake);
-        client.attest_replay(&rex, &submission_id, &BytesN::from_array(&e, &[9u8; 32]), matched);
+        // A match reports the claimed hash, a mismatch a different one.
+        let hash = BytesN::from_array(&e, &[if *matched { 3u8 } else { 9u8 }; 32]);
+        client.attest_replay(&rex, &submission_id, &hash, matched);
         recorded_votes.push((stake, *matched));
     }
 
