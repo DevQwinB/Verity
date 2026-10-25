@@ -12,7 +12,7 @@ declare module "fastify" {
 }
 
 export async function authPlugin(app: FastifyInstance) {
-  app.get("/auth", async (req, reply) => {
+  app.get("/auth", async (req) => {
     const query = z
       .object({
         account: z

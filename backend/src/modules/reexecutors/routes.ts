@@ -100,25 +100,25 @@ export async function reexecutorsRoutes(app: FastifyInstance) {
     });
     const unsignedXdr = assembled.toXDR();
 
-    let row = await db
+    // onConflict, not select-then-insert: a double submit would otherwise
+    // lose the race on the unique stellar_account and answer 500.
+    await db
+      .insertInto("reexecutor")
+      .values({
+        stellar_account: account,
+        // Nothing is staked until the signed transaction lands; the
+        // relay step (and the indexer) fill in the real on-chain amount.
+        // Until then the row is not listed.
+        stake_amount: "0",
+        stake_asset: "native",
+      })
+      .onConflict((oc) => oc.column("stellar_account").doNothing())
+      .execute();
+    const row = await db
       .selectFrom("reexecutor")
       .selectAll()
       .where("stellar_account", "=", account)
-      .executeTakeFirst();
-    if (!row) {
-      row = await db
-        .insertInto("reexecutor")
-        .values({
-          stellar_account: account,
-          // Nothing is staked until the signed transaction lands; the
-          // relay step (and the indexer) fill in the real on-chain amount.
-          // Until then the row is not listed.
-          stake_amount: "0",
-          stake_asset: "native",
-        })
-        .returningAll()
-        .executeTakeFirstOrThrow();
-    }
+      .executeTakeFirstOrThrow();
 
     reply.code(201);
     return { reexecutor: row, unsigned_transaction_xdr: unsignedXdr };

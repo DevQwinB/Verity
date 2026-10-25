@@ -1,6 +1,11 @@
 import { z } from "zod";
 
-export const sha256Hex = z.string().regex(/^[0-9a-f]{64}$/, "must be a lowercase hex sha256 digest");
+export const sha256Hex = z
+  .string()
+  .regex(/^[0-9a-f]{64}$/, "must be a lowercase hex sha256 digest")
+  // Re-executors record 32 zero bytes for "could not reproduce this work", so
+  // no real artifact or output may use it as its hash.
+  .refine((v) => v !== "0".repeat(64), "must not be the all-zero hash");
 
 export const I128_MAX = 2n ** 127n - 1n;
 

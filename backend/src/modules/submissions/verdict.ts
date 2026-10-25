@@ -31,6 +31,17 @@ export async function recordTerminalVerdict(submissionRowId: string, status: str
     (await db.selectFrom("submission").selectAll().where("id", "=", submissionRowId).executeTakeFirst());
   if (!sub) return;
 
+  // Dispatched before anything below that can throw (the contract read in
+  // particular): a retry after a failure finds the row already terminal, so
+  // the webhook would never fire for this verdict again.
+  if (transitioned && (terminal === "verified" || terminal === "slashed")) {
+    await dispatchWebhook(sub.marketplace_id, `submission.${terminal}`, {
+      submission_id: sub.id,
+      status: terminal,
+      tx_hash: txHash ?? null,
+    }).catch((err) => console.error("[verdict] webhook dispatch failed:", err));
+  }
+
   // Filled in whenever they are still missing, so a call that knows the
   // finalize transaction can complete a row first written by one that did not.
   if (!sub.resolution_method || (txHash && !sub.finalize_tx_hash)) {
@@ -53,13 +64,5 @@ export async function recordTerminalVerdict(submissionRowId: string, status: str
       .where("submission_id", "=", sub.id)
       .where("resolved_at", "is", null)
       .execute();
-  }
-
-  if (transitioned && (terminal === "verified" || terminal === "slashed")) {
-    await dispatchWebhook(sub.marketplace_id, `submission.${terminal}`, {
-      submission_id: sub.id,
-      status: terminal,
-      tx_hash: txHash ?? null,
-    }).catch((err) => console.error("[verdict] webhook dispatch failed:", err));
   }
 }
