@@ -6,7 +6,7 @@ The Next.js dashboard for Verity.
 
 The Verity dashboard is built with **Next.js 16**, **React 19**, and **Tailwind CSS 4** (see `frontend/package.json`).
 
-It serves as the user-facing web interface for viewing verification statuses, submitting tasks, registering re-executors, and monitoring disputes. Following the architectural principle in `CONTRIBUTING.md`, the dashboard only renders what the backend API reports—the backend remains the sole authority on chain state.
+It serves as the user-facing web interface for viewing verification statuses, submitting tasks, registering re-executors, and monitoring disputes. Following the architectural principle in `CONTRIBUTING.md`, the dashboard only renders what the backend API reports—the contract is the authority and the backend mirrors it.
 
 The application interacts with the Stellar network by signing transactions through the [Freighter](https://www.freighter.app/) browser wallet extension. The frontend never holds or manages a user's private keys.
 
@@ -19,7 +19,7 @@ Pages live under `src/app`:
 - `/reexecutors/[id]`: Detail page for an individual re-executor
 - `/reexecutors/register`: Registration form for prospective re-executors
 - `/challenges`: Challenge and dispute dashboard
-- `/reports`: Incident and operational reports
+- `/reports`: Verification rates (live counts by marketplace, task type and status, plus the slash count)
 - `/taxonomy`: Verification taxonomy and classification reference
 
 ## Running it
@@ -102,7 +102,7 @@ Authentication follows **Stellar SEP-10**:
 2. The user signs the transaction in Freighter.
 3. The browser submits the signed transaction via `POST /api/auth`.
 4. The backend verifies the signature and returns a signed JWT expiring in 1 hour (`issueJwt` in `backend/src/auth/sep10.ts`).
-5. The Next.js route handler sets an `httpOnly` cookie named `verity_jwt` (`sameSite: "lax"`, `path: "/"`, `maxAge: 3600`, `secure: process.env.NODE_ENV === "production"`).
+5. The Next.js route handler sets an `httpOnly` cookie named `verity_jwt` (`sameSite: "lax"`, `path: "/"`, `maxAge` taken from the JWT's `exp`, `secure: process.env.NODE_ENV === "production"`).
 
 Client-side JavaScript cannot read the token. Because `secure` is enabled in production, serving a production build over plain HTTP will prevent session persistence; HTTPS is required as documented in `docs/DEPLOY.md` section 4.
 
@@ -120,8 +120,11 @@ pnpm --filter @verity/frontend lint
 pnpm --filter @verity/frontend build
 ```
 
-> [!NOTE]
-> The dashboard currently has **no automated tests**. `frontend/package.json` contains no test script, and no test files exist within the `frontend/` package.
+Unit tests for the pure helpers (`src/lib/*.test.mjs`) run with:
+
+```bash
+pnpm --filter @verity/frontend test
+```
 
 ## Container image
 

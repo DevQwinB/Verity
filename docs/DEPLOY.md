@@ -181,7 +181,7 @@ signs with one account sequence, so only one backend process may run them. To
 scale the API, run more backends with `RUN_WORKERS=false`.
 
 **Backup and restore.** State is held in two Docker volumes (`pgdata` at
-`/var/lib/postgresql/data` and `backend_artifacts` at `/app/backend/.artifacts`).
+`/var/lib/postgresql` and `backend_artifacts` at `/app/backend/.artifacts`).
 Both should be backed up together:
 
 - *Postgres backup:*
@@ -206,7 +206,7 @@ window (about 7 days). The artifacts cannot be rebuilt from chain events at all;
 they are lost, function replay and retrieval checking will fail.
 
 **Monitoring keeper balance.** The keeper pays transaction fees for `finalize`,
-`resolve_challenge`, and `settle`. If the keeper account runs out of XLM, the scheduler
+`resolve_challenge`, and `release_attestation_lock`. If the keeper account runs out of XLM, the scheduler
 fails to submit transactions and logs lines like `[scheduler] finalize failed`,
 `[scheduler] resolve_challenge failed`, or `[scheduler] settlement failed`
 (visible with `docker compose logs backend`).
@@ -260,7 +260,8 @@ testnet reset. Stakes on the old contract stay withdrawable from it.
 ### Tuning
 
 The backend validates these optional settings at startup. All are positive
-integers except `REPLAY_OVERASSIGN`, which also accepts `0`.
+integers except `REPLAY_OVERASSIGN` and `DB_STATEMENT_TIMEOUT_MS`, which also accept `0`, and
+`ATTESTATION_SIGNING_SECRET`, which is a Stellar secret key.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -269,6 +270,9 @@ integers except `REPLAY_OVERASSIGN`, which also accepts `0`.
 | `REPLAY_REASSIGN_AFTER_S` | `120` | After this many seconds unanswered, an assignment stops counting toward quorum and another live worker is asked. The original row stays and a late vote still counts. At settlement, an unanswered assignment that had at least this long before finalisation is marked missed; younger ones are dropped without a mark. |
 | `DRAFT_TTL_S` | `3600` | Scheduler deletes drafts with no on-chain submission after this many seconds since `updated_at`; rebuilding a draft transaction restarts its age. Must outlast the built transaction's validity. |
 | `ARTIFACT_MAX_BYTES` | `262144` | Maximum decoded artifact size accepted by `POST /v1/artifacts`; larger artifacts return HTTP 413. |
+| `DB_POOL_MAX` | `10` | Maximum concurrent connections in the Postgres pool. Read by the database package, not `env.ts`. |
+| `DB_STATEMENT_TIMEOUT_MS` | `30000` | Milliseconds before a query is cancelled; `0` disables the timeout. |
+| `ATTESTATION_SIGNING_SECRET` | the keeper key | Stellar secret key that signs verdict attestations. Give it its own key so rotating the fund-moving keeper key does not change every future attestation's signer. |
 | `RATE_LIMIT_PER_MINUTE` | `300` | Requests per minute per account with a valid bearer token, otherwise per client address. `/health*` is exempt; `X-Forwarded-For` supplies the address only with `TRUST_PROXY=true`. |
 
 Outside Docker, add these settings to `backend/.env`, loaded by `dotenv`,
@@ -276,7 +280,7 @@ and restart the backend. `backend/.env.example` shows commented defaults;
 uncomment only the values you want to override.
 
 The current `docker-compose.yml` passes a fixed `backend.environment` list
-and has no `env_file`; it does **not** forward these six variables. Adding
+and has no `env_file`; it does **not** forward these variables. Adding
 them to the root `.env` or `backend/.env` alone does not configure the
 container. Defaults apply unless you also add the desired variables to the
 backend service's `environment` mapping (or a Compose override) and recreate

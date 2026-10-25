@@ -153,7 +153,7 @@ fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(), Error> {
             } else {
                 // Pure replay-consensus slash: no challenger exists to reward,
                 // so the forfeited agent bond routes to the admin/treasury
-                // account configured at initialize().
+                // account configured in the constructor.
                 pay(&admin, sub.bond_amount);
             }
         }

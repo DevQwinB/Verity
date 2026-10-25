@@ -1,10 +1,8 @@
 use soroban_sdk::{contracttype, Address};
 
 /// The shape of task a submission claims to have completed.
-/// `Unverifiable` exists so a marketplace can still route a submission through
-/// EscrowGate for record-keeping even when it cannot be replayed or spot-checked;
-/// such a submission can only ever resolve via ManualReview off-chain and never
-/// auto-verifies on-chain (see EscrowGate::submit).
+/// `Unverifiable` is reserved: `EscrowGate::submit` rejects it with
+/// `Error::InvalidTaskType`, so no submission can carry it today.
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskType {
@@ -26,8 +24,7 @@ pub enum Verdict {
 /// `ManualReview` is deliberately NOT a variant here. On-chain resolution must be
 /// derivable from already-committed state (attestation tallies or a registered
 /// ZK verifier's boolean result) with zero admin-discretionary paths. A
-/// marketplace's own manual-review process for withdrawn/unresolvable challenges
-/// is an off-chain/Postgres-only concept.
+/// challenge that cannot be resolved expires on-chain as `ExpiredUnverified`.
 ///
 /// `None` (rather than wrapping this in `Option<ResolutionMethod>` on the
 /// containing structs) is a deliberate soroban-sdk contracttype workaround:
