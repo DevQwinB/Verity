@@ -261,7 +261,7 @@ Deterministic tasks run in a sandboxed JavaScript runtime:
     from 500 up, DNS failures, timeouts, and network errors are treated as transient: the worker retries for up to `min(RETRIEVAL_RETRY_BUDGET_S, challenge window / 2)`
     seconds (default `RETRIEVAL_RETRY_BUDGET_S` is 120 s), verifies its own network
     connectivity, and only votes mismatch if its own connectivity is intact. Each HTTP request
-    times out after 10 s, and response bodies are capped at 1,000,000 bytes.
+    times out after 10 s of silence or 30 s overall, and response bodies are capped at 1,000,000 bytes.
 15. **JSON pointers.** If the response body is JSON, an optional RFC 6901 pointer (e.g. `/data/0/price`)
     selects the targeted value (`~1` escapes `/`, `~0` escapes `~`). The pointer must start
     with `/`; an empty pointer `""` selects the entire document. A pointer that fails to resolve
