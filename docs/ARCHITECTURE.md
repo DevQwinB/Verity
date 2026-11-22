@@ -151,10 +151,13 @@ Each agent holds one staked account's secret key and loops:
 1. Log in over SEP-10, poll `GET /v1/reexecutors/:id/assignments`. Polling is
    what marks the worker online; only online workers are assigned.
 2. Fetch the declared artifacts by content hash.
-3. **Deterministic tasks:** `sandbox/runner.ts` runs the function in
-   `quickjs-emscripten` (WebAssembly) inside a worker thread with fixed
-   memory, stack and tick limits, no clock and no randomness. Exceeding a
-   limit is a mismatch, identically on every host.
+3. **Deterministic tasks:** `sandbox/runner.ts` runs the function in a pinned
+   fuel-instrumented `quickjs-emscripten` build (WebAssembly) inside a worker
+   thread with fixed memory, stack, tick and fuel limits, no clock and no
+   randomness. Fuel is a wasm-level loop counter, so it also meters the C
+   loops of native builtins and bounds work identically on every host
+   regardless of CPU speed. Exceeding a limit is a mismatch, identically on
+   every host.
 4. **Retrieval tasks:** `sandbox/retrieval.ts` re-fetches the declared URL
    with a private-address guard, retrying for a bounded time before concluding
    the target is at fault.
@@ -163,8 +166,11 @@ Each agent holds one staked account's secret key and loops:
 
 The most important rule: **an agent never votes on its own host's failures.**
 `ReplayInfrastructureError`, a failed connectivity check or a wall-clock kill
-say nothing about the submission, so they are retried, never turned into a
-vote. A false mismatch slashes an honest agent.
+switch that fires only when the host itself is broken say nothing about the
+submission, so they are retried, never turned into a vote. A function that
+merely stalls the host instead trips the engine's fuel budget and is reported
+as `computation budget exceeded` — a mismatch. A false mismatch slashes an
+honest agent.
 
 ### Database (`db/`)
 
@@ -244,7 +250,11 @@ These are stated in the README; they shape what is safe to change.
 - One backend instance runs the indexer and keeper. Do not add a second with
   workers on.
 - Artifacts live on the backend's local disk.
-- Webhooks are delivered once with no retry.
+- Webhooks are retried with exponential backoff: up to 8 attempts over ~a day
+  (5 min doubling, 6 h cap), same delivery id, re-signed and re-SSRF-checked per
+  attempt; 4xx other than 408/429 are not retried. The scheduler pass
+  (`retryWebhooksOnce`) claims due rows with `for update skip locked`, bounded
+  per tick, and also recovers `pending` rows orphaned by a crash.
 - Assignment is uniform, not stake-weighted, and only picks online workers.
 - Only `deterministic` and `retrieval` tasks are accepted. `submit()` rejects
   `unverifiable` with `InvalidTaskType`: Phase 1 has no verification path for

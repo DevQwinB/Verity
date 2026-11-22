@@ -7,7 +7,8 @@
     "start": "tsx src/index.ts",
     "once": "tsx src/index.ts --once",
     "test": "tsx --test \"src/**/*.test.ts\"",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "instrument:wasm": "node scripts/instrument-quickjs-wasm.mjs"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^17.2.1",
@@ -16,7 +17,9 @@
     "quickjs-emscripten": "0.32.0"
   },
   "devDependencies": {
+    "@jitl/quickjs-wasmfile-release-sync": "0.32.0",
     "@types/node": "^22.20.3",
+    "binaryen": "132.0.0",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   }
