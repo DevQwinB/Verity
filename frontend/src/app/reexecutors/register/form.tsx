@@ -8,7 +8,7 @@ import { Button, buttonClasses } from "../../../components/ui/button";
 import { registerReexecutor, relayReexecutorStake } from "../../../lib/client-api";
 import { signXdr } from "../../../lib/wallet";
 import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../../../lib/config";
-import { stroopsToXlm, xlmToStroops } from "../../../lib/format";
+import { stroopsToXlm, parseXlmAmount } from "../../../lib/format";
 import type { GateConfig } from "../../../lib/types";
 
 type Status = "idle" | "building" | "signing" | "relaying" | "done" | "error";
@@ -25,17 +25,22 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
 
   const floor = BigInt(config.min_stake_floor);
   const floorXlm = stroopsToXlm(config.min_stake_floor);
-  const stake = xlmToStroops(stakeXlm);
+  // parseXlmAmount so the reason the stake was rejected shows under the field (#331).
+  const stakeParsed = parseXlmAmount(stakeXlm);
+  const stake = stakeParsed.ok ? stakeParsed.stroops : null;
+  const stakeError = stakeXlm !== "" && !stakeParsed.ok ? stakeParsed.reason : null;
   const belowFloor = stake !== null && stake < floor;
 
   async function handleRegister() {
     if (!account) return;
     setError(null);
-    if (stake === null) {
-      setError("Enter the stake as a positive XLM amount, for example 1000.");
+    if (!stakeParsed.ok) {
+      setError(stakeParsed.reason);
       setStatus("error");
       return;
     }
+    // narrowed: the stake is a real amount from here on
+    const stake = stakeParsed.stroops;
     try {
       setStatus("building");
       const { reexecutor, unsigned_transaction_xdr } = await registerReexecutor(stake.toString());
@@ -144,7 +149,8 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
                   inputMode="decimal"
                   value={stakeXlm}
                   onChange={(e) => setStakeXlm(e.target.value)}
-                  aria-describedby="stake-help"
+                  aria-describedby={stakeError ? "stake-help stake-error" : "stake-help"}
+                  aria-invalid={stakeError ? true : undefined}
                   className="w-full max-w-xs rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
                 />
                 <p id="stake-help" className={belowFloor ? "text-xs text-status-pending" : "text-xs text-text-tertiary"}>
@@ -152,6 +158,11 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
                     ? `Below the ${floorXlm} XLM floor: this would be staked, but the account would not be assigned work.`
                     : `At least ${floorXlm} XLM to be assigned work. Staking again later adds to this.`}
                 </p>
+                {stakeError && (
+                  <p id="stake-error" className="text-xs text-status-slashed">
+                    {stakeError}
+                  </p>
+                )}
               </div>
 
               {error && (
