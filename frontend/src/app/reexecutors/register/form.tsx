@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useWallet } from "../../../components/wallet-provider";
 import { Card, CardBody, CardHeader } from "../../../components/ui/card";
 import { Button, buttonClasses } from "../../../components/ui/button";
+import { LiveStatus } from "../../../components/live-status";
 import { registerReexecutor, relayReexecutorStake } from "../../../lib/client-api";
 import { signXdr } from "../../../lib/wallet";
 import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../../../lib/config";
@@ -160,8 +161,23 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
                 </p>
               )}
 
+              <LiveStatus
+                message={
+                  status === "building"
+                    ? "Building transaction..."
+                    : status === "signing"
+                      ? "Awaiting signature in Freighter..."
+                      : status === "relaying"
+                        ? "Submitting to testnet..."
+                        : ""
+                }
+              />
               {account ? (
-                <Button onClick={handleRegister} disabled={status !== "idle" && status !== "error"}>
+                <Button
+                  onClick={handleRegister}
+                  disabled={status !== "idle" && status !== "error"}
+                  aria-busy={status !== "idle" && status !== "error"}
+                >
                   {status === "building"
                     ? "Building transaction..."
                     : status === "signing"
@@ -171,7 +187,7 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
                         : "Stake and register"}
                 </Button>
               ) : (
-                <Button onClick={login} disabled={connecting}>
+                <Button onClick={login} disabled={connecting} aria-busy={connecting}>
                   {connecting ? "Connecting..." : "Connect wallet to continue"}
                 </Button>
               )}
