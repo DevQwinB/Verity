@@ -3,11 +3,11 @@ import { sql } from "kysely";
 import type { TaskType } from "@verity/db";
 import { db } from "../../db.js";
 import { env } from "../../config/env.js";
-import { getGateConfig } from "../../chain/config.js";
+import { chain } from "../../chain/seam.js";
 
 /** The contract's live voting rules, as far as assignment needs them. */
 async function votingRules(): Promise<{ quorum: number; allowlist: boolean }> {
-  const cfg = await getGateConfig();
+  const cfg = await chain.getGateConfig();
   return { quorum: Number(cfg.quorum_min_reexecutors), allowlist: cfg.reexecutor_allowlist };
 }
 

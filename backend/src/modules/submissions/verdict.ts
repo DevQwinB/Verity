@@ -1,6 +1,6 @@
 import type { SubmissionStatus } from "@verity/db";
 import { db } from "../../db.js";
-import { readSubmission } from "../../chain/actions.js";
+import { chain } from "../../chain/seam.js";
 import { fromChainResolutionMethod } from "../../chain/mappers.js";
 import { dispatchWebhook } from "../webhooks/dispatcher.js";
 
@@ -45,7 +45,7 @@ export async function recordTerminalVerdict(submissionRowId: string, status: str
   // Filled in whenever they are still missing, so a call that knows the
   // finalize transaction can complete a row first written by one that did not.
   if (!sub.resolution_method || (txHash && !sub.finalize_tx_hash)) {
-    const record = sub.chain_submission_id ? await readSubmission(sub.chain_submission_id) : null;
+    const record = sub.chain_submission_id ? await chain.readSubmission(sub.chain_submission_id) : null;
     await db
       .updateTable("submission")
       .set({

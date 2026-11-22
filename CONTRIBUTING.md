@@ -145,6 +145,12 @@ For contract changes also run `cargo fmt` and `cargo clippy` inside
 - **TypeScript unit tests** live next to the code as `*.test.ts` (backend,
   re-executor agent) and `*.test.mjs` (dashboard) and run with
   `pnpm --filter <package> test`. New pure logic should come with a test.
+- **Postgres-backed worker tests** live in `backend/src/workers/*.db.test.ts`
+  and run against a real throw-away embedded Postgres (no docker) started by
+  `backend/src/test/db-harness.ts`, with chain reads stubbed through
+  `backend/src/chain/seam.ts`. They are gated behind `VERITY_DB_TESTS=1` so
+  `pnpm --filter @verity/backend test` stays fast; CI runs them with the flag.
+  Run them locally with `VERITY_DB_TESTS=1 pnpm --filter @verity/backend test`.
 
 ### Changing a contract interface
 
