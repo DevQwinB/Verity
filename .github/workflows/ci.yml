@@ -48,6 +48,8 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm --filter @verity/reexecutor-agent test
       - run: pnpm --filter @verity/backend test
+      # Postgres-backed worker handler/scheduler suites (embedded Postgres, no docker).
+      - run: VERITY_DB_TESTS=1 pnpm --filter @verity/backend test
       - run: pnpm --filter @verity/frontend test
       - run: pnpm lint
       - run: pnpm --filter @verity/frontend build

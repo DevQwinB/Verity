@@ -9,8 +9,8 @@ import {
   escalateAgentPendingSubmissions,
   escalateToFullReplay,
 } from "../modules/reexecutors/assignment.js";
-import { escrowGateAsKeeper } from "../chain/clients.js";
-import { consensusOutcome, finalizeOnChain, minChallengerBond, readSubmission } from "../chain/actions.js";
+import { consensusOutcome, minChallengerBond } from "../chain/actions.js";
+import { chain } from "../chain/seam.js";
 import { dispatchWebhook } from "../modules/webhooks/dispatcher.js";
 import { recordTerminalVerdict } from "../modules/submissions/verdict.js";
 import { isTransientError } from "./transient.js";
@@ -59,8 +59,10 @@ function ledgerOfPagingToken(token: string): number {
 
 /** Idempotent by construction: every handler upserts on a unique key derived
  * from on-chain identity (chain_submission_id, (submission,reexecutor) pair,
- * etc.), so replaying the same event twice (e.g. after a restart) is safe. */
-async function handleEvent(topic: unknown[], value: unknown, ledger: number, txHash: string) {
+ * etc.), so replaying the same event twice (e.g. after a restart) is safe.
+ * Exported for the Postgres-backed handler tests (VERITY_DB_TESTS=1), which
+ * drive it with the chain seam stubbed. */
+export async function handleEvent(topic: unknown[], value: unknown, ledger: number, txHash: string) {
   const kind = topic[0] as string;
 
   switch (kind) {
@@ -86,7 +88,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           .executeTakeFirst();
       }
       if (row) {
-        const sub = await readSubmission(chainSubmissionId);
+        const sub = await chain.readSubmission(chainSubmissionId);
         await db
           .updateTable("submission")
           .set({
@@ -183,7 +185,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
         // consensus; mirror the account from the contract and record it,
         // or settlement never releases that account's stake lock. An RPC
         // failure here propagates so the event is retried, not consumed.
-        const info = (await escrowGateAsKeeper.reexecutor_info({ reexecutor: v.reexecutor })).result;
+        const info = (await chain.reexecutorInfo(v.reexecutor)).result;
         if (!info) {
           console.warn(
             `[indexer] replay_attested by ${v.reexecutor} (tx ${txHash}) ignored: the contract knows no such re-executor`
@@ -352,7 +354,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
         // Read the stake before writing anything. No database connection is
         // held open across a network call, and if this throws nothing has been
         // written yet, so the retry of this event starts from scratch.
-        const info = await escrowGateAsKeeper.reexecutor_info({ reexecutor: v.reexecutor });
+        const info = await chain.reexecutorInfo(v.reexecutor);
 
         // All or nothing: a failure after the insert must roll the insert back,
         // or the retry would find the row, skip the update, and slashed_count
@@ -419,10 +421,10 @@ export async function maybeEarlyFinalize(submissionRowId: string, chainSubmissio
     .where("id", "=", submissionRowId)
     .executeTakeFirst();
   if (!sub || sub.status !== "pending") return;
-  const record = await readSubmission(chainSubmissionId);
+  const record = await chain.readSubmission(chainSubmissionId);
   if (!record || record.finalized || !consensusOutcome(record)) return;
 
-  const { status, txHash } = await finalizeOnChain(chainSubmissionId);
+  const { status, txHash } = await chain.finalizeOnChain(chainSubmissionId);
   await recordTerminalVerdict(submissionRowId, status, txHash);
 }
 
