@@ -6,7 +6,7 @@ import { useWallet } from "./wallet-provider";
 import { Button } from "./ui/button";
 import { buildStakeWithdrawal, relayReexecutorStake } from "../lib/client-api";
 import { assertWalletNetwork, signXdr, WalletError, wrongNetworkMessage } from "../lib/wallet";
-import { TESTNET_EXPLORER_TX } from "../lib/config";
+import { explorerUrl } from "../lib/config";
 import { formatUnits, parseUnits, resolveBondAsset } from "../lib/format";
 import type { BondAsset } from "../lib/types";
 
@@ -120,8 +120,8 @@ export function WithdrawStake({
       )}
       {txHash && (
         <p role="status" className="text-sm">
-          Withdrawal confirmed on testnet.{" "}
-          <a href={TESTNET_EXPLORER_TX(txHash)} target="_blank" rel="noreferrer" className="text-accent underline-offset-2 hover:underline">
+          Withdrawal confirmed.{" "}
+          <a href={explorerUrl("tx", txHash, networkPassphrase)} target="_blank" rel="noreferrer" className="text-accent underline-offset-2 hover:underline">
             View transaction
           </a>
         </p>
