@@ -1,5 +1,5 @@
 import { cn } from "../../lib/utils";
-import type { ButtonHTMLAttributes } from "react";
+import type { ButtonHTMLAttributes, Ref } from "react";
 
 /** Shape lock for this project: buttons = rounded-md, cards/panels/inputs =
  * rounded-lg, badges/pills = rounded-full. Followed everywhere, not mixed. */
@@ -28,7 +28,13 @@ export function buttonClasses(variant: Variant = "primary", className?: string) 
 export function Button({
   variant = "primary",
   className,
+  ref,
   ...props
-}: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant }) {
-  return <button className={buttonClasses(variant, className)} {...props} />;
+}: ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: Variant;
+  // React 19 passes ref as a prop; declare it so callers can hold the
+  // button (e.g. to return focus to it) and forward it to the <button>.
+  ref?: Ref<HTMLButtonElement>;
+}) {
+  return <button ref={ref} className={buttonClasses(variant, className)} {...props} />;
 }
