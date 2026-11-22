@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { runDeterministicFunction, ReplayInfrastructureError } from "./runner.js";
+import { runDeterministicFunction, ReplayInfrastructureError, REPLAY_ENGINE, FUEL_WASM_SHA256 } from "./runner.js";
 
 // Each call starts a real worker and a fresh WebAssembly engine, so a case
 // takes seconds. The timeout is well under the 20 s wall-clock kill switch.
@@ -81,6 +81,38 @@ test("values JSON cannot represent are normalised", opts, async () => {
 
   const mixed = await runDeterministicFunction("return {a: NaN, b: undefined, c: [undefined]};", {});
   assert.deepEqual(mixed.output, { a: null, c: [null] });
+});
+
+test("a native builtin loop (indexOf) exceeds the computation budget, not the host kill switch", opts, async () => {
+  // ~2e11 element visits inside native code: the interrupt handler never
+  // fires there, but the wasm-level fuel counter does, so this is a guest
+  // error well inside the test timeout instead of a 20s ReplayInfrastructureError.
+  await rejectsAsGuestError(
+    "const a = new Array(2000000).fill(0); let c = 0; for (let i = 0; i < 100000; i++) c += a.indexOf(1); return c;",
+    /computation budget exceeded/
+  );
+});
+
+test("a native string builtin loop (join) exceeds the computation budget", opts, async () => {
+  await rejectsAsGuestError(
+    "const a = new Array(3000000).fill('x'); let s = ''; for (let i = 0; i < 1000; i++) s = a.join(''); return s.length;",
+    /computation budget exceeded/
+  );
+});
+
+test("the budget-exceeded outcome is the same on consecutive runs", opts, async () => {
+  const src = "const a = new Array(2000000).fill(0); let c = 0; for (let i = 0; i < 100000; i++) c += a.indexOf(1); return c;";
+  await rejectsAsGuestError(src, /computation budget exceeded/);
+  await rejectsAsGuestError(src, /computation budget exceeded/);
+});
+
+test("the engine reports the pinned fuel-instrumented wasm build and budget", () => {
+  // sha256 of the committed quickjs-fuel.wasm artifact, so it cannot be
+  // swapped without this test failing.
+  assert.equal(FUEL_WASM_SHA256, "9d064c7e8b8b3971b9cacb93871bf0673506fb53eccbd7debbffe5944d177813");
+  assert.match(REPLAY_ENGINE, /^quickjs-emscripten@/);
+  assert.match(REPLAY_ENGINE, /fuel=100000000/);
+  assert.match(REPLAY_ENGINE, /fuel-wasm sha256=9d064c7e8b8b3971/);
 });
 
 test("no state leaks from one replay to the next", opts, async () => {
