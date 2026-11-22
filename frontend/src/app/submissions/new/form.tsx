@@ -9,7 +9,10 @@ import { uploadArtifact, createSubmission, relaySubmission } from "../../../lib/
 import { signXdr } from "../../../lib/wallet";
 import { NETWORK_PASSPHRASE } from "../../../lib/config";
 import { canonicalJson, parseJsonOrText } from "../../../lib/canonical";
+import { EXAMPLES, EXAMPLE_LIST, generateExampleEscrowRef, type ExampleId, type SubmissionExample } from "../../../lib/examples";
 import { bpsToPercent, formatDuration, stroopsToXlm, xlmToStroops } from "../../../lib/format";
+import { validateRetrievalSpec } from "../../../lib/retrieval";
+import { cn } from "../../../lib/utils";
 import type { GateConfig, TaskType } from "../../../lib/types";
 
 function textToBase64(text: string): string {
@@ -46,41 +49,6 @@ function checkArtifactSize(name: string, text: string) {
 
 type Step = "idle" | "uploading" | "building" | "signing" | "relaying" | "done" | "error";
 
-/** A malformed retrieval spec is expensive: every re-executor fails to replay
- * it, votes "mismatch", and the agent's own bond is slashed (see
- * reexecutor-agent/src/sandbox/retrieval.ts). Catch what the worker would
- * reject here, before anything is uploaded or signed. */
-function validateRetrievalSpec(value: unknown): void {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(
-      'The request spec must be a JSON object, e.g. {"url": "https://...", "pointer": "/field"}.'
-    );
-  }
-  const spec = value as Record<string, unknown>;
-  const url = spec.url;
-  if (typeof url !== "string") {
-    throw new Error('The request spec needs a "url" starting with http:// or https://.');
-  }
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new Error(`"${url}" is not a valid URL. Use a full address like https://example.com/data.json.`);
-  }
-  // new URL() accepts javascript: and ftp: too; the worker only replays http(s).
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error('The "url" must start with http:// or https://.');
-  }
-  if (Object.hasOwn(spec, "pointer") && spec.pointer !== undefined) {
-    const pointer = spec.pointer;
-    if (typeof pointer !== "string" || (pointer !== "" && !pointer.startsWith("/"))) {
-      throw new Error(
-        'The "pointer" must be a JSON Pointer string: "" for the whole document, or starting with "/", e.g. "/network_passphrase".'
-      );
-    }
-  }
-}
-
 // The reference is free text that is hashed on-chain and shown in lists, so it is capped for sanity; keep it in line with any backend limit.
 const ESCROW_REF_MAX_LENGTH = 128;
 
@@ -89,6 +57,7 @@ const ESCROW_REF_MAX_LENGTH = 128;
 export function NewSubmissionForm({ config }: { config: GateConfig }) {
   const router = useRouter();
   const { account, connecting, login } = useWallet();
+  const taskTypeId = useId();
   // One key for this form: retrying after a declined signature reuses the
   // same draft instead of leaving a new unsigned one behind each time.
   const idempotencyKey = useRef<string | null>(null);
@@ -100,8 +69,22 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
   const [inputContent, setInputContent] = useState("");
   const [functionContent, setFunctionContent] = useState("");
   const [outputContent, setOutputContent] = useState("");
+  const [activeExample, setActiveExample] = useState<ExampleId | null>(null);
   const [step, setStep] = useState<Step>("idle");
   const [error, setError] = useState<string | null>(null);
+
+  const filledExample = activeExample ? EXAMPLE_LIST.find((e) => e.id === activeExample) ?? null : null;
+
+  function applyExample(example: SubmissionExample) {
+    idempotencyKey.current = null;
+    setError(null);
+    setTaskType(example.taskType);
+    setEscrowRef(generateExampleEscrowRef());
+    setInputContent(example.input);
+    setFunctionContent(example.functionBody);
+    setOutputContent(example.output);
+    setActiveExample(example.id);
+  }
 
   const escrowRefTrimmed = escrowRef.trim();
   const escrowValue = xlmToStroops(escrowValueXlm);
@@ -250,19 +233,67 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
             )}
           </Field>
 
-          <Field label="Task type">
-            {(control) => (
-              <select
-                {...control}
-                value={taskType}
-                onChange={(e) => setTaskType(e.target.value as TaskType)}
-                className={inputClass}
+          <div className="space-y-2">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <label htmlFor={taskTypeId} className="block text-sm text-text-secondary">
+                Task type
+              </label>
+              <div
+                className="flex flex-wrap items-center gap-1.5"
+                role="group"
+                aria-label="Fill in an example"
               >
-                <option value="deterministic">Deterministic (replay-verified)</option>
-                <option value="retrieval">Retrieval (spot-checked)</option>
-              </select>
+                <span className="text-xs text-text-tertiary">Fill in an example:</span>
+                {EXAMPLE_LIST.map((example) => {
+                  const selected = activeExample === example.id;
+                  const isWrong = example.expectedOutcome === "slashed";
+                  return (
+                    <Button
+                      key={example.id}
+                      type="button"
+                      variant="secondary"
+                      disabled={busy}
+                      aria-pressed={selected}
+                      onClick={() => applyExample(example)}
+                      className={cn(
+                        "px-2.5 py-1 text-xs",
+                        isWrong && "border-status-slashed/40 text-status-slashed hover:bg-status-slashed/10",
+                        selected && !isWrong && "border-accent text-accent",
+                        selected && isWrong && "border-status-slashed bg-status-slashed/10"
+                      )}
+                    >
+                      {example.label}
+                    </Button>
+                  );
+                })}
+              </div>
+            </div>
+            <select
+              id={taskTypeId}
+              value={taskType}
+              onChange={(e) => {
+                setTaskType(e.target.value as TaskType);
+                setActiveExample(null);
+              }}
+              className={inputClass}
+            >
+              <option value="deterministic">Deterministic (replay-verified)</option>
+              <option value="retrieval">Retrieval (spot-checked)</option>
+            </select>
+            {filledExample && (
+              <p
+                role="status"
+                className={cn(
+                  "rounded-lg border px-3 py-2 text-xs",
+                  filledExample.expectedOutcome === "slashed"
+                    ? "border-status-slashed/40 bg-status-slashed/10 text-status-slashed"
+                    : "border-border-subtle bg-surface text-text-secondary"
+                )}
+              >
+                {filledExample.note}
+              </p>
             )}
-          </Field>
+          </div>
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field
@@ -320,13 +351,16 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
               <textarea
                 {...control}
                 value={inputContent}
-                onChange={(e) => setInputContent(e.target.value)}
+                onChange={(e) => {
+                  setInputContent(e.target.value);
+                  setActiveExample(null);
+                }}
                 rows={3}
                 spellCheck={false}
                 placeholder={
                   taskType === "retrieval"
-                    ? '{"url": "https://horizon-testnet.stellar.org/", "pointer": "/network_passphrase"}'
-                    : '{"n": 21}'
+                    ? EXAMPLES.retrievalCorrect.input
+                    : EXAMPLES.deterministicCorrect.input
                 }
                 className={cnMono}
               />
@@ -341,10 +375,13 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
                 <textarea
                   {...control}
                   value={functionContent}
-                  onChange={(e) => setFunctionContent(e.target.value)}
+                  onChange={(e) => {
+                    setFunctionContent(e.target.value);
+                    setActiveExample(null);
+                  }}
                   rows={4}
                   spellCheck={false}
-                  placeholder="return { doubled: input.n * 2 };"
+                  placeholder={EXAMPLES.deterministicCorrect.functionBody}
                   className={cnMono}
                 />
               )}
@@ -358,10 +395,17 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
               <textarea
                 {...control}
                 value={outputContent}
-                onChange={(e) => setOutputContent(e.target.value)}
+                onChange={(e) => {
+                  setOutputContent(e.target.value);
+                  setActiveExample(null);
+                }}
                 rows={3}
                 spellCheck={false}
-                placeholder={taskType === "retrieval" ? "Test SDF Network ; September 2015" : '{"doubled": 42}'}
+                placeholder={
+                  taskType === "retrieval"
+                    ? EXAMPLES.retrievalCorrect.output
+                    : EXAMPLES.deterministicCorrect.output
+                }
                 className={cnMono}
               />
             )}
