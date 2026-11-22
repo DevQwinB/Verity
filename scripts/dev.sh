@@ -6,9 +6,11 @@
 #   -> one reexecutor-agent per bootstrap identity -> frontend
 #
 # Secrets are read from your stellar-cli identities at start-up and handed to
-# each process through its environment; this script never writes a secret key
-# to disk except the keeper key + JWT secret in backend/.env (gitignored),
-# and only when that file does not exist yet.
+# each process through its environment; this script never writes a Stellar
+# secret key to disk. The only secret it writes is the session JWT secret in
+# backend/.env (gitignored), and only when that file does not exist yet.
+# A backend run by hand needs KEEPER_SECRET_KEY exported itself, e.g.
+# KEEPER_SECRET_KEY="$(stellar keys secret keeper)" pnpm --filter @verity/backend dev
 #
 #   VERITY_API_PORT (3001)  VERITY_WEB_PORT (3000)  VERITY_PG_PORT (5433)
 #   VERITY_DEPLOYMENT (testnet)                       which deployments/<name>.json
@@ -81,11 +83,18 @@ WEB_AUTH_DOMAIN=localhost:$API_PORT
 HOME_DOMAIN=localhost:$API_PORT
 PORT=$API_PORT
 ARTIFACT_STORAGE_DIR=./.artifacts
-KEEPER_SECRET_KEY=$(stellar keys secret "$KEEPER")
 JWT_SECRET=$(openssl rand -hex 32)
 ENV
   )
   chmod 600 backend/.env
+else
+  # An .env written by an older dev.sh may still hold the keeper's secret key.
+  # pnpm dev never reads it (the key comes from the keystore on every start),
+  # so say so once and leave the user's file untouched.
+  if grep -q '^KEEPER_SECRET_KEY=' backend/.env; then
+    echo "WARN: backend/.env still contains KEEPER_SECRET_KEY. pnpm dev does not use it" >&2
+    echo "      (the keeper key comes from the stellar-cli keystore on every start); delete that line." >&2
+  fi
 fi
 
 PIDS=()
