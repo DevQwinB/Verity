@@ -32,7 +32,7 @@ public issues; see [SECURITY.md](SECURITY.md).
 
 | Tool | Version | Needed for |
 |---|---|---|
-| Node.js | 20+ (CI uses 22) | backend, agent, dashboard |
+| Node.js | 22.6+ (CI uses 22) | backend, agent, dashboard |
 | pnpm | 10 | workspace |
 | [stellar-cli](https://developers.stellar.org/docs/tools/cli) | current | deploying, bindings, identities |
 | Rust | pinned by `contracts/rust-toolchain.toml` | contract work only |
@@ -40,6 +40,12 @@ public issues; see [SECURITY.md](SECURITY.md).
 Docker is not required. Rust is only needed if you change or test contracts;
 `rustup` picks up the pinned toolchain (and the `wasm32v1-none` target,
 `rustfmt` and `clippy`) automatically inside `contracts/`.
+
+The Node floor is 22.6 because the frontend tests run
+`node --experimental-strip-types`, which only exists from 22.6.0. The floor
+is enforced three ways: `engines.node` in the root `package.json`,
+`engine-strict=true` in `.npmrc` (install fails on older Node), and `.nvmrc`
+for `nvm` users. CI and the Dockerfiles already use Node 22.
 
 ## Getting set up
 
