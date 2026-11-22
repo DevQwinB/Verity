@@ -188,6 +188,7 @@ export interface WebhookDeliveryTable {
   attempts: Generated<number>;
   last_attempt_at: Timestamp | null;
   response_code: number | null;
+  next_attempt_at: Timestamp | null;
   created_at: GeneratedTimestamp;
 }
 

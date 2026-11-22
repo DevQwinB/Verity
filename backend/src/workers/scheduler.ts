@@ -12,6 +12,7 @@ import { fromChainVerdict } from "../chain/mappers.js";
 import { recordTerminalVerdict } from "../modules/submissions/verdict.js";
 import { exportAttestation } from "../modules/attestations/export.js";
 import { topUpAssignments } from "../modules/reexecutors/assignment.js";
+import { retryWebhooksOnce } from "../modules/webhooks/dispatcher.js";
 import { maybeEarlyFinalize } from "./indexer.js";
 
 /** How long settlement waits for the indexer to catch up on a submission's
@@ -307,6 +308,7 @@ export function startScheduler(intervalMs = 10000): { stop: () => void } {
     await step("expire-challenges", expireChallengesOnce);
     await step("settle", settleOnce);
     await step("purge-drafts", purgeDraftsOnce);
+    await step("retry-webhooks", () => retryWebhooksOnce());
     if (!stopped) timer = setTimeout(tick, intervalMs);
   };
   timer = setTimeout(tick, intervalMs);

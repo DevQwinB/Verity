@@ -526,14 +526,23 @@ not a comprehensive network isolation guarantee.
 The address check runs both at registration and immediately before delivery.
 Redirects are not followed: any redirect fails the delivery.
 
-**Delivery is best-effort: one attempt, no retry.** A delivery times out
-after 5 seconds. HTTP 2xx counts as delivered; other responses, timeouts,
-redirects, and transport failures count as failed. The backend records
+**Delivery retries with backoff.** A delivery times out after 5 seconds.
+HTTP 2xx counts as delivered and stops retrying; 5xx, 408, 429, timeouts and
+transport failures are retried with exponential backoff (5 min doubling to a
+6 h cap, up to 8 attempts — roughly a day), always under the same
+`x-verity-delivery` id so receivers can deduplicate. Other 4xx responses and
+redirects (which are never followed) are a definitive no and are not retried.
+Every attempt is re-signed with a fresh timestamp and re-passes the SSRF guard.
+The scheduler's `retryWebhooksOnce` pass picks due rows with
+`for update skip locked` (bounded to 25 rows per tick, 5 concurrent POSTs),
+and also retries rows left `pending` by a crash once they are 5 minutes old;
+a subscription deactivated in the meantime is skipped. The backend records
 delivery attempts internally but provides no delivery-history API.
 Deliveries run in the background after the verdict is recorded and never
-block verdict handling. Failed HTTP responses and transport errors are
-recorded in `webhook_delivery` and logged by the dispatcher; a delivery still
-in flight when the process exits stays `pending`.
+block verdict handling. Failed attempts are recorded in `webhook_delivery`
+(`attempts`, `last_attempt_at`, `response_code`, `next_attempt_at`) and logged
+by the dispatcher. After the final attempt the row is parked with
+`next_attempt_at = null`.
 No delivery to a receiver is guaranteed.
 
 
@@ -684,7 +693,7 @@ full tally.
   schema is not published.
 - **False-accept rate** needs a manual audit sample and is reported as `null`.
 - **One backend instance** runs the indexer and keeper; artifacts are on its
-  local disk; webhooks are delivered once with no retry.
+  local disk; webhooks are retried with backoff (see [Webhooks](#webhooks)).
 - **Containers.** The three images build, and the full stack has been run
   from them (Postgres, migrations, backend, three re-executors, dashboard)
   and passed the smoke test, using podman with the services started one by
