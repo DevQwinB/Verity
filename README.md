@@ -70,6 +70,7 @@ and `backend/src/chain/canonical.ts`.
 | `db/` | Kysely schema, migrations, embedded Postgres for Docker-free dev |
 | `deployments/<name>.json` | Deployed contract IDs and public keys, one file per deployment |
 | `scripts/` | Deploy, bootstrap, approve, bindings, dev runner, smoke test |
+| `examples/x402-verified-api/` | Verify-then-pay example: an x402 (HTTP 402, USDC) paid API whose responses are bonded through EscrowGate, `escrow_ref` = payment tx hash |
 | `docs/DEPLOY.md` | Running a public deployment from the container images |
 
 ## Run it

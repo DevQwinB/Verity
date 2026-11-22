@@ -4,6 +4,7 @@ packages:
   - frontend
   - reexecutor-agent
   - db
+  - examples/x402-verified-api
 
 onlyBuiltDependencies:
   - '@embedded-postgres/linux-x64'

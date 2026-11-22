@@ -1,0 +1,20 @@
+{
+  "name": "@verity/example-x402-verified-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Verify-then-pay example: an x402 paid agent API whose responses are bonded through EscrowGate (see README.md)",
+  "scripts": {
+    "seller": "node seller.mjs",
+    "buyer": "node buyer.mjs",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^17.2.1",
+    "@x402/core": "2.32.0",
+    "@x402/express": "2.32.0",
+    "@x402/fetch": "2.32.0",
+    "@x402/stellar": "2.32.0",
+    "express": "^5.1.0"
+  }
+}
