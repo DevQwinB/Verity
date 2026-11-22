@@ -260,8 +260,11 @@ Deterministic tasks run in a sandboxed JavaScript runtime:
     `accept: application/json, text/plain;q=0.9, */*;q=0.1` and no credentials, auth headers,
     or cookies. The endpoint must be publicly accessible without authentication.
     Only `http:` and `https:` schemes are supported. The URL must resolve to a public IP
-    address: loopback, private, and link-local IP addresses are rejected, and the request
-    connects directly to the validated IP.
+    address: retrieval applies the same non-public table as webhook registration (see
+    "Webhooks"), kept in `reexecutor-agent/src/sandbox/address.ts` in step with
+    `backend/src/modules/webhooks/url-guard.ts` — loopback, private, link-local, CGNAT,
+    documentation, benchmarking, multicast and reserved ranges, including IPv6 forms that
+    wrap IPv4 addresses, are rejected, and the request connects directly to the validated IP.
 14. **Redirects and response codes.** Redirects are not followed; HTTP 3xx status codes
     are treated as a mismatch. Definitive 4xx statuses (for example 404 or 410) and other
     non-2xx responses are also mismatches. Statuses 401, 403, 408, 429, 451 and anything
@@ -423,6 +426,14 @@ deactivating one does not free its slot. The URL must resolve to a public
 address: private, loopback, link-local, multicast and reserved ranges (and IPv6
 forms that wrap them) are refused with HTTP 400, both at registration and again
 at every delivery, which connects to the address it just checked.
+The refused ranges are exactly the non-public table in
+`backend/src/modules/webhooks/url-guard.ts`:
+IPv4 `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`,
+`169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`,
+`192.88.99.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `198.51.100.0/24`,
+`203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4`;
+IPv6 `::/128`, `::1/128`, `100::/64`, `2001:db8::/32`, `fc00::/7`,
+`fe80::/10`, `fec0::/10`, `ff00::/8`.
 
 `GET /v1/marketplaces/:id/webhooks` lists the marketplace's subscriptions
 (`id`, `url`, `events`, `active`, `created_at`; the `secret` is never
@@ -520,11 +531,14 @@ createServer(async (req, res) => {
 **URL rule: public addresses only.** Use a publicly reachable `http:` or
 `https:` receiver URL whose host resolves. At registration, an unresolvable
 host or an address rejected by `assertPublicHttpUrl` returns HTTP 400.
-The guard rejects private, loopback and link-local addresses it recognizes.
-Its checks do not cover every non-public IP range, so passing validation is
-not a comprehensive network isolation guarantee.
+The guard applies the non-public table listed under "Webhooks" above
+(`url-guard.ts`): private, loopback, link-local, multicast and reserved ranges,
+including IPv6 forms that wrap IPv4 addresses, are all refused, so passing
+validation means the address is outside every range the guard blocks.
 The address check runs both at registration and immediately before delivery.
 Redirects are not followed: any redirect fails the delivery.
+An address check is not network isolation: also firewall the backend's
+outbound traffic on the host.
 
 **Delivery is best-effort: one attempt, no retry.** A delivery times out
 after 5 seconds. HTTP 2xx counts as delivered; other responses, timeouts,
