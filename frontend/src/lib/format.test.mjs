@@ -2,9 +2,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   bpsToPercent,
+  describeContractError,
   formatCountdown,
   formatDuration,
   formatRelativeTime,
+  parseXlmAmount,
   stroopsToXlm,
   truncateMiddle,
   windowDeadlineIso,
@@ -164,4 +166,73 @@ describe("formatRelativeTime", () => {
       assert.equal(formatRelativeTime(at(offsetMs)), expected);
     });
   }
+});
+
+// #331: the forms show parseXlmAmount's reason next to the field, so each
+// rejection reason is pinned here — a reworded or dropped reason is a UI
+// regression, not a style change.
+describe("parseXlmAmount", () => {
+  const okCases = [
+    ["5", 50000000n],
+    ["5.5", 55000000n],
+    [".5", 5000000n],
+    ["1.", 10000000n],
+    ["0.0000001", 1n],
+    [" 12 ", 120000000n],
+    ["1.0000000", 10000000n],
+  ];
+  for (const [input, expected] of okCases) {
+    it(`${JSON.stringify(input)} -> ok ${expected} stroops`, () => {
+      assert.deepEqual(parseXlmAmount(input), { ok: true, stroops: expected });
+    });
+  }
+
+  // Every rejection carries the reason the field will display.
+  const rejected = [
+    ["", "Enter an amount."],
+    ["   ", "Enter an amount."],
+    ["1,5", "Use a dot for decimals and no thousands separators."],
+    ["1,000", "Use a dot for decimals and no thousands separators."],
+    ["-1", "The amount must be positive."],
+    ["1.12345678", "Use at most 7 decimal places."],
+    [".12345678", "Use at most 7 decimal places."],
+    ["abc", "Enter a number, like 5 or 0.5."],
+    ["1e3", "Enter a number, like 5 or 0.5."],
+    ["+1", "Enter a number, like 5 or 0.5."],
+    ["1.2.3", "Enter a number, like 5 or 0.5."],
+    ["0", "The amount must be more than zero."],
+    ["0.0", "The amount must be more than zero."],
+    ["0.0000000", "The amount must be more than zero."],
+  ];
+  for (const [input, reason] of rejected) {
+    it(`${JSON.stringify(input)} -> rejected: ${reason}`, () => {
+      assert.deepEqual(parseXlmAmount(input), { ok: false, reason });
+    });
+  }
+
+  it("xlmToStroops agrees with parseXlmAmount on ok and rejected inputs", () => {
+    for (const input of ["5", "0.0000001", "", "1,5", "-1", "1.12345678", "abc", "0"]) {
+      const result = parseXlmAmount(input);
+      assert.equal(xlmToStroops(input), result.ok ? result.stroops : null);
+    }
+  });
+});
+
+describe("describeContractError", () => {
+  it("describes a known contract error name", () => {
+    assert.equal(
+      describeContractError("BondTooLow"),
+      "The bond amount is below the required minimum for this escrow value."
+    );
+  });
+
+  it("returns null for an unknown name", () => {
+    assert.equal(describeContractError("NoSuchError"), null);
+  });
+
+  it("returns null for __proto__ instead of a prototype value", () => {
+    // Object.hasOwn guards the lookup: "__proto__" is not a key of the map.
+    assert.equal(describeContractError("__proto__"), null);
+    assert.equal(describeContractError("constructor"), null);
+  });
 });

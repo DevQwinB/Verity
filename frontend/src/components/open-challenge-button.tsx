@@ -7,7 +7,7 @@ import { Button } from "./ui/button";
 import { openChallenge, relayChallenge } from "../lib/client-api";
 import { signXdr } from "../lib/wallet";
 import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../lib/config";
-import { stroopsToXlm, xlmToStroops } from "../lib/format";
+import { stroopsToXlm, parseXlmAmount } from "../lib/format";
 
 const POLL_EVERY_MS = 3000;
 const GIVE_UP_AFTER_MS = 60_000;
@@ -35,6 +35,9 @@ export function OpenChallengeButton({
   const [txHash, setTxHash] = useState<string | null>(null);
   const [stalled, setStalled] = useState(false);
   const [windowOpen, setWindowOpen] = useState(() => Date.now() < new Date(deadlineIso).getTime());
+  // parseXlmAmount so the reason a bond was rejected shows under the field (#331).
+  const bondAmount = parseXlmAmount(bondXlm);
+  const bondError = bondXlm !== "" && !bondAmount.ok ? bondAmount.reason : null;
 
   useEffect(() => {
     const id = setInterval(() => setWindowOpen(Date.now() < new Date(deadlineIso).getTime()), 1000);
@@ -62,11 +65,11 @@ export function OpenChallengeButton({
   async function handleChallenge() {
     if (!account) return;
     setError(null);
-    const bond = xlmToStroops(bondXlm);
-    if (bond === null) {
-      setError("Enter the bond as a positive XLM amount, for example 5 or 5.5.");
+    if (!bondAmount.ok) {
+      setError(bondAmount.reason);
       return;
     }
+    const bond = bondAmount.stroops;
     if (minBondStroops && bond < BigInt(minBondStroops)) {
       setError(`The bond must be at least ${stroopsToXlm(minBondStroops)} XLM for this submission.`);
       return;
@@ -144,7 +147,8 @@ export function OpenChallengeButton({
             inputMode="decimal"
             value={bondXlm}
             onChange={(e) => setBondXlm(e.target.value)}
-            aria-describedby="challenge-bond-help"
+            aria-describedby={bondError ? "challenge-bond-help challenge-bond-error" : "challenge-bond-help"}
+            aria-invalid={bondError ? true : undefined}
             className="w-36 rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
           />
         </div>
@@ -163,6 +167,11 @@ export function OpenChallengeButton({
           ? `Minimum ${stroopsToXlm(minBondStroops)} XLM for this submission, set by the contract.`
           : "The contract sets a minimum in proportion to the escrow value."}
       </p>
+      {bondError && (
+        <p id="challenge-bond-error" className="text-xs text-status-slashed">
+          {bondError}
+        </p>
+      )}
       {error && (
         <p role="alert" className="text-sm text-status-slashed">
           {error}
