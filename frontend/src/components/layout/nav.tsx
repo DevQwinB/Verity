@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation";
 import { List, X } from "@phosphor-icons/react/dist/ssr";
 import { cn } from "../../lib/utils";
 import { ThemeToggle } from "../theme-toggle";
+import { LiveStatus } from "../live-status";
 import { useWallet } from "../wallet-provider";
 import { truncateMiddle } from "../../lib/format";
 import { FREIGHTER_INSTALL_URL } from "../../lib/config";
@@ -69,9 +70,13 @@ export function Nav() {
               </Button>
             </div>
           ) : (
-            <Button variant="primary" onClick={login} disabled={connecting}>
-              {connecting ? "Connecting..." : "Connect wallet"}
-            </Button>
+            <>
+              {/* The connecting state only changes the button label; announce it too (#330). */}
+              <LiveStatus message={connecting ? "Connecting wallet..." : ""} />
+              <Button variant="primary" onClick={login} disabled={connecting} aria-busy={connecting}>
+                {connecting ? "Connecting..." : "Connect wallet"}
+              </Button>
+            </>
           )}
           <Button
             variant="ghost"

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useWallet } from "./wallet-provider";
 import { Button } from "./ui/button";
+import { LiveStatus } from "./live-status";
 import { openChallenge, relayChallenge } from "../lib/client-api";
 import { signXdr } from "../lib/wallet";
 import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../lib/config";
@@ -121,14 +122,25 @@ export function OpenChallengeButton({
 
   if (!account) {
     return (
-      <Button variant="secondary" onClick={login} disabled={connecting}>
+      <Button variant="secondary" onClick={login} disabled={connecting} aria-busy={connecting}>
         {connecting ? "Connecting..." : "Connect wallet to open a challenge"}
       </Button>
     );
   }
 
+  // Same text as the button, announced politely (#330).
+  const busyLabel =
+    busy === "building"
+      ? "Building transaction..."
+      : busy === "signing"
+        ? "Awaiting signature in Freighter..."
+        : busy === "relaying"
+          ? "Submitting to testnet..."
+          : null;
+
   return (
     <div className="space-y-3">
+      <LiveStatus message={busyLabel ?? ""} />
       <p className="max-w-prose text-sm text-text-secondary">
         A challenge puts your bond against the agent&apos;s. If re-executors find the work wrong you
         get your bond back plus a share of theirs; if they find it right, your bond goes to the
@@ -148,14 +160,8 @@ export function OpenChallengeButton({
             className="w-36 rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
           />
         </div>
-        <Button variant="danger" onClick={handleChallenge} disabled={busy !== null}>
-          {busy === "building"
-            ? "Building transaction..."
-            : busy === "signing"
-              ? "Awaiting signature in Freighter..."
-              : busy === "relaying"
-                ? "Submitting to testnet..."
-                : "Open challenge"}
+        <Button variant="danger" onClick={handleChallenge} disabled={busy !== null} aria-busy={busy !== null}>
+          {busyLabel ?? "Open challenge"}
         </Button>
       </div>
       <p id="challenge-bond-help" className="text-xs text-text-tertiary">
