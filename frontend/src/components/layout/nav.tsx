@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { List, X } from "@phosphor-icons/react/dist/ssr";
@@ -23,6 +23,31 @@ export function Nav() {
   const pathname = usePathname();
   const { account, connecting, problem, login, logout, dismissProblem } = useWallet();
   const [menuOpen, setMenuOpen] = useState(false);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+
+  // Escape closes the open menu and returns focus to its toggle (#337). The
+  // listener exists only while the menu is open, so Escape with the menu
+  // closed does nothing. Following a link still closes the menu from the
+  // link's own onClick, without moving focus.
+  useEffect(() => {
+    if (!menuOpen) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setMenuOpen(false);
+        toggleRef.current?.focus();
+      }
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [menuOpen]);
+
+  // Back/forward navigation also closes the menu: only the link onClick did.
+  // Adjusting state during render (not in an effect) for the pathname change.
+  const [lastPathname, setLastPathname] = useState(pathname);
+  if (pathname !== lastPathname) {
+    setLastPathname(pathname);
+    setMenuOpen(false);
+  }
 
   return (
     <header className="sticky top-0 z-20 border-b border-border-subtle bg-surface/90 backdrop-blur">
@@ -74,6 +99,7 @@ export function Nav() {
             </Button>
           )}
           <Button
+            ref={toggleRef}
             variant="ghost"
             className="px-2 md:hidden"
             aria-label={menuOpen ? "Close menu" : "Open menu"}
