@@ -121,9 +121,13 @@ longer the recorded account (a replaced keeper is only reported: it holds no
 authority on-chain). Named deployments use `verity-<name>-…` aliases.
 
 Secrets stay in your stellar-cli keystore. `pnpm dev` reads them at start-up
-and passes them to each process through its environment. The only secrets it
-writes to disk are in `backend/.env` (gitignored), and only if that file does
-not exist; it also creates the local database under `.pgdata/`.
+and passes them to each process through its environment; it never writes a
+Stellar secret key to disk. The only secret it writes is the session
+`JWT_SECRET` in `backend/.env` (gitignored), and only if that file does not
+exist; it also creates the local database under `.pgdata/`. If you run the
+backend by hand instead of through `pnpm dev`, export the keeper key yourself
+rather than saving it to a file:
+`KEEPER_SECRET_KEY="$(stellar keys secret keeper)" pnpm --filter @verity/backend dev`.
 
 ### Prove it works end to end
 
