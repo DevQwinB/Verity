@@ -244,7 +244,11 @@ These are stated in the README; they shape what is safe to change.
 - One backend instance runs the indexer and keeper. Do not add a second with
   workers on.
 - Artifacts live on the backend's local disk.
-- Webhooks are delivered once with no retry.
+- Webhooks are retried with exponential backoff: up to 8 attempts over ~a day
+  (5 min doubling, 6 h cap), same delivery id, re-signed and re-SSRF-checked per
+  attempt; 4xx other than 408/429 are not retried. The scheduler pass
+  (`retryWebhooksOnce`) claims due rows with `for update skip locked`, bounded
+  per tick, and also recovers `pending` rows orphaned by a crash.
 - Assignment is uniform, not stake-weighted, and only picks online workers.
 - Only `deterministic` and `retrieval` tasks are accepted. `submit()` rejects
   `unverifiable` with `InvalidTaskType`: Phase 1 has no verification path for
