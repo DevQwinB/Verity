@@ -1,4 +1,4 @@
-import { Address, FeeBumpTransaction, rpc, scValToNative, TransactionBuilder } from "@stellar/stellar-sdk";
+import { Address, FeeBumpTransaction, rpc, scValToNative, StrKey, TransactionBuilder } from "@stellar/stellar-sdk";
 import { env } from "../config/env.js";
 import { HttpError } from "../http-error.js";
 
@@ -52,7 +52,12 @@ export function parseGateCall(signedXdr: string): GateCall {
 
 /** Requires the signed transaction to be one of `fns` on EscrowGate, sent by
  * `account` and acting for `account` (every user-facing entrypoint takes the
- * acting address as its first argument). */
+ * acting address as its first argument).
+ *
+ * For contract accounts (C... addresses) per SEP-45 / sponsored transactions:
+ * - `args[0]` must equal `expected.account`.
+ * - The transaction has an auth entry signed by `expected.account`.
+ * - The fee-paying transaction source may be any valid G... account. */
 export function assertGateCall(
   signedXdr: string,
   expected: { account: string; fns: string[]; check?: (call: GateCall) => string | null }
@@ -61,9 +66,37 @@ export function assertGateCall(
   if (!expected.fns.includes(call.fn)) {
     throw new HttpError(400, `this endpoint relays ${expected.fns.join(" / ")} only, not ${call.fn}`);
   }
-  if (call.source !== expected.account || call.args[0] !== expected.account) {
-    throw new HttpError(403, "transaction must be sent by, and act for, the authenticated account");
+
+  const isContractAccount = StrKey.isValidContract(expected.account);
+  if (isContractAccount) {
+    if (call.args[0] !== expected.account) {
+      throw new HttpError(403, "transaction must act for the authenticated contract account");
+    }
+
+    const tx = TransactionBuilder.fromXDR(signedXdr, env.NETWORK_PASSPHRASE);
+    if (!(tx instanceof FeeBumpTransaction) && tx.operations[0]?.type === "invokeHostFunction") {
+      const authEntries = (tx.operations[0].auth ?? []) as unknown as Array<{ credentials: { type?: string; address?: { address: unknown } } }>;
+      const hasValidAuth = authEntries.some((entry) => {
+        const creds = entry.credentials;
+        if (creds?.type === "sorobanCredentialsAddress" && creds.address?.address) {
+          const addr = Address.fromScAddress(creds.address.address as any).toString();
+          return addr === expected.account;
+        }
+        return false;
+      });
+
+      if (!hasValidAuth) {
+        throw new HttpError(403, `transaction missing valid SorobanAuthorizationEntry for ${expected.account}`);
+      }
+    } else {
+      throw new HttpError(403, "transaction does not contain valid authorization for contract account");
+    }
+  } else {
+    if (call.source !== expected.account || call.args[0] !== expected.account) {
+      throw new HttpError(403, "transaction must be sent by, and act for, the authenticated account");
+    }
   }
+
   const problem = expected.check?.(call) ?? null;
   if (problem) throw new HttpError(400, problem);
   return call;
