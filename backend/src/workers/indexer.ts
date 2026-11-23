@@ -3,7 +3,7 @@ import { sql } from "kysely";
 import { db } from "../db.js";
 import { server } from "../chain/rpc.js";
 import { env } from "../config/env.js";
-import { fromChainVerdict, fromChainResolution, fromChainResolutionMethod } from "../chain/mappers.js";
+import { fromChainVerdict, fromChainResolution, fromChainResolutionMethod, challengeResolutionMethod } from "../chain/mappers.js";
 import {
   assignReplayJobs,
   escalateAgentPendingSubmissions,
@@ -401,12 +401,6 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
   }
 }
 
-/** A challenge row only ever records a resolution the contract accepted;
- * anything else (None, or a method this deployment cannot use) stays null. */
-function challengeResolutionMethod(v: unknown): "reexecution_consensus" | "zk_proof" | null {
-  const method = fromChainResolutionMethod(v);
-  return method === "reexecution_consensus" || method === "zk_proof" ? method : null;
-}
 
 /** Mirrors invariant 1 off-chain: as soon as a fresh replay tally implies a
  * bonded supermajority, proactively call the real keeper-signed finalize()

@@ -1,4 +1,4 @@
-import type { SubmissionRecord } from "escrow-gate";
+import type { ChallengeRecord, SubmissionRecord } from "escrow-gate";
 import { Errors } from "escrow-gate";
 import { escrowGateAsKeeper } from "./clients.js";
 import { withKeeperLock } from "./keeper.js";
@@ -16,6 +16,11 @@ export function contractErrorName(err: unknown): string | null {
 
 export async function readSubmission(chainSubmissionId: string): Promise<SubmissionRecord | null> {
   const tx = await escrowGateAsKeeper.get_submission({ id: BigInt(chainSubmissionId) });
+  return tx.result ?? null;
+}
+
+export async function readChallenge(chainSubmissionId: string): Promise<ChallengeRecord | null> {
+  const tx = await escrowGateAsKeeper.get_challenge({ id: BigInt(chainSubmissionId) });
   return tx.result ?? null;
 }
 
