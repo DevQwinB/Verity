@@ -7,8 +7,16 @@
 //! integrator can copy the pattern from (Rust) or reimplement against the
 //! exported EscrowGate contract spec (any language via stellar-sdk bindings).
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, BytesN, Env};
 use verity_common::{Error, SubmissionRecord, Verdict};
+
+/// Grace after an escrow's deadline before its poster may reclaim it. Covers
+/// the longest legitimate in-flight lifetime of work started before the
+/// deadline: a submission created just before it can still be inside its own
+/// challenge window at the deadline, and a challenge opened as that window
+/// closes can run for one further window before `release()` sees a terminal
+/// verdict. Two maximum challenge windows bound that worst case.
+const REFUND_GRACE_S: u64 = 2 * escrow_gate::MAX_WINDOW_S;
 
 #[contracttype]
 #[derive(Clone)]
@@ -26,7 +34,17 @@ struct EscrowRecord {
     payee: Address,
     poster: Address,
     amount: i128,
+    deadline: u64,
     released: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EscrowRefunded {
+    #[topic]
+    pub escrow_id: u64,
+    pub poster: Address,
+    pub amount: i128,
 }
 
 #[contract]
@@ -57,9 +75,20 @@ impl ExampleMarketplaceEscrow {
 
     /// The bounty poster escrows funds for a specific payee agent, unrelated
     /// to (and pre-dating) any Verity submission — this is the marketplace's
-    /// own existing escrow behavior, unchanged by integrating Verity.
-    pub fn create_escrow(e: Env, poster: Address, payee: Address, amount: i128) -> Result<u64, Error> {
+    /// own existing escrow behavior, with one addition: a deadline (a ledger
+    /// timestamp) after which the poster can reclaim the funds with
+    /// `refund_expired()` if the payee never delivered.
+    pub fn create_escrow(
+        e: Env,
+        poster: Address,
+        payee: Address,
+        amount: i128,
+        deadline: u64,
+    ) -> Result<u64, Error> {
         poster.require_auth();
+        if deadline <= e.ledger().timestamp() {
+            return Err(Error::DeadlineInThePast);
+        }
         let bond_asset: Address = e
             .storage()
             .instance()
@@ -72,7 +101,7 @@ impl ExampleMarketplaceEscrow {
         e.storage().instance().set(&DataKey::NextId, &(id + 1));
         e.storage().persistent().set(
             &DataKey::Escrow(id),
-            &EscrowRecord { payee, poster, amount, released: false },
+            &EscrowRecord { payee, poster, amount, deadline, released: false },
         );
         Ok(id)
     }
@@ -143,6 +172,45 @@ impl ExampleMarketplaceEscrow {
             }
         }
         e.storage().persistent().set(&DataKey::Escrow(escrow_id), &rec);
+        Ok(())
+    }
+
+    /// Reclaims an escrow the payee never delivered on. The poster must sign,
+    /// and the funds can only leave once the deadline has passed and a grace
+    /// period has run out. The grace period is the in-flight-work rule: a
+    /// submission created before the deadline is never cut off while it can
+    /// still be verified, because `REFUND_GRACE_S` covers its challenge window
+    /// plus the one further window an unresolved challenge can last. Until
+    /// then this returns `DeadlineNotElapsed` and the poster must wait.
+    ///
+    /// `release()` keeps working after the deadline, so work that does settle
+    /// is still paid even if the poster has not asked for a refund. A refund
+    /// is final: once it happens, `release()` is a no-op.
+    pub fn refund_expired(e: Env, escrow_id: u64) -> Result<(), Error> {
+        let mut rec: EscrowRecord = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(Error::SubmissionNotFound)?;
+        rec.poster.require_auth();
+        if rec.released {
+            return Err(Error::AlreadyReleased);
+        }
+        if e.ledger().timestamp() < rec.deadline.saturating_add(REFUND_GRACE_S) {
+            return Err(Error::DeadlineNotElapsed);
+        }
+
+        let bond_asset: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::BondAsset)
+            .ok_or(Error::NotInitialized)?;
+        let token = soroban_sdk::token::TokenClient::new(&e, &bond_asset);
+        token.transfer(&e.current_contract_address(), rec.poster.clone(), &rec.amount);
+
+        rec.released = true;
+        e.storage().persistent().set(&DataKey::Escrow(escrow_id), &rec);
+        EscrowRefunded { escrow_id, poster: rec.poster.clone(), amount: rec.amount }.publish(&e);
         Ok(())
     }
 }

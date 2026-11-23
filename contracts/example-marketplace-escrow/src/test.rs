@@ -61,6 +61,11 @@ fn setup() -> TestSetup {
     }
 }
 
+/// A deadline far enough away that a test not about refunds never reaches it.
+fn far_deadline(e: &Env) -> u64 {
+    e.ledger().timestamp() + 86_400
+}
+
 fn create_escrow_and_submission(
     setup: &TestSetup,
     poster: &Address,
@@ -69,7 +74,7 @@ fn create_escrow_and_submission(
     setup.token_admin.mint(poster, &(1000 * XLM));
     setup.token_admin.mint(agent, &(1000 * XLM));
 
-    let escrow_id = setup.mkt.create_escrow(poster, agent, &(1000 * XLM));
+    let escrow_id = setup.mkt.create_escrow(poster, agent, &(1000 * XLM), &far_deadline(&setup.e));
     let submission_id = setup.gate.submit(
         agent,
         &crate::escrow_ref_for(&setup.e, escrow_id),
@@ -104,7 +109,7 @@ fn release_pays_agent_only_after_gate_verifies() {
     token_admin.mint(&poster, &(1000 * XLM));
     token_admin.mint(&agent, &(1000 * XLM)); // agent needs its own bond for submit()
 
-    let escrow_id = mkt.create_escrow(&poster, &agent, &(1000 * XLM));
+    let escrow_id = mkt.create_escrow(&poster, &agent, &(1000 * XLM), &far_deadline(&e));
 
     let submission_id = gate.submit(
         &agent,
@@ -157,7 +162,7 @@ fn release_refunds_poster_when_gate_slashes() {
     token_admin.mint(&poster, &(1000 * XLM));
     token_admin.mint(&agent, &(1000 * XLM));
 
-    let escrow_id = mkt.create_escrow(&poster, &agent, &(1000 * XLM));
+    let escrow_id = mkt.create_escrow(&poster, &agent, &(1000 * XLM), &far_deadline(&e));
     let submission_id = gate.submit(
         &agent,
         &crate::escrow_ref_for(&e, escrow_id),
@@ -277,7 +282,7 @@ fn release_rejects_submission_from_other_agent() {
     token_admin.mint(&poster, &(1000 * XLM));
     token_admin.mint(&other_agent, &(1000 * XLM));
 
-    let escrow_id = mkt.create_escrow(&poster, &payee, &(1000 * XLM));
+    let escrow_id = mkt.create_escrow(&poster, &payee, &(1000 * XLM), &far_deadline(&e));
 
     // A valid, matching-escrow submission that simply belongs to a different
     // agent must not release this escrow.
@@ -321,7 +326,7 @@ fn release_rejects_mismatched_escrow_value() {
     token_admin.mint(&poster, &(1000 * XLM));
     token_admin.mint(&payee, &(1000 * XLM));
 
-    let escrow_id = mkt.create_escrow(&poster, &payee, &(1000 * XLM));
+    let escrow_id = mkt.create_escrow(&poster, &payee, &(1000 * XLM), &far_deadline(&e));
 
     // Right agent and escrow_ref, but the claimed value does not match the
     // escrow's amount.
@@ -365,7 +370,7 @@ fn release_rejects_mismatched_escrow_ref() {
     token_admin.mint(&poster, &(1000 * XLM));
     token_admin.mint(&payee, &(1000 * XLM));
 
-    let escrow_id = mkt.create_escrow(&poster, &payee, &(1000 * XLM));
+    let escrow_id = mkt.create_escrow(&poster, &payee, &(1000 * XLM), &far_deadline(&e));
 
     // Right agent and value, but the submission names a different escrow.
     let submission_id = gate.submit(
@@ -405,9 +410,107 @@ fn release_rejects_unknown_submission() {
     let payee = Address::generate(&e);
     token_admin.mint(&poster, &(1000 * XLM));
 
-    let escrow_id = mkt.create_escrow(&poster, &payee, &(1000 * XLM));
+    let escrow_id = mkt.create_escrow(&poster, &payee, &(1000 * XLM), &far_deadline(&e));
 
     let res = mkt.try_release(&escrow_id, &99u64);
     assert_eq!(res, Err(Ok(Error::SubmissionNotFound)));
     assert_eq!(token.balance(&mkt_id), 1000 * XLM);
+}
+
+// ---- refunding an escrow the payee never delivered on ----
+
+#[test]
+fn create_escrow_rejects_a_deadline_in_the_past() {
+    let setup = setup();
+    let poster = Address::generate(&setup.e);
+    let payee = Address::generate(&setup.e);
+    setup.token_admin.mint(&poster, &(1000 * XLM));
+    let now = setup.e.ledger().timestamp();
+
+    for invalid in [now.saturating_sub(1), now] {
+        let res = setup.mkt.try_create_escrow(&poster, &payee, &(1000 * XLM), &invalid);
+        assert_eq!(res, Err(Ok(Error::DeadlineInThePast)));
+    }
+    assert_eq!(setup.token.balance(&poster), 1000 * XLM);
+    assert_eq!(setup.token.balance(&setup.mkt_id), 0);
+}
+
+#[test]
+fn refund_waits_for_the_deadline_and_the_grace_period() {
+    let setup = setup();
+    let poster = Address::generate(&setup.e);
+    let payee = Address::generate(&setup.e);
+    setup.token_admin.mint(&poster, &(1000 * XLM));
+    let start = setup.e.ledger().timestamp();
+    let deadline = start + 1000;
+    let escrow_id = setup.mkt.create_escrow(&poster, &payee, &(1000 * XLM), &deadline);
+
+    // Before the deadline, and even after it while in-flight work could
+    // still be verifying, the poster cannot take the funds back.
+    for at in [deadline - 1, deadline, deadline + crate::REFUND_GRACE_S - 1] {
+        setup.e.ledger().set_timestamp(at);
+        let res = setup.mkt.try_refund_expired(&escrow_id);
+        assert_eq!(res, Err(Ok(Error::DeadlineNotElapsed)), "at {at}");
+    }
+    assert_eq!(setup.token.balance(&poster), 0);
+    assert_eq!(setup.token.balance(&setup.mkt_id), 1000 * XLM);
+
+    // Once the grace period is over the poster gets the full amount back.
+    setup.e.ledger().set_timestamp(deadline + crate::REFUND_GRACE_S);
+    setup.mkt.refund_expired(&escrow_id);
+    assert_eq!(setup.token.balance(&poster), 1000 * XLM);
+    assert_eq!(setup.token.balance(&setup.mkt_id), 0);
+}
+
+#[test]
+fn refund_after_a_release_is_rejected() {
+    let setup = setup();
+    let poster = Address::generate(&setup.e);
+    let agent = Address::generate(&setup.e);
+    let (escrow_id, submission_id) = create_escrow_and_submission(&setup, &poster, &agent);
+
+    setup.e.ledger().set_timestamp(setup.e.ledger().timestamp() + 3601);
+    setup.mkt.release(&escrow_id, &submission_id);
+
+    // Advancing past the deadline changes nothing: the escrow is settled.
+    setup
+        .e
+        .ledger()
+        .set_timestamp(far_deadline(&setup.e) + crate::REFUND_GRACE_S);
+    let res = setup.mkt.try_refund_expired(&escrow_id);
+    assert_eq!(res, Err(Ok(Error::AlreadyReleased)));
+    assert_eq!(setup.token.balance(&setup.mkt_id), 0);
+}
+
+#[test]
+fn release_after_a_refund_is_a_no_op() {
+    let setup = setup();
+    let poster = Address::generate(&setup.e);
+    let agent = Address::generate(&setup.e);
+    let start = setup.e.ledger().timestamp();
+
+    setup.token_admin.mint(&poster, &(1000 * XLM));
+    setup.token_admin.mint(&agent, &(1000 * XLM));
+    let escrow_id = setup.mkt.create_escrow(&poster, &agent, &(1000 * XLM), &(start + 1000));
+    let submission_id = setup.gate.submit(
+        &agent,
+        &crate::escrow_ref_for(&setup.e, escrow_id),
+        &(1000 * XLM),
+        &TaskType::Deterministic,
+        &BytesN::from_array(&setup.e, &[2u8; 32]),
+        &BytesN::from_array(&setup.e, &[3u8; 32]),
+        &(50 * XLM),
+    );
+
+    setup.e.ledger().set_timestamp(start + 1000 + crate::REFUND_GRACE_S);
+    setup.mkt.refund_expired(&escrow_id);
+    assert_eq!(setup.token.balance(&poster), 1000 * XLM);
+    let agent_before = setup.token.balance(&agent);
+
+    // The submission may still settle later, but the money is already back
+    // with the poster, so release must not pay the agent a second time.
+    setup.e.ledger().set_timestamp(start + 1000 + crate::REFUND_GRACE_S + 3601);
+    setup.mkt.release(&escrow_id, &submission_id);
+    assert_eq!(setup.token.balance(&agent), agent_before);
+    assert_eq!(setup.token.balance(&setup.mkt_id), 0);
 }

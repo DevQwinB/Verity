@@ -10,6 +10,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 soroban-sdk = { workspace = true }
 verity-common = { workspace = true }
+# Only for MAX_WINDOW_S: the refund grace period is derived from the longest
+# challenge window EscrowGate accepts.
+escrow-gate = { path = "../escrow-gate" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

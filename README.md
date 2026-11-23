@@ -297,6 +297,15 @@ The admin (the deploying account) can change the configuration future
 submissions use, and decides which staked accounts may vote while
 `reexecutor_allowlist` is on. It cannot set, change or override a verdict.
 
+The reference `example-marketplace-escrow` shows the integration end to end.
+Its `create_escrow` takes a deadline (a ledger timestamp) as well as the
+payee and amount, and rejects one that is not in the future. `release()` is
+the normal payout path and keeps working after the deadline. If the payee
+never delivers, the poster can call `refund_expired()` once the deadline and
+a two-challenge-window grace period have passed; the grace period is what
+keeps work already under verification at the deadline from being cut off.
+A refund is final: a later `release()` is a no-op.
+
 ## API
 
 SEP-10 JWT auth (`GET /auth?account=G…`, sign, `POST /auth`). Every
@@ -668,7 +677,8 @@ full tally.
   committed on-chain; the function is stored by hash but not committed. A
   verdict means "consistent with the artifacts the agent declared".
 - **No escrow is gated yet.** `example-marketplace-escrow` shows the
-  integration but is not deployed; `escrow_value` is declared by the agent.
+  integration, including a poster deadline and refund, but is not deployed;
+  `escrow_value` is declared by the agent.
 - **Voter set.** Stake is free on testnet, so an open voter set could be
   captured at no cost. Deployments here run with `reexecutor_allowlist` on:
   the admin approves which staked accounts may vote.
