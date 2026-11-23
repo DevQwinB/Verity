@@ -12,7 +12,9 @@ export async function configRoutes(app: FastifyInstance) {
       deployment: env.DEPLOYMENT_NAME,
       network_passphrase: env.NETWORK_PASSPHRASE,
       escrow_gate_contract_id: env.ESCROW_GATE_CONTRACT_ID,
-      bond_asset: "native",
+      // The contract id of the token bonds and stakes are paid in: checked
+      // against the gate's own at startup (chain/bond-asset.ts).
+      bond_asset: env.BOND_ASSET_CONTRACT_ID,
       min_stake_floor: cfg.min_stake_floor.toString(),
       quorum_min_reexecutors: cfg.quorum_min_reexecutors,
       quorum_supermajority_bps: cfg.quorum_supermajority_bps,
