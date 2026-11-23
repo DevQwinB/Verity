@@ -3,10 +3,22 @@ import { env } from "./config/env.js";
 import { db } from "./db.js";
 import { startIndexer } from "./workers/indexer.js";
 import { startScheduler } from "./workers/scheduler.js";
+import { assertContractMatch } from "./workers/contract-guard.js";
 
 async function main() {
   const app = buildApp();
   await app.listen({ port: env.PORT, host: "0.0.0.0" });
+
+  if (env.RUN_WORKERS) {
+    await assertContractMatch(env.ESCROW_GATE_CONTRACT_ID, {
+      logger: app.log,
+      exit: async (code) => {
+        await app.close().catch((err) => app.log.error(err));
+        await db.destroy().catch((err) => app.log.error(err));
+        process.exit(code);
+      },
+    });
+  }
 
   // The indexer owns the chain cursor and the scheduler signs with the keeper
   // account; two processes doing either would race. RUN_WORKERS=false makes
