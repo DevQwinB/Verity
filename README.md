@@ -383,7 +383,8 @@ dismissed or a tab closed between build and relay:
 | Case | Response |
 |---|---|
 | key already used by a *different* account | 409 `{ "error": "idempotency_key is already in use" }` |
-| same account, submission already on-chain | 200 `{ submission, unsigned_transaction_xdr: null, network_passphrase }` — nothing to sign |
+| same account, submission already on-chain, same fields | 200 `{ submission, unsigned_transaction_xdr: null, network_passphrase }` — nothing to sign |
+| same account, submission already on-chain, any field changed | 409 `{ "error": "idempotency_key was already used for a different submission (<fields> differ). …" }` — the earlier submission is unchanged; send the new one with a new key |
 | same account, draft never signed | draft updated, fresh transaction built; 200 `{ submission, unsigned_transaction_xdr, network_passphrase }` |
 | new key | 201 with the same three fields |
 
