@@ -1,5 +1,7 @@
 # Verity
 
+**Live testnet deployment:** [Dashboard](https://verity.devqwinb.xyz) | [API](https://api.verity.devqwinb.xyz) | [Status](https://verity.devqwinb.xyz/status) (`deployments/public.json`)
+
 An optimistic verification layer for Soroban escrow. A marketplace's escrow
 contract asks Verity's `EscrowGate` for a verdict before it pays an AI agent;
 the verdict comes from bonded re-executors replaying the agent's work, with a
@@ -262,13 +264,22 @@ Deterministic tasks run in a sandboxed JavaScript runtime:
     Only `http:` and `https:` schemes are supported. The URL must resolve to a public IP
     address: loopback, private, and link-local IP addresses are rejected, and the request
     connects directly to the validated IP.
-14. **Redirects and response codes.** Redirects are not followed; HTTP 3xx status codes
+14. **Redirects, response codes, and encodings.** Redirects are not followed; HTTP 3xx status codes
     are treated as a mismatch. Definitive 4xx statuses (for example 404 or 410) and other
     non-2xx responses are also mismatches. Statuses 401, 403, 408, 429, 451 and anything
     from 500 up, DNS failures, timeouts, and network errors are treated as transient: the worker retries for up to `min(RETRIEVAL_RETRY_BUDGET_S, challenge window / 2)`
     seconds (default `RETRIEVAL_RETRY_BUDGET_S` is 120 s), verifies its own network
-    connectivity, and only votes mismatch if its own connectivity is intact. Each HTTP request
-    times out after 10 s of silence or 30 s overall, and response bodies are capped at 1,000,000 bytes.
+    connectivity, and only votes mismatch if its own connectivity is intact. When a target
+    resolves to multiple addresses, each checked address is tried in turn upon connection failure
+    (IPv4 first, then IPv6). A redirect or HTTP response from the first address that answers is final
+    and subsequent addresses are not tried. When all addresses fail because this host cannot route
+    to their address family (`ENETUNREACH` or `EADDRNOTAVAIL`), this is treated as a host infrastructure
+    error (`RetrievalHostError`) and the worker does not vote, preventing split votes caused by host network
+    limitations (such as IPv6-only targets on IPv4-only hosts). Each HTTP request
+    times out after 10 s of silence or 30 s overall, and response bodies are capped at 1,000,000 decompressed bytes.
+    Responses encoded with `Content-Encoding: gzip`, `x-gzip`, `deflate`, or `br` are decompressed;
+    any other non-identity encoding is treated as a mismatch. Response bodies are always decoded as UTF-8
+    with a leading byte-order mark (BOM) stripped (other charsets are not decoded).
 15. **JSON pointers.** If the response body is JSON, an optional RFC 6901 pointer (e.g. `/data/0/price`)
     selects the targeted value (`~1` escapes `/`, `~0` escapes `~`). The pointer must start
     with `/`; an empty pointer `""` selects the entire document. A pointer that fails to resolve
@@ -334,6 +345,7 @@ call it was built for.
 | `POST /v1/marketplaces/:id/webhooks` | Bearer | 400 for an unknown event name; 403 for another account's marketplace |
 | `GET /v1/marketplaces/:id/webhooks` | Bearer | your subscriptions, without `secret`; 403 for another account's marketplace |
 | `PATCH /v1/marketplaces/:id/webhooks/:webhookId` | Bearer | `{"active": boolean}`; 403 for another account's marketplace, 404 for an unknown webhook |
+| `DELETE /v1/marketplaces/:id/webhooks/:webhookId` | Bearer | removes subscription and its delivery history, freeing a slot; 204 on success, 403 for another account's marketplace, 404 for an unknown webhook |
 
 ### Authentication and token lifetime
 
@@ -419,18 +431,21 @@ with HTTP 400 and duplicates are stored once. The marketplace ID is a UUID;
 only its own account may register a webhook (otherwise HTTP 403). A
 successful registration returns the subscription row with HTTP 201. A
 marketplace can hold at most 10 subscriptions (HTTP 409 beyond that);
-deactivating one does not free its slot. The URL must resolve to a public
-address: private, loopback, link-local, multicast and reserved ranges (and IPv6
-forms that wrap them) are refused with HTTP 400, both at registration and again
-at every delivery, which connects to the address it just checked.
+delete an existing subscription to free a slot (deactivating one does not).
+The URL must resolve to a public address: private, loopback, link-local,
+multicast and reserved ranges (and IPv6 forms that wrap them) are refused
+with HTTP 400, both at registration and again at every delivery, which
+connects to the address it just checked.
 
 `GET /v1/marketplaces/:id/webhooks` lists the marketplace's subscriptions
 (`id`, `url`, `events`, `active`, `created_at`; the `secret` is never
 returned). `PATCH /v1/marketplaces/:id/webhooks/:webhookId` with
 `{"active": false}` stops deliveries to a subscription and `{"active": true}`
 resumes them; it returns the updated subscription, or HTTP 404 if that
-webhook does not exist on this marketplace. Both require the marketplace's own
-account (otherwise HTTP 403).
+webhook does not exist on this marketplace. `DELETE /v1/marketplaces/:id/webhooks/:webhookId`
+permanently removes a subscription, cascades and deletes its delivery history,
+and frees its slot (returning HTTP 204, or HTTP 404 if not found). All require
+the marketplace's own account (otherwise HTTP 403).
 
 | Event | When emitted | `data` |
 | --- | --- | --- |

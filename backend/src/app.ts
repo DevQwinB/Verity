@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import cookie from "@fastify/cookie";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
+import { Keypair, xdr } from "@stellar/stellar-sdk";
 import { sql } from "kysely";
 import { ZodError } from "zod";
 import { env } from "./config/env.js";
@@ -56,6 +57,37 @@ async function computeReadiness(): Promise<Readiness> {
     if (cursor) indexerLag = Math.max(0, latestLedger - Number(cursor.last_ledger));
   }
   const indexer = indexerLag === null || indexerLag <= MAX_INDEXER_LAG_LEDGERS;
+
+  let reexecutorsOnline = 0;
+  if (database) {
+    await check(async () => {
+      const res = await db
+        .selectFrom("reexecutor")
+        .select((eb) => eb.fn.countAll<number>().as("count"))
+        .where("active", "=", true)
+        .where("last_seen_at", ">", sql<Date>`now() - (${env.REEXECUTOR_LIVENESS_S} || ' seconds')::interval`)
+        .executeTakeFirst();
+      reexecutorsOnline = Number(res?.count ?? 0);
+    });
+  }
+
+  let keeperBalanceStroops: string | null = null;
+  if (rpc) {
+    try {
+      const keeperKp = Keypair.fromSecret(env.KEEPER_SECRET_KEY);
+      const key = xdr.LedgerKey.account(
+        new xdr.LedgerKeyAccount({ accountId: keeperKp.xdrPublicKey() })
+      );
+      const res = await server.getLedgerEntries(key);
+      const bal = (res.entries[0]?.val as any)?.account?.balance;
+      if (bal !== undefined && bal !== null) {
+        keeperBalanceStroops = bal.toString();
+      }
+    } catch {
+      // transient RPC error reading keeper balance leaves it null
+    }
+  }
+
   const ok = database && rpc && indexer;
   return {
     code: ok ? 200 : 503,
@@ -65,6 +97,8 @@ async function computeReadiness(): Promise<Readiness> {
       network_passphrase: env.NETWORK_PASSPHRASE,
       escrow_gate_contract_id: env.ESCROW_GATE_CONTRACT_ID,
       workers: env.RUN_WORKERS,
+      keeper_balance_stroops: keeperBalanceStroops,
+      reexecutors_online: reexecutorsOnline,
       checks: { database, rpc, indexer, indexer_lag_ledgers: indexerLag },
     },
   };
