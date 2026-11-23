@@ -1,4 +1,6 @@
 import { createHmac } from "node:crypto";
+import type { Kysely, Transaction, Selectable } from "kysely";
+import type { Database, WebhookDeliveryTable } from "@verity/db";
 import { db } from "../../db.js";
 import { resolvePublicTarget } from "./url-guard.js";
 import { postPinned } from "./post-pinned.js";
@@ -60,34 +62,78 @@ export interface WebhookSubscriptionRecord {
   active: boolean;
 }
 
+export interface EnqueuedWebhook {
+  delivery: Selectable<WebhookDeliveryTable>;
+  subscription: WebhookSubscriptionRecord;
+}
+
 /**
- * Delivers a single webhook event to a subscription.
+ * Enqueues pending webhook_delivery rows in the provided database transaction.
+ * Resolves active subscriptions matching the event type and inserts pending delivery records.
+ */
+export async function enqueueWebhook(
+  trx: Kysely<Database> | Transaction<Database>,
+  marketplaceId: string,
+  eventType: string,
+  payload: unknown
+): Promise<EnqueuedWebhook[]> {
+  const subs = await trx
+    .selectFrom("webhook_subscription")
+    .selectAll()
+    .where("marketplace_id", "=", marketplaceId)
+    .where("active", "=", true)
+    .execute();
+
+  const matching = subs.filter((sub) => sub.events.includes(eventType));
+  if (matching.length === 0) {
+    return [];
+  }
+
+  const results: EnqueuedWebhook[] = [];
+  for (const sub of matching) {
+    const delivery = await trx
+      .insertInto("webhook_delivery")
+      .values({
+        subscription_id: sub.id,
+        event_type: eventType,
+        payload: payload as any,
+        status: "pending",
+      })
+      .returningAll()
+      .executeTakeFirstOrThrow();
+    results.push({ delivery, subscription: sub });
+  }
+  return results;
+}
+
+/**
+ * Attempts delivery for an already-enqueued webhook_delivery record.
  * Handles SSRF guard checking with the checked address pinned for the request,
  * an overall per-request timeout, and database status tracking.
  */
-export async function deliver(
-  sub: WebhookSubscriptionRecord,
-  eventType: string,
-  payload: unknown
+export async function attemptDelivery(
+  delivery: Selectable<WebhookDeliveryTable>,
+  subscription?: WebhookSubscriptionRecord
 ): Promise<void> {
+  let sub = subscription;
+  if (!sub) {
+    const found = await db
+      .selectFrom("webhook_subscription")
+      .selectAll()
+      .where("id", "=", delivery.subscription_id)
+      .executeTakeFirst();
+    if (!found) {
+      console.error(`[webhook] subscription ${delivery.subscription_id} not found for delivery ${delivery.id}`);
+      return;
+    }
+    sub = found;
+  }
+
+  const eventType = delivery.event_type;
+  const payload = delivery.payload;
   const body = JSON.stringify({ event: eventType, data: payload });
   const origin = getUrlOrigin(sub.url);
-
-  let deliveryId: string | undefined;
-  try {
-    const delivery = await db
-      .insertInto("webhook_delivery")
-      .values({ subscription_id: sub.id, event_type: eventType, payload: payload as any })
-      .returningAll()
-      .executeTakeFirstOrThrow();
-    deliveryId = delivery.id;
-  } catch (insertErr) {
-    console.error(
-      `[webhook] failed to create delivery record for subscription ${sub.id} (${eventType}) to ${origin}:`,
-      insertErr
-    );
-    return;
-  }
+  const deliveryId = delivery.id;
 
   // Signed over timestamp, delivery id and body so a captured request cannot be
   // replayed later or under another delivery id.
@@ -155,33 +201,51 @@ export async function deliver(
 }
 
 /**
+ * Delivers a single webhook event to a subscription.
+ * Used for direct delivery or backward compatibility.
+ */
+export async function deliver(
+  sub: WebhookSubscriptionRecord,
+  eventType: string,
+  payload: unknown
+): Promise<void> {
+  let delivery: Selectable<WebhookDeliveryTable>;
+  try {
+    delivery = await db
+      .insertInto("webhook_delivery")
+      .values({ subscription_id: sub.id, event_type: eventType, payload: payload as any, status: "pending" })
+      .returningAll()
+      .executeTakeFirstOrThrow();
+  } catch (insertErr) {
+    const origin = getUrlOrigin(sub.url);
+    console.error(
+      `[webhook] failed to create delivery record for subscription ${sub.id} (${eventType}) to ${origin}:`,
+      insertErr
+    );
+    return;
+  }
+
+  await attemptDelivery(delivery, sub);
+}
+
+/**
  * Dispatches webhook events for a marketplace without blocking caller loops.
  *
- * It awaits loading the active subscriptions for the marketplace, then kicks off
- * all matching deliveries concurrently in the background. Webhook deliveries run
- * with a short per-request timeout (5s) and release their connection bodies.
- *
- * If the process exits while deliveries are in flight, their rows stay `pending`
- * (webhooks are delivered once with no retry).
+ * Enqueues delivery rows transactionally, then kicks off all deliveries concurrently
+ * in the background. Webhook deliveries run with a short per-request timeout (5s)
+ * and release their connection bodies.
  */
 export async function dispatchWebhook(marketplaceId: string, eventType: string, payload: unknown): Promise<void> {
-  const subs = await db
-    .selectFrom("webhook_subscription")
-    .selectAll()
-    .where("marketplace_id", "=", marketplaceId)
-    .where("active", "=", true)
-    .execute();
-
-  const matching = subs.filter((sub) => sub.events.includes(eventType));
-  if (matching.length === 0) {
+  const enqueued = await db.transaction().execute((trx) => enqueueWebhook(trx, marketplaceId, eventType, payload));
+  if (enqueued.length === 0) {
     return;
   }
 
   // Trigger deliveries concurrently without awaiting network completion
   void Promise.allSettled(
-    matching.map((sub) =>
-      deliver(sub, eventType, payload).catch((err) => {
-        console.error(`[webhook] unhandled error delivering event ${eventType} to subscription ${sub.id}:`, err);
+    enqueued.map((item) =>
+      attemptDelivery(item.delivery, item.subscription).catch((err) => {
+        console.error(`[webhook] unhandled error delivering event ${eventType} to subscription ${item.subscription.id}:`, err);
       })
     )
   );
