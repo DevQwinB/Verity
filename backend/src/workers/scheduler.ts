@@ -1,4 +1,5 @@
 import { sql } from "kysely";
+import type { SubmissionRecord } from "escrow-gate";
 import { db } from "../db.js";
 import { env } from "../config/env.js";
 import {
@@ -7,12 +8,27 @@ import {
   readSubmission,
   releaseAttestationLockOnChain,
   resolveChallengeOnChain,
+  type KeeperTxResult,
 } from "../chain/actions.js";
 import { fromChainVerdict } from "../chain/mappers.js";
 import { recordTerminalVerdict } from "../modules/submissions/verdict.js";
 import { exportAttestation } from "../modules/attestations/export.js";
 import { topUpAssignments } from "../modules/reexecutors/assignment.js";
 import { maybeEarlyFinalize } from "./indexer.js";
+
+export interface SchedulerChainSeam {
+  readSubmission: (chainSubmissionId: string) => Promise<SubmissionRecord | null>;
+  finalizeOnChain: (chainSubmissionId: string) => Promise<KeeperTxResult>;
+  resolveChallengeOnChain: (chainSubmissionId: string) => Promise<KeeperTxResult>;
+  releaseAttestationLockOnChain: (chainSubmissionId: string, reexecutor: string) => Promise<string | null>;
+}
+
+export const schedulerChain: SchedulerChainSeam = {
+  readSubmission: (id) => readSubmission(id),
+  finalizeOnChain: (id) => finalizeOnChain(id),
+  resolveChallengeOnChain: (id) => resolveChallengeOnChain(id),
+  releaseAttestationLockOnChain: (id, reexecutor) => releaseAttestationLockOnChain(id, reexecutor),
+};
 
 /** How long settlement waits for the indexer to catch up on a submission's
  * votes before settling with the ones it has. */
@@ -48,7 +64,7 @@ export async function sweepOnce(): Promise<number> {
       .where("id", "=", sub.id)
       .execute();
     try {
-      const { status, txHash } = await finalizeOnChain(sub.chain_submission_id!);
+      const { status, txHash } = await schedulerChain.finalizeOnChain(sub.chain_submission_id!);
       await recordTerminalVerdict(sub.id, status, txHash);
     } catch (err) {
       console.error(`[scheduler] finalize failed for submission ${sub.id}:`, err);
@@ -104,9 +120,9 @@ export async function resolveChallengesOnce(): Promise<number> {
   let resolved = 0;
   for (const row of open) {
     try {
-      const record = await readSubmission(row.chain_submission_id!);
+      const record = await schedulerChain.readSubmission(row.chain_submission_id!);
       if (!record || record.finalized || !consensusOutcome(record)) continue;
-      const { status, txHash } = await resolveChallengeOnChain(row.chain_submission_id!);
+      const { status, txHash } = await schedulerChain.resolveChallengeOnChain(row.chain_submission_id!);
       await recordTerminalVerdict(row.id, status, txHash);
       resolved++;
     } catch (err) {
@@ -140,7 +156,7 @@ export async function expireChallengesOnce(): Promise<number> {
   for (const row of stale) {
     await db.updateTable("submission").set({ finalize_attempted_at: new Date() }).where("id", "=", row.id).execute();
     try {
-      const { status, txHash } = await finalizeOnChain(row.chain_submission_id!);
+      const { status, txHash } = await schedulerChain.finalizeOnChain(row.chain_submission_id!);
       await recordTerminalVerdict(row.id, status, txHash);
     } catch (err) {
       console.error(`[scheduler] challenge expiry failed for submission ${row.id}:`, err);
@@ -182,7 +198,7 @@ export async function settleOnce(): Promise<number> {
       // Vote events can be lost for good (RPC retention, a skipped event), so
       // after a grace period settle the votes we do know about rather than
       // leaving every one of them locked.
-      const record = await readSubmission(sub.chain_submission_id!);
+      const record = await schedulerChain.readSubmission(sub.chain_submission_id!);
       if (!record) continue;
       const onChainVotes = record.match_votes + record.mismatch_votes;
       if (votes.length < onChainVotes) {
@@ -195,7 +211,7 @@ export async function settleOnce(): Promise<number> {
 
       for (const vote of votes) {
         if (vote.lock_released_at) continue;
-        await releaseAttestationLockOnChain(sub.chain_submission_id!, vote.stellar_account);
+        await schedulerChain.releaseAttestationLockOnChain(sub.chain_submission_id!, vote.stellar_account);
         await db
           .updateTable("replay")
           .set({ lock_released_at: new Date() })
@@ -274,7 +290,7 @@ export async function reconcileOnce(): Promise<number> {
   let changed = 0;
   for (const row of open) {
     try {
-      const record = await readSubmission(row.chain_submission_id!);
+      const record = await schedulerChain.readSubmission(row.chain_submission_id!);
       if (!record?.finalized) continue;
       const status = fromChainVerdict(record.verdict);
       if (status === row.status) continue;

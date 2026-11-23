@@ -3,6 +3,7 @@ import pg from "pg";
 import type { Database } from "./types.js";
 
 export * from "./types.js";
+export { startLocalPostgres } from "./local-postgres.js";
 
 function intFromEnv(name: string, fallback: number, min = 0): number {
   const val = process.env[name];

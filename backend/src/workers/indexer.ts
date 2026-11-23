@@ -9,11 +9,35 @@ import {
   escalateAgentPendingSubmissions,
   escalateToFullReplay,
 } from "../modules/reexecutors/assignment.js";
+import type { SubmissionRecord } from "escrow-gate";
 import { escrowGateAsKeeper } from "../chain/clients.js";
-import { consensusOutcome, finalizeOnChain, minChallengerBond, readSubmission } from "../chain/actions.js";
+import { consensusOutcome, finalizeOnChain, minChallengerBond, readSubmission, type KeeperTxResult } from "../chain/actions.js";
 import { dispatchWebhook } from "../modules/webhooks/dispatcher.js";
 import { recordTerminalVerdict } from "../modules/submissions/verdict.js";
 import { isTransientError } from "./transient.js";
+
+export interface IndexerChainSeam {
+  readSubmission: (chainSubmissionId: string) => Promise<SubmissionRecord | null>;
+  reexecutorInfo: (reexecutor: string) => Promise<{ active: boolean; approved: boolean; stake_amount: bigint } | null>;
+  finalizeOnChain: (chainSubmissionId: string) => Promise<KeeperTxResult>;
+  assignReplayJobs: (args: {
+    submissionId: string;
+    chainSubmissionId: string;
+    taskType: "deterministic" | "retrieval" | "unverifiable";
+  }) => Promise<void>;
+  escalateToFullReplay: (submissionId: string) => Promise<void>;
+}
+
+export const indexerChain: IndexerChainSeam = {
+  readSubmission: (id) => readSubmission(id),
+  reexecutorInfo: async (reexecutor) => {
+    const tx = await escrowGateAsKeeper.reexecutor_info({ reexecutor });
+    return tx.result ?? null;
+  },
+  finalizeOnChain: (id) => finalizeOnChain(id),
+  assignReplayJobs: (args) => assignReplayJobs(args),
+  escalateToFullReplay: (submissionId) => escalateToFullReplay(submissionId),
+};
 
 const CONTRACT_ID = env.ESCROW_GATE_CONTRACT_ID;
 
@@ -60,7 +84,7 @@ function ledgerOfPagingToken(token: string): number {
 /** Idempotent by construction: every handler upserts on a unique key derived
  * from on-chain identity (chain_submission_id, (submission,reexecutor) pair,
  * etc.), so replaying the same event twice (e.g. after a restart) is safe. */
-async function handleEvent(topic: unknown[], value: unknown, ledger: number, txHash: string) {
+export async function handleEvent(topic: unknown[], value: unknown, ledger: number, txHash: string) {
   const kind = topic[0] as string;
 
   switch (kind) {
@@ -86,7 +110,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           .executeTakeFirst();
       }
       if (row) {
-        const sub = await readSubmission(chainSubmissionId);
+        const sub = await indexerChain.readSubmission(chainSubmissionId);
         await db
           .updateTable("submission")
           .set({
@@ -102,7 +126,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           })
           .where("id", "=", row.id)
           .execute();
-        await assignReplayJobs({
+        await indexerChain.assignReplayJobs({
           submissionId: row.id,
           chainSubmissionId,
           taskType: row.task_type,
@@ -183,7 +207,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
         // consensus; mirror the account from the contract and record it,
         // or settlement never releases that account's stake lock. An RPC
         // failure here propagates so the event is retried, not consumed.
-        const info = (await escrowGateAsKeeper.reexecutor_info({ reexecutor: v.reexecutor })).result;
+        const info = await indexerChain.reexecutorInfo(v.reexecutor);
         if (!info) {
           console.warn(
             `[indexer] replay_attested by ${v.reexecutor} (tx ${txHash}) ignored: the contract knows no such re-executor`
@@ -246,7 +270,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           .returningAll()
           .executeTakeFirst();
         if (spotCheck && !v.matched) {
-          await escalateToFullReplay(sub.id);
+          await indexerChain.escalateToFullReplay(sub.id);
           await escalateAgentPendingSubmissions(sub.agent_id, sub.id);
         }
         // Opportunistic: the vote above is already recorded, and the
@@ -295,7 +319,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           .execute();
         // A challenge is only ever resolved by bonded re-execution consensus,
         // so make sure a full quorum is actually working on it.
-        await escalateToFullReplay(sub.id);
+        await indexerChain.escalateToFullReplay(sub.id);
       }
       break;
     }
@@ -352,7 +376,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
         // Read the stake before writing anything. No database connection is
         // held open across a network call, and if this throws nothing has been
         // written yet, so the retry of this event starts from scratch.
-        const info = await escrowGateAsKeeper.reexecutor_info({ reexecutor: v.reexecutor });
+        const info = await indexerChain.reexecutorInfo(v.reexecutor);
 
         // All or nothing: a failure after the insert must roll the insert back,
         // or the retry would find the row, skip the update, and slashed_count
@@ -388,8 +412,8 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
               slashed_count: sql<number>`slashed_count + 1`,
               // Without a fresh read, leave the stored stake alone rather than
               // rewriting it from the stale row.
-              ...(info.result
-                ? { stake_amount: info.result.stake_amount.toString(), active: info.result.active }
+              ...(info
+                ? { stake_amount: info.stake_amount.toString(), active: info.active }
                 : {}),
             })
             .where("id", "=", rex.id)
@@ -419,10 +443,10 @@ export async function maybeEarlyFinalize(submissionRowId: string, chainSubmissio
     .where("id", "=", submissionRowId)
     .executeTakeFirst();
   if (!sub || sub.status !== "pending") return;
-  const record = await readSubmission(chainSubmissionId);
+  const record = await indexerChain.readSubmission(chainSubmissionId);
   if (!record || record.finalized || !consensusOutcome(record)) return;
 
-  const { status, txHash } = await finalizeOnChain(chainSubmissionId);
+  const { status, txHash } = await indexerChain.finalizeOnChain(chainSubmissionId);
   await recordTerminalVerdict(submissionRowId, status, txHash);
 }
 
