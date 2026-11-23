@@ -22,6 +22,15 @@ export function rankBySeed<T extends { stellar_account: string }>(seed: string, 
     .map(({ r }) => r);
 }
 
+/** Pure filter helper to exclude the submitting agent from eligible re-executors. */
+export function filterEligibleReexecutors<T extends { stellar_account: string }>(
+  rows: T[],
+  excludeAgentId?: string | null
+): T[] {
+  if (!excludeAgentId) return rows;
+  return rows.filter((r) => r.stellar_account !== excludeAgentId);
+}
+
 /**
  * Re-executors that can actually cast a counting vote right now, in this
  * submission's deterministic order: staked above the floor, approved when the
@@ -33,15 +42,16 @@ export function rankBySeed<T extends { stellar_account: string }>(seed: string, 
  * one to an account that staked but runs no worker costs the submission its
  * consensus. Ranking is uniform, not stake-weighted.
  */
-async function rankedLiveReexecutors(seed: string, allowlist: boolean) {
+async function rankedLiveReexecutors(seed: string, allowlist: boolean, excludeAgentId?: string | null) {
   let qb = db
     .selectFrom("reexecutor")
     .select(["id", "stellar_account"])
     .where("active", "=", true)
     .where("last_seen_at", ">", sql<Date>`now() - (${env.REEXECUTOR_LIVENESS_S} || ' seconds')::interval`);
   if (allowlist) qb = qb.where("approved", "=", true);
+  if (excludeAgentId) qb = qb.where("stellar_account", "!=", excludeAgentId);
   const live = await qb.execute();
-  return rankBySeed(seed, live);
+  return rankBySeed(seed, filterEligibleReexecutors(live, excludeAgentId));
 }
 
 /** Adds up to `count` re-executors who hold no row yet in `table` for this
@@ -51,15 +61,25 @@ async function assignNext(
   submissionId: string,
   seed: string,
   allowlist: boolean,
-  count: number
+  count: number,
+  excludeAgentId?: string | null
 ): Promise<number> {
   if (count <= 0) return 0;
+  let agentId = excludeAgentId;
+  if (agentId === undefined) {
+    const sub = await db
+      .selectFrom("submission")
+      .select("agent_id")
+      .where("id", "=", submissionId)
+      .executeTakeFirst();
+    agentId = sub?.agent_id;
+  }
   const taken = new Set(
     (
       await db.selectFrom(table).select("reexecutor_id").where("submission_id", "=", submissionId).execute()
     ).map((row) => row.reexecutor_id)
   );
-  const next = (await rankedLiveReexecutors(seed, allowlist)).filter((r) => !taken.has(r.id)).slice(0, count);
+  const next = (await rankedLiveReexecutors(seed, allowlist, agentId)).filter((r) => !taken.has(r.id)).slice(0, count);
   for (const r of next) {
     if (table === "replay") {
       await db
@@ -96,6 +116,7 @@ export async function assignReplayJobs(params: {
   submissionId: string;
   chainSubmissionId: string;
   taskType: TaskType;
+  agentId?: string | null;
   /** Force a full replay quorum even for a retrieval task — used when a
    * spot-check mismatches or a challenge is opened, where a single sampled
    * vote can never reach on-chain consensus on its own. */
@@ -105,6 +126,16 @@ export async function assignReplayJobs(params: {
   const { quorum, allowlist } = await votingRules();
   const seed = assignmentSeed(params.submissionId, params.chainSubmissionId);
 
+  let agentId = params.agentId;
+  if (agentId === undefined) {
+    const sub = await db
+      .selectFrom("submission")
+      .select("agent_id")
+      .where("id", "=", params.submissionId)
+      .executeTakeFirst();
+    agentId = sub?.agent_id;
+  }
+
   if (params.taskType === "deterministic" || params.fullQuorum) {
     const held = await db
       .selectFrom("replay")
@@ -113,9 +144,9 @@ export async function assignReplayJobs(params: {
       .where("status", "!=", "missed")
       .executeTakeFirst();
     const want = replayWantCount(quorum, env.REPLAY_OVERASSIGN, Number(held?.count ?? 0));
-    await assignNext("replay", params.submissionId, seed, allowlist, want);
+    await assignNext("replay", params.submissionId, seed, allowlist, want, agentId);
   } else {
-    await assignNext("spot_check", params.submissionId, seed, allowlist, 1);
+    await assignNext("spot_check", params.submissionId, seed, allowlist, 1, agentId);
   }
 }
 
@@ -132,6 +163,7 @@ export async function escalateToFullReplay(submissionId: string) {
     submissionId: sub.id,
     chainSubmissionId: sub.chain_submission_id,
     taskType: sub.task_type,
+    agentId: sub.agent_id,
     fullQuorum: true,
   });
 }
@@ -163,7 +195,7 @@ export async function escalateAgentPendingSubmissions(agentId: string, exceptSub
 export async function topUpAssignments(): Promise<number> {
   const open = await db
     .selectFrom("submission")
-    .select(["id", "chain_submission_id", "task_type", "status"])
+    .select(["id", "chain_submission_id", "task_type", "status", "agent_id"])
     .where("status", "in", ["pending", "disputed"])
     .where("chain_submission_id", "is not", null)
     // Once the window has closed on an unchallenged submission the sweep
@@ -197,7 +229,7 @@ export async function topUpAssignments(): Promise<number> {
 
     if (needsFullQuorum) {
       const working = Number(replays?.confirmed ?? 0) + Number(replays?.fresh ?? 0);
-      added += await assignNext("replay", sub.id, seed, allowlist, quorum - working);
+      added += await assignNext("replay", sub.id, seed, allowlist, quorum - working, sub.agent_id);
       continue;
     }
 
@@ -211,7 +243,7 @@ export async function topUpAssignments(): Promise<number> {
       .where("submission_id", "=", sub.id)
       .executeTakeFirst();
     if (Number(spot?.answered ?? 0) === 0 && Number(spot?.fresh ?? 0) === 0) {
-      added += await assignNext("spot_check", sub.id, seed, allowlist, 1);
+      added += await assignNext("spot_check", sub.id, seed, allowlist, 1, sub.agent_id);
     }
   }
   return added;
