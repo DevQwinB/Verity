@@ -1911,3 +1911,627 @@ fn a_challenge_with_a_zero_bond_is_rejected_even_when_the_minimum_rounds_to_zero
     );
     assert!(w.client.get_challenge(&id).is_none());
 }
+
+// ---- admin transfer and the treasury ----
+
+mod admin_and_treasury {
+    use super::*;
+    use crate::events::{AdminChanged, AdminProposed, TreasuryChanged};
+    use soroban_sdk::{
+        events::Event as _,
+        testutils::{Events as _, MockAuth, MockAuthInvoke},
+        xdr::ToXdr as _,
+        IntoVal as _, Val, Vec,
+    };
+
+    /// Three re-executors all report a mismatch, so `finalize` slashes the
+    /// agent's 50 XLM bond with no challenger to share it.
+    fn slash_by_consensus(w: &World, id: u64) {
+        for _ in 0..3 {
+            let rex = Address::generate(&w.e);
+            register_rex(w, &rex);
+            w.client
+                .attest_replay(&rex, &id, &BytesN::from_array(&w.e, &[9u8; 32]), &false);
+        }
+        assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+    }
+
+    fn instance_ttl(w: &World) -> u32 {
+        w.e.as_contract(&w.client.address, || w.e.storage().instance().get_ttl())
+    }
+
+    #[test]
+    fn the_treasury_starts_as_the_admin_and_nothing_is_proposed() {
+        let e = Env::default();
+        let w = setup(&e);
+        assert_eq!(w.client.get_treasury(), Some(w.admin.clone()));
+        assert_eq!(w.client.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn propose_admin_is_refused_for_anyone_but_the_admin() {
+        let e = Env::default();
+        let w = setup(&e);
+        let stranger = Address::generate(&e);
+        let next = Address::generate(&e);
+
+        assert_eq!(
+            w.client.try_propose_admin(&stranger, &next),
+            Err(Ok(Error::NotAdmin))
+        );
+        // Not even to name itself.
+        assert_eq!(
+            w.client.try_propose_admin(&stranger, &stranger),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_eq!(w.client.get_pending_admin(), None);
+        assert_eq!(w.client.get_admin(), Some(w.admin.clone()));
+    }
+
+    #[test]
+    fn a_proposal_alone_gives_the_proposed_address_no_rights() {
+        let e = Env::default();
+        let w = setup(&e);
+        let next = Address::generate(&e);
+        w.client.propose_admin(&w.admin, &next);
+
+        assert_eq!(w.client.get_pending_admin(), Some(next.clone()));
+        assert_eq!(w.client.get_admin(), Some(w.admin.clone()));
+        assert_eq!(w.client.get_treasury(), Some(w.admin.clone()));
+
+        let cfg = ConfigRecord {
+            quorum_min_reexecutors: 5,
+            ..default_config()
+        };
+        assert_eq!(
+            w.client.try_update_config(&next, &cfg),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_eq!(
+            w.client.try_set_treasury(&next, &next),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_eq!(
+            w.client.try_propose_admin(&next, &next),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_config_eq(&w.client.get_config().unwrap(), &default_config());
+
+        // The admin is still the admin.
+        w.client.update_config(&w.admin, &cfg);
+        assert_eq!(w.client.get_config().unwrap().quorum_min_reexecutors, 5);
+    }
+
+    #[test]
+    fn accept_admin_hands_the_role_to_the_proposed_address() {
+        let e = Env::default();
+        let w = setup(&e);
+        let next = Address::generate(&e);
+        w.client.propose_admin(&w.admin, &next);
+        w.client.accept_admin(&next);
+
+        assert_eq!(w.client.get_admin(), Some(next.clone()));
+        assert_eq!(w.client.get_pending_admin(), None);
+
+        // The old admin has lost every admin right.
+        let cfg = ConfigRecord {
+            quorum_min_reexecutors: 5,
+            ..default_config()
+        };
+        let rex = Address::generate(&e);
+        register_rex(&w, &rex);
+        let vault = Address::generate(&e);
+        assert_eq!(
+            w.client.try_update_config(&w.admin, &cfg),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_eq!(
+            w.client.try_set_reexecutor_approved(&w.admin, &rex, &true),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_eq!(
+            w.client.try_set_treasury(&w.admin, &vault),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_eq!(
+            w.client.try_propose_admin(&w.admin, &w.admin),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_config_eq(&w.client.get_config().unwrap(), &default_config());
+        assert!(!w.client.reexecutor_info(&rex).unwrap().approved);
+        assert_eq!(w.client.get_treasury(), Some(w.admin.clone()));
+        assert_eq!(w.client.get_pending_admin(), None);
+
+        // The new admin has all of them.
+        w.client.update_config(&next, &cfg);
+        assert_eq!(w.client.get_config().unwrap().quorum_min_reexecutors, 5);
+        w.client.set_reexecutor_approved(&next, &rex, &true);
+        assert!(w.client.reexecutor_info(&rex).unwrap().approved);
+        w.client.set_treasury(&next, &vault);
+        assert_eq!(w.client.get_treasury(), Some(vault));
+        w.client.propose_admin(&next, &w.admin);
+        assert_eq!(w.client.get_pending_admin(), Some(w.admin.clone()));
+    }
+
+    #[test]
+    fn accept_admin_is_refused_for_anyone_but_the_proposed_address() {
+        let e = Env::default();
+        let w = setup(&e);
+        let next = Address::generate(&e);
+        let stranger = Address::generate(&e);
+        w.client.propose_admin(&w.admin, &next);
+
+        assert_eq!(
+            w.client.try_accept_admin(&stranger),
+            Err(Ok(Error::NotPendingAdmin))
+        );
+        // The current admin cannot accept in the proposed address's place.
+        assert_eq!(
+            w.client.try_accept_admin(&w.admin),
+            Err(Ok(Error::NotPendingAdmin))
+        );
+        assert_eq!(w.client.get_admin(), Some(w.admin.clone()));
+        assert_eq!(w.client.get_pending_admin(), Some(next));
+    }
+
+    #[test]
+    fn accept_admin_is_refused_when_nothing_is_proposed() {
+        let e = Env::default();
+        let w = setup(&e);
+        let next = Address::generate(&e);
+        assert_eq!(
+            w.client.try_accept_admin(&next),
+            Err(Ok(Error::NoPendingAdmin))
+        );
+        assert_eq!(
+            w.client.try_accept_admin(&w.admin),
+            Err(Ok(Error::NoPendingAdmin))
+        );
+        assert_eq!(w.client.get_admin(), Some(w.admin.clone()));
+
+        // Accepting uses the proposal up.
+        w.client.propose_admin(&w.admin, &next);
+        w.client.accept_admin(&next);
+        assert_eq!(
+            w.client.try_accept_admin(&next),
+            Err(Ok(Error::NoPendingAdmin))
+        );
+        assert_eq!(w.client.get_admin(), Some(next));
+    }
+
+    #[test]
+    fn a_later_proposal_replaces_an_earlier_one() {
+        let e = Env::default();
+        let w = setup(&e);
+        let mistyped = Address::generate(&e);
+        let meant = Address::generate(&e);
+        w.client.propose_admin(&w.admin, &mistyped);
+        w.client.propose_admin(&w.admin, &meant);
+
+        assert_eq!(w.client.get_pending_admin(), Some(meant.clone()));
+        assert_eq!(
+            w.client.try_accept_admin(&mistyped),
+            Err(Ok(Error::NotPendingAdmin))
+        );
+        assert_eq!(w.client.get_admin(), Some(w.admin.clone()));
+        w.client.accept_admin(&meant);
+        assert_eq!(w.client.get_admin(), Some(meant));
+    }
+
+    #[test]
+    fn accept_admin_needs_the_signature_of_the_proposed_address_and_no_other() {
+        let e = Env::default();
+        let w = setup(&e);
+        let next = Address::generate(&e);
+        w.client.propose_admin(&w.admin, &next);
+        let args: Vec<Val> = (next.clone(),).into_val(&e);
+
+        // Signed by the current admin alone: refused, and nothing changes.
+        let by_admin = MockAuth {
+            address: &w.admin,
+            invoke: &MockAuthInvoke {
+                contract: &w.client.address,
+                fn_name: "accept_admin",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        };
+        assert!(w
+            .client
+            .mock_auths(&[by_admin])
+            .try_accept_admin(&next)
+            .is_err());
+        assert_eq!(w.client.get_admin(), Some(w.admin.clone()));
+        assert_eq!(w.client.get_pending_admin(), Some(next.clone()));
+
+        // Signed by the proposed address alone: accepted.
+        let by_next = MockAuth {
+            address: &next,
+            invoke: &MockAuthInvoke {
+                contract: &w.client.address,
+                fn_name: "accept_admin",
+                args,
+                sub_invokes: &[],
+            },
+        };
+        w.client.mock_auths(&[by_next]).accept_admin(&next);
+        assert_eq!(w.client.get_admin(), Some(next));
+    }
+
+    #[test]
+    fn propose_admin_and_set_treasury_need_the_signature_of_the_admin() {
+        let e = Env::default();
+        let w = setup(&e);
+        let next = Address::generate(&e);
+
+        // The proposed address signs its own proposal in the admin's name: refused.
+        let args: Vec<Val> = (w.admin.clone(), next.clone()).into_val(&e);
+        let by_next = MockAuth {
+            address: &next,
+            invoke: &MockAuthInvoke {
+                contract: &w.client.address,
+                fn_name: "propose_admin",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        };
+        assert!(w
+            .client
+            .mock_auths(&[by_next])
+            .try_propose_admin(&w.admin, &next)
+            .is_err());
+        assert_eq!(w.client.get_pending_admin(), None);
+
+        let by_admin = MockAuth {
+            address: &w.admin,
+            invoke: &MockAuthInvoke {
+                contract: &w.client.address,
+                fn_name: "propose_admin",
+                args,
+                sub_invokes: &[],
+            },
+        };
+        w.client
+            .mock_auths(&[by_admin])
+            .propose_admin(&w.admin, &next);
+        assert_eq!(w.client.get_pending_admin(), Some(next.clone()));
+
+        // The same for the treasury: the would-be treasury cannot appoint itself.
+        let args: Vec<Val> = (w.admin.clone(), next.clone()).into_val(&e);
+        let by_next = MockAuth {
+            address: &next,
+            invoke: &MockAuthInvoke {
+                contract: &w.client.address,
+                fn_name: "set_treasury",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        };
+        assert!(w
+            .client
+            .mock_auths(&[by_next])
+            .try_set_treasury(&w.admin, &next)
+            .is_err());
+        assert_eq!(w.client.get_treasury(), Some(w.admin.clone()));
+
+        let by_admin = MockAuth {
+            address: &w.admin,
+            invoke: &MockAuthInvoke {
+                contract: &w.client.address,
+                fn_name: "set_treasury",
+                args,
+                sub_invokes: &[],
+            },
+        };
+        w.client
+            .mock_auths(&[by_admin])
+            .set_treasury(&w.admin, &next);
+        assert_eq!(w.client.get_treasury(), Some(next));
+    }
+
+    #[test]
+    fn set_treasury_is_refused_for_anyone_but_the_admin() {
+        let e = Env::default();
+        let w = setup(&e);
+        let stranger = Address::generate(&e);
+
+        assert_eq!(
+            w.client.try_set_treasury(&stranger, &stranger),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_eq!(w.client.get_treasury(), Some(w.admin.clone()));
+    }
+
+    #[test]
+    fn a_forfeited_agent_bond_goes_to_the_treasury_and_not_to_the_admin() {
+        let e = Env::default();
+        let w = setup(&e);
+        let vault = Address::generate(&e);
+        w.client.set_treasury(&w.admin, &vault);
+        assert_eq!(w.client.get_treasury(), Some(vault.clone()));
+        assert_eq!(w.client.get_admin(), Some(w.admin.clone()));
+
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        slash_by_consensus(&w, id);
+
+        assert_eq!(w.token.balance(&vault), 50 * XLM);
+        assert_eq!(w.token.balance(&w.admin), 0);
+        assert_eq!(w.token.balance(&agent), 950 * XLM);
+    }
+
+    #[test]
+    fn the_treasury_share_of_an_upheld_challenge_goes_to_the_treasury() {
+        let e = Env::default();
+        let w = setup(&e);
+        let vault = Address::generate(&e);
+        w.client.set_treasury(&w.admin, &vault);
+
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let challenger = Address::generate(&e);
+        fund(&w, &challenger, 1000 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        for _ in 0..3 {
+            let rex = Address::generate(&e);
+            register_rex(&w, &rex);
+            w.client
+                .attest_replay(&rex, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+        }
+        assert_eq!(
+            w.client
+                .resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+            Verdict::Slashed
+        );
+
+        // The challenger's share is what it was: its own bond back and 20% of
+        // the agent's. Only the receiver of the other 40 XLM is different.
+        assert_eq!(w.token.balance(&challenger), 1010 * XLM);
+        assert_eq!(w.token.balance(&vault), 40 * XLM);
+        assert_eq!(w.token.balance(&w.admin), 0);
+    }
+
+    #[test]
+    fn slashed_stake_goes_to_the_treasury() {
+        // No challenger: the whole 10% of a wrong voter's 600 XLM stake.
+        let e = Env::default();
+        let w = setup(&e);
+        let vault = Address::generate(&e);
+        w.client.set_treasury(&w.admin, &vault);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let backer = Address::generate(&e);
+        register_rex(&w, &backer);
+        w.client
+            .attest_replay(&backer, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+        slash_by_consensus(&w, id);
+        let vault_before = w.token.balance(&vault);
+        assert_eq!(w.client.slash(&backer, &id), 60 * XLM);
+        assert_eq!(w.token.balance(&vault), vault_before + 60 * XLM);
+        assert_eq!(w.token.balance(&w.admin), 0);
+
+        // An upheld challenge: the challenger keeps its 20%, the treasury gets the rest.
+        let e = Env::default();
+        let w = setup(&e);
+        let vault = Address::generate(&e);
+        w.client.set_treasury(&w.admin, &vault);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let challenger = Address::generate(&e);
+        fund(&w, &challenger, 1000 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        let backer = Address::generate(&e);
+        register_rex(&w, &backer);
+        w.client
+            .attest_replay(&backer, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+        for _ in 0..3 {
+            let rex = Address::generate(&e);
+            register_rex(&w, &rex);
+            w.client
+                .attest_replay(&rex, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+        }
+        assert_eq!(
+            w.client
+                .resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+            Verdict::Slashed
+        );
+        let challenger_before = w.token.balance(&challenger);
+        let vault_before = w.token.balance(&vault);
+        assert_eq!(w.client.slash(&backer, &id), 60 * XLM);
+        assert_eq!(w.token.balance(&challenger), challenger_before + 12 * XLM);
+        assert_eq!(w.token.balance(&vault), vault_before + 48 * XLM);
+        assert_eq!(w.token.balance(&w.admin), 0);
+    }
+
+    #[test]
+    fn a_treasury_change_reaches_a_submission_in_flight_without_writing_to_it() {
+        let e = Env::default();
+        let w = setup(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let before = w.client.get_submission(&id).unwrap().to_xdr(&e);
+
+        let vault = Address::generate(&e);
+        let next = Address::generate(&e);
+        w.client.set_treasury(&w.admin, &vault);
+        w.client.propose_admin(&w.admin, &next);
+        w.client.accept_admin(&next);
+        // None of the three wrote to the submission.
+        assert_eq!(w.client.get_submission(&id).unwrap().to_xdr(&e), before);
+
+        slash_by_consensus(&w, id);
+        assert_eq!(w.token.balance(&vault), 50 * XLM);
+        assert_eq!(w.token.balance(&w.admin), 0);
+        assert_eq!(w.token.balance(&next), 0);
+    }
+
+    #[test]
+    fn what_was_paid_before_a_treasury_change_stays_where_it_went() {
+        let e = Env::default();
+        let w = setup(&e);
+        let first = submit_default(&w, &Address::generate(&e));
+        slash_by_consensus(&w, first);
+        assert_eq!(w.token.balance(&w.admin), 50 * XLM);
+
+        let vault = Address::generate(&e);
+        w.client.set_treasury(&w.admin, &vault);
+        assert_eq!(w.token.balance(&w.admin), 50 * XLM);
+        assert_eq!(w.token.balance(&vault), 0);
+
+        let second = submit_default(&w, &Address::generate(&e));
+        slash_by_consensus(&w, second);
+        assert_eq!(w.token.balance(&w.admin), 50 * XLM);
+        assert_eq!(w.token.balance(&vault), 50 * XLM);
+    }
+
+    #[test]
+    fn an_admin_transfer_does_not_move_the_treasury() {
+        let e = Env::default();
+        let w = setup(&e);
+        let next = Address::generate(&e);
+        w.client.propose_admin(&w.admin, &next);
+        w.client.accept_admin(&next);
+        assert_eq!(w.client.get_treasury(), Some(w.admin.clone()));
+
+        // Forfeits keep going to the old address until the new admin says otherwise.
+        let first = submit_default(&w, &Address::generate(&e));
+        slash_by_consensus(&w, first);
+        assert_eq!(w.token.balance(&w.admin), 50 * XLM);
+        assert_eq!(w.token.balance(&next), 0);
+
+        w.client.set_treasury(&next, &next);
+        let second = submit_default(&w, &Address::generate(&e));
+        slash_by_consensus(&w, second);
+        assert_eq!(w.token.balance(&w.admin), 50 * XLM);
+        assert_eq!(w.token.balance(&next), 50 * XLM);
+    }
+
+    #[test]
+    fn admin_and_treasury_changes_emit_their_events() {
+        let e = Env::default();
+        let w = setup(&e);
+        let next = Address::generate(&e);
+        let vault = Address::generate(&e);
+
+        w.client.propose_admin(&w.admin, &next);
+        let proposed = AdminProposed {
+            proposed_admin: next.clone(),
+            admin: w.admin.clone(),
+        }
+        .to_xdr(&e, &w.client.address);
+        assert!(e.events().all().events().contains(&proposed));
+
+        w.client.accept_admin(&next);
+        let changed = AdminChanged {
+            new_admin: next.clone(),
+            old_admin: w.admin.clone(),
+        }
+        .to_xdr(&e, &w.client.address);
+        assert!(e.events().all().events().contains(&changed));
+
+        w.client.set_treasury(&next, &vault);
+        let moved = TreasuryChanged {
+            new_treasury: vault,
+            old_treasury: w.admin.clone(),
+        }
+        .to_xdr(&e, &w.client.address);
+        assert!(e.events().all().events().contains(&moved));
+    }
+
+    #[test]
+    fn a_refused_call_emits_no_event() {
+        let e = Env::default();
+        let w = setup(&e);
+        let stranger = Address::generate(&e);
+
+        assert!(w.client.try_propose_admin(&stranger, &stranger).is_err());
+        assert!(e.events().all().events().is_empty());
+        assert!(w.client.try_accept_admin(&stranger).is_err());
+        assert!(e.events().all().events().is_empty());
+        assert!(w.client.try_set_treasury(&stranger, &stranger).is_err());
+        assert!(e.events().all().events().is_empty());
+    }
+
+    #[test]
+    fn the_entrypoints_report_not_initialized_without_a_stored_admin() {
+        let e = Env::default();
+        let w = setup(&e);
+        let next = Address::generate(&e);
+        w.client.propose_admin(&w.admin, &next);
+        e.as_contract(&w.client.address, || {
+            e.storage()
+                .instance()
+                .remove(&crate::storage::DataKey::Admin)
+        });
+
+        assert_eq!(
+            w.client.try_propose_admin(&w.admin, &next),
+            Err(Ok(Error::NotInitialized))
+        );
+        assert_eq!(
+            w.client.try_set_treasury(&w.admin, &next),
+            Err(Ok(Error::NotInitialized))
+        );
+        assert_eq!(
+            w.client.try_accept_admin(&next),
+            Err(Ok(Error::NotInitialized))
+        );
+        assert_eq!(w.client.get_admin(), None);
+    }
+
+    #[test]
+    fn a_gate_with_no_stored_treasury_pays_nobody_else_instead() {
+        let e = Env::default();
+        let w = setup(&e);
+        e.as_contract(&w.client.address, || {
+            e.storage()
+                .instance()
+                .remove(&crate::storage::DataKey::Treasury)
+        });
+        assert_eq!(w.client.get_treasury(), None);
+        let vault = Address::generate(&e);
+        assert_eq!(
+            w.client.try_set_treasury(&w.admin, &vault),
+            Err(Ok(Error::NotInitialized))
+        );
+
+        // A settlement that owes the treasury stops; it does not fall back to
+        // the admin or leave the verdict recorded with the bond unpaid.
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        for _ in 0..3 {
+            let rex = Address::generate(&e);
+            register_rex(&w, &rex);
+            w.client
+                .attest_replay(&rex, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+        }
+        assert_eq!(w.client.try_finalize(&id), Err(Ok(Error::NotInitialized)));
+        assert_eq!(
+            w.client.get_submission(&id).unwrap().verdict,
+            Verdict::Pending
+        );
+        assert_eq!(w.token.balance(&w.admin), 0);
+    }
+
+    #[test]
+    fn the_admin_entrypoints_extend_the_instance_ttl() {
+        for entrypoint in ["propose_admin", "accept_admin", "set_treasury"] {
+            let e = Env::default();
+            let w = setup(&e);
+            let next = Address::generate(&e);
+            // update_config brings the TTL to BUMP_TO (500_000 ledgers; see storage.rs).
+            w.client.update_config(&w.admin, &default_config());
+            w.client.propose_admin(&w.admin, &next);
+            assert_eq!(instance_ttl(&w), 500_000);
+            e.ledger().with_mut(|l| l.sequence_number += 450_000);
+            assert_eq!(instance_ttl(&w), 50_000);
+
+            match entrypoint {
+                "propose_admin" => w.client.propose_admin(&w.admin, &next),
+                "accept_admin" => w.client.accept_admin(&next),
+                _ => w.client.set_treasury(&w.admin, &next),
+            }
+            assert_eq!(instance_ttl(&w), 500_000, "{entrypoint}");
+        }
+    }
+}

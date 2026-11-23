@@ -41,8 +41,8 @@ chain wins, and the backend should reconcile to it.
 | Crate | Role |
 |---|---|
 | `common` | Shared types (`SubmissionRecord`, `ConfigRecord`, `Verdict`, `Resolution`, `ResolutionMethod`, `TaskType`, …) and the single `Error` enum. |
-| `escrow-gate` | The core. Holds bonds and stakes, records submissions, replay votes and challenges, and computes verdicts. Entrypoints: `submit`, `register_reexecutor`, `withdraw_stake`, `attest_replay`, `release_attestation_lock`, `open_challenge`, `resolve_challenge`, `finalize`, `slash`, admin `update_config` / `set_reexecutor_approved`, and getters. |
-| `zk-verifier-registry` | Deployed **empty** as the Phase 2 anchor. `escrow-gate` rejects the ZK resolution method outright, so nothing can report a ZK-verified result. |
+| `escrow-gate` | The core. Holds bonds and stakes, records submissions, replay votes and challenges, and computes verdicts. Entrypoints: `submit`, `register_reexecutor`, `withdraw_stake`, `attest_replay`, `release_attestation_lock`, `open_challenge`, `resolve_challenge`, `finalize`, `slash`, admin `update_config` / `set_reexecutor_approved` / `propose_admin` / `set_treasury`, `accept_admin` for a proposed admin, and getters. Forfeited bonds and slashed stake are paid to a treasury address, which starts as the admin. |
+| `zk-verifier-registry` | Deployed **empty** as the Phase 2 anchor. `escrow-gate` rejects the ZK resolution method outright, so nothing can report a ZK-verified result. Its admin role moves with the same `propose_admin` / `accept_admin` pair. |
 | `example-marketplace-escrow` | Reference integration only. Not deployed. |
 
 Rules that hold in the contract and must keep holding (PRD §8; the proptest

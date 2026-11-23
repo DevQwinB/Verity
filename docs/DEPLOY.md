@@ -66,7 +66,8 @@ Before you choose an asset other than XLM:
   computes the address.
 - **Every account that moves the token needs a trustline to it, and a
   balance.** That is each re-executor (to stake), each agent (to post a bond)
-  and each challenger, and the admin account, which receives forfeited bonds.
+  and each challenger, and the treasury account, which receives forfeited bonds
+  (the admin, unless `set_treasury` has changed it).
   A transfer to or from an account without the trustline fails, and the
   contract call fails with it. `scripts/bootstrap_reexecutors.sh` stakes from
   the fleet's accounts and does not create trustlines or fund them in another
@@ -277,13 +278,54 @@ which requires constructing the raw XDR representation of `DataKey` (e.g. `DataK
 Because constructing raw XDR storage keys by hand is impractical, ensure entries in
 active dispute are touched before their 29-day lifetime expires.
 
-**Loss of admin key.** `verity-public-deployer` is the only identity authorized to
-call `update_config` and `set_reexecutor_approved` on `EscrowGate`. `EscrowGate` has
-no admin-transfer or contract upgrade entrypoints. If the admin secret key is lost:
+**Loss of admin key.** Until the role is handed on, `verity-public-deployer` is the
+only identity authorized to call `update_config`, `set_reexecutor_approved`,
+`propose_admin` and `set_treasury` on `EscrowGate`. Only the current admin can hand
+the role on, and `EscrowGate` has no contract upgrade entrypoint, so a key that is
+already lost cannot be replaced. If the admin secret key is lost:
 - Existing submissions, challenges, and voting continue functioning according to the live configuration.
 - No new re-executors can be approved, and existing approvals cannot be revoked.
 - Configuration parameters (challenge windows, fee rates, bonds) cannot be modified.
-- Forfeited agent bonds without challengers that are paid to the admin address in `settle` will accumulate permanently in that account and cannot be recovered.
+- The treasury can no longer be changed. Forfeited bonds and slashed stake keep going to it. If it is still the admin account, they accumulate there and cannot be recovered.
+
+**Rotating the admin key and moving the treasury.** Do both while you still hold
+the key. The role moves in two steps, and the new admin signs the second one,
+which shows its key works before the old one gives the role up:
+
+```sh
+# 1. The current admin names the new one. Nothing changes yet.
+stellar contract invoke \
+  --id "$ESCROW_GATE_CONTRACT_ID" --source verity-public-deployer --network testnet \
+  -- propose_admin --admin "$(stellar keys address verity-public-deployer)" --new_admin G...NEW
+
+# 2. The new admin accepts, signing with its own key.
+stellar contract invoke \
+  --id "$ESCROW_GATE_CONTRACT_ID" --source <new-admin-identity> --network testnet \
+  -- accept_admin --new_admin G...NEW
+```
+
+A second `propose_admin` replaces the first, so a mistyped address is corrected by
+proposing again, and an address nobody holds simply never accepts. `get_admin` and
+`get_pending_admin` show where things stand. `ZkVerifierRegistry` has the same two
+calls and is rotated separately.
+
+Accepting does not move the treasury. Forfeits keep going to the old address until
+the admin names another:
+
+```sh
+stellar contract invoke \
+  --id "$ESCROW_GATE_CONTRACT_ID" --source <admin-identity> --network testnet \
+  -- set_treasury --admin G...ADMIN --treasury G...TREASURY
+```
+
+The treasury has to be able to receive the bond asset: an account that exists, with
+a trustline if the asset is not XLM. `set_treasury` does not check this, and a
+settlement that owes the treasury fails until the treasury can be paid.
+
+After a rotation `scripts/approve_reexecutor.sh` stops working as it is: it signs
+with the deployer identity and checks it against `deployer_public_key` in the
+deployment record. Call `set_reexecutor_approved` with the new admin as above until
+the scripts are told about the new identity.
 
 **Testnet resets.** Stellar testnet is wiped periodically. After a reset the
 contracts are gone: repeat step 1 with `--force --replace-public` (the public-deployment guard requires `--replace-public` because replacing it abandons the old contracts), update `.env`, and start

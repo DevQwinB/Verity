@@ -10,8 +10,9 @@ mod events;
 mod storage;
 
 use events::{
-    ChallengeOpened, ChallengeResolved, Finalized, ReexecutorApprovalChanged,
-    ReexecutorRegistered, ReexecutorStakeWithdrawn, ReplayAttested, Slashed, SubmissionCreated,
+    AdminChanged, AdminProposed, ChallengeOpened, ChallengeResolved, Finalized,
+    ReexecutorApprovalChanged, ReexecutorRegistered, ReexecutorStakeWithdrawn, ReplayAttested,
+    Slashed, SubmissionCreated, TreasuryChanged,
 };
 use soroban_sdk::{contract, contractimpl, panic_with_error, Address, BytesN, Env};
 use verity_common::{
@@ -117,7 +118,7 @@ fn consensus_outcome(sub: &SubmissionRecord) -> Result<Option<Verdict>, Error> {
 ///   forfeit is what makes a frivolous challenge cost something.
 /// - Slashed: the agent's bond is forfeited. A prevailing challenger gets
 ///   their own bond back plus slash_split_challenger_bps of the agent's; the
-///   rest (or all of it, absent a challenger) goes to the admin/treasury.
+///   rest (or all of it, absent a challenger) goes to the treasury.
 /// - ExpiredUnverified: nothing was established either way — an unresolved
 ///   challenge, or a window that closed without quorum while a re-executor
 ///   had reported a mismatch — so nobody was proven wrong and every bond
@@ -139,7 +140,7 @@ fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(), Error> {
             pay(&sub.agent, total);
         }
         Verdict::Slashed => {
-            let admin = storage::get_admin(e).ok_or(Error::NotInitialized)?;
+            let treasury = storage::get_treasury(e).ok_or(Error::NotInitialized)?;
             if let Some(chal) = challenge {
                 let challenger_share =
                     checked_bps(sub.bond_amount, sub.cfg_slash_split_challenger_bps)?;
@@ -149,12 +150,11 @@ fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(), Error> {
                     .ok_or(Error::Overflow)?;
                 let to_challenger = chal.bond.checked_add(challenger_share).ok_or(Error::Overflow)?;
                 pay(&chal.challenger, to_challenger);
-                pay(&admin, remainder);
+                pay(&treasury, remainder);
             } else {
                 // Pure replay-consensus slash: no challenger exists to reward,
-                // so the forfeited agent bond routes to the admin/treasury
-                // account configured in the constructor.
-                pay(&admin, sub.bond_amount);
+                // so the whole forfeited agent bond goes to the treasury.
+                pay(&treasury, sub.bond_amount);
             }
         }
         Verdict::ExpiredUnverified => {
@@ -208,7 +208,7 @@ fn apply_slash(
     let bond_asset = storage::get_bond_asset(e).ok_or(Error::NotInitialized)?;
     let token = soroban_sdk::token::TokenClient::new(e, &bond_asset);
     let contract_address = e.current_contract_address();
-    let admin = storage::get_admin(e).ok_or(Error::NotInitialized)?;
+    let treasury = storage::get_treasury(e).ok_or(Error::NotInitialized)?;
     // Only a challenger whose challenge was upheld earns a share; one who
     // lost has no claim on the stake of the voters who disagreed with them.
     let prevailing_challenger = storage::get_challenge(e, sub.id)
@@ -225,11 +225,21 @@ fn apply_slash(
         }
     }
     if remainder > 0 {
-        token.transfer(&contract_address, admin, &remainder);
+        token.transfer(&contract_address, treasury, &remainder);
     }
 
     Slashed { submission_id: sub.id, reexecutor: reexecutor.clone(), amount }.publish(e);
     Ok(amount)
+}
+
+/// Authenticates `admin` and checks that it is the stored admin.
+fn require_admin(e: &Env, admin: &Address) -> Result<(), Error> {
+    let stored_admin = storage::get_admin(e).ok_or(Error::NotInitialized)?;
+    admin.require_auth();
+    if admin != &stored_admin {
+        return Err(Error::NotAdmin);
+    }
+    Ok(())
 }
 
 #[contract]
@@ -244,6 +254,7 @@ impl EscrowGate {
             panic_with_error!(&e, err);
         }
         storage::set_admin(&e, &admin);
+        storage::set_treasury(&e, &admin);
         storage::set_bond_asset(&e, &bond_asset);
         storage::set_config(&e, &config);
     }
@@ -289,6 +300,69 @@ impl EscrowGate {
         storage::bump_instance(&e);
 
         ReexecutorApprovalChanged { reexecutor, approved }.publish(&e);
+        Ok(())
+    }
+
+    /// First half of handing the admin role to another address. Nothing
+    /// changes hands until that address calls `accept_admin`, so a mistyped
+    /// address cannot take the role: it can only fail to accept. A later
+    /// proposal replaces this one.
+    ///
+    /// Like every admin entrypoint, this reads and writes no submission,
+    /// challenge or vote. Whoever holds the role, it decides no verdict.
+    pub fn propose_admin(e: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
+        require_admin(&e, &admin)?;
+        storage::set_pending_admin(&e, &new_admin);
+        storage::bump_instance(&e);
+
+        AdminProposed {
+            proposed_admin: new_admin,
+            admin,
+        }
+        .publish(&e);
+        Ok(())
+    }
+
+    /// Second half: the proposed address takes the role. Only that address
+    /// can call this and it has to sign, which shows its key is held before
+    /// the old admin gives the role up. The treasury does not move with the
+    /// role: forfeits keep going where they went until `set_treasury`.
+    pub fn accept_admin(e: Env, new_admin: Address) -> Result<(), Error> {
+        let old_admin = storage::get_admin(&e).ok_or(Error::NotInitialized)?;
+        let pending = storage::get_pending_admin(&e).ok_or(Error::NoPendingAdmin)?;
+        new_admin.require_auth();
+        if new_admin != pending {
+            return Err(Error::NotPendingAdmin);
+        }
+        storage::set_admin(&e, &new_admin);
+        storage::clear_pending_admin(&e);
+        storage::bump_instance(&e);
+
+        AdminChanged {
+            new_admin,
+            old_admin,
+        }
+        .publish(&e);
+        Ok(())
+    }
+
+    /// Admin-gated: the account forfeited agent bonds and slashed stake are
+    /// paid to from now on, submissions already in flight included. It
+    /// changes who receives the treasury's share and nothing else: no
+    /// verdict, no amount, and no payment already made. The account must be
+    /// able to receive the bond asset, because a settlement that cannot pay
+    /// it fails.
+    pub fn set_treasury(e: Env, admin: Address, treasury: Address) -> Result<(), Error> {
+        require_admin(&e, &admin)?;
+        let old_treasury = storage::get_treasury(&e).ok_or(Error::NotInitialized)?;
+        storage::set_treasury(&e, &treasury);
+        storage::bump_instance(&e);
+
+        TreasuryChanged {
+            new_treasury: treasury,
+            old_treasury,
+        }
+        .publish(&e);
         Ok(())
     }
 
@@ -763,6 +837,16 @@ impl EscrowGate {
 
     pub fn get_admin(e: Env) -> Option<Address> {
         storage::get_admin(&e)
+    }
+
+    /// The address a `propose_admin` is waiting on, if there is one.
+    pub fn get_pending_admin(e: Env) -> Option<Address> {
+        storage::get_pending_admin(&e)
+    }
+
+    /// The account forfeited bonds and slashed stake are paid to.
+    pub fn get_treasury(e: Env) -> Option<Address> {
+        storage::get_treasury(&e)
     }
 
     /// The token every bond and stake is paid in. It is set by the constructor
