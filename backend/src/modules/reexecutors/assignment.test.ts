@@ -15,7 +15,7 @@ Object.assign(process.env, {
   HOME_DOMAIN: "localhost",
 });
 
-const { assignmentSeed, rankBySeed, replayWantCount } = await import("./assignment.js");
+const { assignmentSeed, rankBySeed, replayWantCount, filterEligibleReexecutors } = await import("./assignment.js");
 
 test("assignmentSeed produces deterministic sha256 golden vector", () => {
   const seed = assignmentSeed("11111111-1111-1111-1111-111111111111", "7");
@@ -81,4 +81,45 @@ test("replayWantCount calculates seat requirements correctly", () => {
   assert.equal(replayWantCount(3, 1, 0), 4);
   assert.equal(replayWantCount(3, 1, 4), 0);
   assert.equal(replayWantCount(3, 1, 5), -1);
+});
+
+test("filterEligibleReexecutors excludes the submitting agent account when present", () => {
+  const accounts = [
+    { stellar_account: "agent-submitter" },
+    { stellar_account: "reexecutor-1" },
+    { stellar_account: "reexecutor-2" },
+  ];
+  const filtered = filterEligibleReexecutors(accounts, "agent-submitter");
+  assert.deepEqual(
+    filtered.map((r) => r.stellar_account),
+    ["reexecutor-1", "reexecutor-2"]
+  );
+});
+
+test("filterEligibleReexecutors preserves all accounts when excludeAgentId is not provided or not present", () => {
+  const accounts = [
+    { stellar_account: "reexecutor-1" },
+    { stellar_account: "reexecutor-2" },
+  ];
+  assert.deepEqual(filterEligibleReexecutors(accounts, null), accounts);
+  assert.deepEqual(filterEligibleReexecutors(accounts, undefined), accounts);
+  assert.deepEqual(filterEligibleReexecutors(accounts, "nonexistent-agent"), accounts);
+});
+
+test("rankedLiveReexecutors logic with excluded agent preserves determinism among remaining eligible re-executors", () => {
+  const seed = assignmentSeed("11111111-1111-1111-1111-111111111111", "7");
+  const accounts = [
+    { stellar_account: "acct-a" },
+    { stellar_account: "acct-b" },
+    { stellar_account: "acct-c" },
+    { stellar_account: "acct-d" },
+  ];
+  // Normally ranked1 is ["acct-d", "acct-a", "acct-c", "acct-b"]
+  // If acct-d is the submitting agent, the ranking among the rest should be ["acct-a", "acct-c", "acct-b"]
+  const eligible = filterEligibleReexecutors(accounts, "acct-d");
+  const ranked = rankBySeed(seed, eligible);
+  assert.deepEqual(
+    ranked.map((r) => r.stellar_account),
+    ["acct-a", "acct-c", "acct-b"]
+  );
 });

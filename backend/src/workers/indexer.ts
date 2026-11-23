@@ -106,6 +106,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           submissionId: row.id,
           chainSubmissionId,
           taskType: row.task_type,
+          agentId: row.agent_id,
         });
       }
       break;
