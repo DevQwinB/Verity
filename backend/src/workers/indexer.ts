@@ -11,7 +11,7 @@ import {
 } from "../modules/reexecutors/assignment.js";
 import { escrowGateAsKeeper } from "../chain/clients.js";
 import { consensusOutcome, finalizeOnChain, minChallengerBond, readSubmission } from "../chain/actions.js";
-import { dispatchWebhook } from "../modules/webhooks/dispatcher.js";
+import { attemptDelivery, dispatchWebhook, enqueueWebhook, type EnqueuedWebhook } from "../modules/webhooks/dispatcher.js";
 import { recordTerminalVerdict } from "../modules/submissions/verdict.js";
 import { isTransientError } from "./transient.js";
 
@@ -268,34 +268,47 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
         .where("chain_submission_id", "=", chainSubmissionId)
         .executeTakeFirst();
       if (sub) {
-        await db
-          .insertInto("challenge")
-          .values({
-            submission_id: sub.id,
-            challenger_account: v.challenger,
-            challenger_bond: v.bond.toString(),
-            chain_tx_hash: txHash,
-          })
-          .onConflict((oc) => oc.doNothing())
-          .returningAll()
-          .executeTakeFirst()
-          .then(async (inserted) => {
-            if (!inserted) return;
-            await dispatchWebhook(sub.marketplace_id, "submission.disputed", {
+        const { inserted, enqueued } = await db.transaction().execute(async (trx) => {
+          const inserted = await trx
+            .insertInto("challenge")
+            .values({
+              submission_id: sub.id,
+              challenger_account: v.challenger,
+              challenger_bond: v.bond.toString(),
+              chain_tx_hash: txHash,
+            })
+            .onConflict((oc) => oc.doNothing())
+            .returningAll()
+            .executeTakeFirst();
+
+          let enqueued: EnqueuedWebhook[] = [];
+          if (inserted) {
+            enqueued = await enqueueWebhook(trx, sub.marketplace_id, "submission.disputed", {
               submission_id: sub.id,
               status: "disputed",
               tx_hash: txHash,
-            }).catch((err) => console.error("[indexer] webhook dispatch failed:", err));
-          });
-        await db
-          .updateTable("submission")
-          .set({ status: "disputed", updated_at: new Date() })
-          .where("id", "=", sub.id)
-          .where("status", "=", "pending")
-          .execute();
-        // A challenge is only ever resolved by bonded re-execution consensus,
-        // so make sure a full quorum is actually working on it.
-        await escalateToFullReplay(sub.id);
+            });
+            await trx
+              .updateTable("submission")
+              .set({ status: "disputed", updated_at: new Date() })
+              .where("id", "=", sub.id)
+              .where("status", "=", "pending")
+              .execute();
+          }
+          return { inserted: !!inserted, enqueued };
+        });
+
+        for (const item of enqueued) {
+          void attemptDelivery(item.delivery, item.subscription).catch((err) =>
+            console.error("[indexer] webhook delivery attempt failed:", err)
+          );
+        }
+
+        if (inserted) {
+          // A challenge is only ever resolved by bonded re-execution consensus,
+          // so make sure a full quorum is actually working on it.
+          await escalateToFullReplay(sub.id);
+        }
       }
       break;
     }
