@@ -6,7 +6,7 @@ import { basicNodeSigner } from "@stellar/stellar-sdk/contract";
 import { Client as EscrowGateClient } from "escrow-gate";
 import type { SubmissionRecord } from "escrow-gate";
 import { REPLAY_ENGINE, ReplayInfrastructureError, runDeterministicFunction } from "./sandbox/runner.js";
-import { hasConnectivity, RetrievalTransientError, runRetrieval } from "./sandbox/retrieval.js";
+import { hasConnectivity, RetrievalHostError, RetrievalTransientError, runRetrieval } from "./sandbox/retrieval.js";
 import { assertSep10Challenge } from "./sep10.js";
 import { NO_OUTPUT_HASH, voteMatches } from "./vote.js";
 import { startHeartbeat } from "./heartbeat.js";
@@ -162,6 +162,7 @@ async function reExecute(
     try {
       return await runRetrieval(spec);
     } catch (err) {
+      if (err instanceof RetrievalHostError) throw err;
       const message = (err as Error).message;
       if (!(err instanceof RetrievalTransientError)) return noOutput(`retrieval failed: ${message}`);
 

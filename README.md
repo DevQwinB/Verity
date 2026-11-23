@@ -267,7 +267,13 @@ Deterministic tasks run in a sandboxed JavaScript runtime:
     non-2xx responses are also mismatches. Statuses 401, 403, 408, 429, 451 and anything
     from 500 up, DNS failures, timeouts, and network errors are treated as transient: the worker retries for up to `min(RETRIEVAL_RETRY_BUDGET_S, challenge window / 2)`
     seconds (default `RETRIEVAL_RETRY_BUDGET_S` is 120 s), verifies its own network
-    connectivity, and only votes mismatch if its own connectivity is intact. Each HTTP request
+    connectivity, and only votes mismatch if its own connectivity is intact. When a target
+    resolves to multiple addresses, each checked address is tried in turn upon connection failure
+    (IPv4 first, then IPv6). A redirect or HTTP response from the first address that answers is final
+    and subsequent addresses are not tried. When all addresses fail because this host cannot route
+    to their address family (`ENETUNREACH` or `EADDRNOTAVAIL`), this is treated as a host infrastructure
+    error (`RetrievalHostError`) and the worker does not vote, preventing split votes caused by host network
+    limitations (such as IPv6-only targets on IPv4-only hosts). Each HTTP request
     times out after 10 s of silence or 30 s overall, and response bodies are capped at 1,000,000 bytes.
 15. **JSON pointers.** If the response body is JSON, an optional RFC 6901 pointer (e.g. `/data/0/price`)
     selects the targeted value (`~1` escapes `/`, `~0` escapes `~`). The pointer must start
