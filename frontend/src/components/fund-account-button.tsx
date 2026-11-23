@@ -8,7 +8,7 @@ import { fundTestnetAccount } from "../lib/client-api";
 /** Asks the testnet faucet for test XLM for the connected account. Bonds and
  * stakes need a balance, and a new Freighter account starts with none. */
 export function FundAccountButton() {
-  const { account, connecting, login } = useWallet();
+  const { status, account, connecting, login } = useWallet();
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
 
@@ -23,6 +23,14 @@ export function FundAccountButton() {
     } finally {
       setBusy(false);
     }
+  }
+
+  if (status === "restoring") {
+    return (
+      <Button variant="secondary" disabled>
+        Checking session...
+      </Button>
+    );
   }
 
   if (!account) {

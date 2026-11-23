@@ -88,7 +88,7 @@ const ESCROW_REF_MAX_LENGTH = 128;
  * window shown here are the ones EscrowGate will actually apply. */
 export function NewSubmissionForm({ config }: { config: GateConfig }) {
   const router = useRouter();
-  const { account, connecting, login } = useWallet();
+  const { status, account, connecting, login } = useWallet();
   // One key for this form: retrying after a declined signature reuses the
   // same draft instead of leaving a new unsigned one behind each time.
   const idempotencyKey = useRef<string | null>(null);
@@ -375,7 +375,11 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
         </p>
       )}
 
-      {account ? (
+      {status === "restoring" ? (
+        <Button variant="secondary" disabled>
+          Checking session...
+        </Button>
+      ) : account ? (
         <Button onClick={handleSubmit} disabled={busy || !escrowRefTrimmed || !inputContent || !outputContent}>
           {step === "uploading"
             ? "Uploading artifacts..."

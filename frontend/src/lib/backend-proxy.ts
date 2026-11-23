@@ -18,19 +18,37 @@ export async function readJsonBody(
   }
 }
 
-/** The signed-in account, read from the session cookie without verifying
- * it — good enough to address a request, never to authorise one (the backend
- * verifies the token itself on every call). */
-export async function sessionAccount(): Promise<string | null> {
+/** What the session cookie claims: the account, and when the token expires.
+ * Read without verifying the signature — good enough to address a request and
+ * to schedule a UI clock, never to authorise one (the backend verifies the
+ * token itself on every call). `expires_at` is the token's `exp` in
+ * milliseconds since the epoch, or null for a token that carries none: an
+ * early or late clock on the client can only make the UI wrong sooner or
+ * later, never make an expired token work. */
+export async function sessionInfo(): Promise<{
+  account: string | null;
+  expires_at: number | null;
+}> {
+  const empty = { account: null, expires_at: null };
   const token = (await cookies()).get(SESSION_COOKIE)?.value;
-  if (!token) return null;
+  if (!token) return empty;
   try {
     const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"));
-    if (payload.exp && Date.now() >= payload.exp * 1000) return null;
-    return typeof payload.sub === "string" ? payload.sub : null;
+    if (payload.exp && Date.now() >= payload.exp * 1000) return empty;
+    if (typeof payload.sub !== "string") return empty;
+    return {
+      account: payload.sub,
+      expires_at: typeof payload.exp === "number" ? payload.exp * 1000 : null,
+    };
   } catch {
-    return null;
+    return empty;
   }
+}
+
+/** The signed-in account alone, for server-side code that only needs to know
+ * who is asking. */
+export async function sessionAccount(): Promise<string | null> {
+  return (await sessionInfo()).account;
 }
 
 /**

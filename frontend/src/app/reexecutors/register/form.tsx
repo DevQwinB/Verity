@@ -16,7 +16,7 @@ type Status = "idle" | "building" | "signing" | "relaying" | "done" | "error";
 /** `config` is the contract's live rule set: the stake floor, the slash
  * rate, and whether voting needs the admin's approval. */
 export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
-  const { account, connecting, login } = useWallet();
+  const { status: sessionStatus, account, connecting, login } = useWallet();
   // Twice the floor by default: a single slash then leaves the account active.
   const [stakeXlm, setStakeXlm] = useState(stroopsToXlm((BigInt(config.min_stake_floor) * BigInt(2)).toString()));
   const [status, setStatus] = useState<Status>("idle");
@@ -160,7 +160,11 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
                 </p>
               )}
 
-              {account ? (
+              {sessionStatus === "restoring" ? (
+                <Button variant="secondary" disabled>
+                  Checking session...
+                </Button>
+              ) : account ? (
                 <Button onClick={handleRegister} disabled={status !== "idle" && status !== "error"}>
                   {status === "building"
                     ? "Building transaction..."

@@ -28,7 +28,7 @@ export function OpenChallengeButton({
   minBondStroops: string | null;
 }) {
   const router = useRouter();
-  const { account, connecting, login } = useWallet();
+  const { status, account, connecting, login } = useWallet();
   const [bondXlm, setBondXlm] = useState(minBondStroops ? stroopsToXlm(minBondStroops) : "");
   const [busy, setBusy] = useState<null | "building" | "signing" | "relaying">(null);
   const [error, setError] = useState<string | null>(null);
@@ -116,6 +116,14 @@ export function OpenChallengeButton({
         The challenge window has closed. This submission is waiting to be finalized and can no
         longer be challenged.
       </p>
+    );
+  }
+
+  if (status === "restoring") {
+    return (
+      <Button variant="secondary" disabled>
+        Checking session...
+      </Button>
     );
   }
 
