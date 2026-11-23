@@ -4,6 +4,7 @@ packages:
   - frontend
   - reexecutor-agent
   - db
+  - examples/*
 
 onlyBuiltDependencies:
   - '@embedded-postgres/linux-x64'
