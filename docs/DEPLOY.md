@@ -111,7 +111,14 @@ five identities (`verity-public-rex1..5`).
 
 ### Running a standalone re-executor worker
 
-A worker can be built and run on a separate host without the rest of the compose stack:
+A worker can be run on a separate host using the published container image:
+
+```bash
+docker pull ghcr.io/devqwinb/verity-reexecutor:latest
+docker run -d --restart unless-stopped --env-file worker.env ghcr.io/devqwinb/verity-reexecutor:latest
+```
+
+Alternatively, it can be built from source:
 
 ```bash
 docker build -f reexecutor-agent/Dockerfile -t verity-reexecutor .
@@ -134,8 +141,10 @@ CONNECTIVITY_CHECK_URL=https://soroban-testnet.stellar.org
 **Prerequisites:** The account corresponding to `REEXECUTOR_SECRET_KEY` must be
 staked above the on-chain floor (500 XLM, via dashboard under Re-executors → Register)
 and approved by the deployment admin (`scripts/approve_reexecutor.sh G...`).
-Otherwise, the worker logs that no work will be assigned and idles. No prebuilt
-image is published; it must be built from the repository.
+Otherwise, the worker logs that no work will be assigned and idles. Prebuilt
+images are published to GitHub Container Registry (`ghcr.io/devqwinb/verity-backend`,
+`ghcr.io/devqwinb/verity-frontend`, and `ghcr.io/devqwinb/verity-reexecutor`) on
+every `main` commit and release tag.
 
 ## 4. Put HTTPS in front
 

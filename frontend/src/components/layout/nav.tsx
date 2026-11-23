@@ -17,6 +17,7 @@ const LINKS = [
   { href: "/challenges", label: "Challenges" },
   { href: "/reports", label: "Reports" },
   { href: "/taxonomy", label: "Taxonomy" },
+  { href: "/status", label: "Status" },
 ];
 
 export function Nav() {
