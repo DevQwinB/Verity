@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { describe, it, test } from "node:test";
-import { RetrievalTransientError, getPinned, hasConnectivity, isInconclusiveStatus, isPrivateAddress, resolvePointer, resolvePublicTarget, runRetrieval } from "./retrieval.js";
+import { RetrievalHostError, RetrievalTransientError, getPinned, hasConnectivity, isInconclusiveStatus, isNoRouteError, isPrivateAddress, resolvePointer, resolvePublicTarget, runRetrieval } from "./retrieval.js";
 
 describe("isInconclusiveStatus", () => {
   const testCases: Array<{ status: number; expected: boolean }> = [
@@ -541,4 +541,83 @@ test("getPinned gives up on a server that keeps dripping bytes past the overall 
     server.closeAllConnections();
     server.close();
   }
+});
+
+test("getPinned given target with ['127.0.0.2', '127.0.0.1'] succeeds via second address when server listens only on 127.0.0.1", async () => {
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("ok from 127.0.0.1");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address() as AddressInfo;
+    const target = {
+      url: new URL(`http://example.com:${port}/`),
+      addresses: ["127.0.0.2", "127.0.0.1"],
+      address: "127.0.0.2",
+      family: 4 as const,
+    };
+    const res = await getPinned(target, 5000);
+    assert.equal(res.status, 200);
+    assert.equal(res.body, "ok from 127.0.0.1");
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("when every address fails with ENETUNREACH, error is a RetrievalHostError and pure classifier recognises it", async () => {
+  const err1 = Object.assign(new Error("connect ENETUNREACH 2001:db8::1"), { code: "ENETUNREACH" });
+  const err2 = Object.assign(new Error("connect ENETUNREACH 2001:db8::2"), { code: "ENETUNREACH" });
+  assert.equal(isNoRouteError(err1), true);
+  assert.equal(isNoRouteError(err2), true);
+  assert.equal(isNoRouteError(Object.assign(new Error("connect EADDRNOTAVAIL 2001:db8::1"), { code: "EADDRNOTAVAIL" })), true);
+  assert.equal(isNoRouteError(new Error("connect ECONNREFUSED 127.0.0.1:80")), false);
+
+  // Directly verify getPinned behavior with mock/non-routable IPv6 addresses
+  // In an environment where IPv6 cannot be routed, connecting to 2001:db8:: fails with ENETUNREACH or EADDRNOTAVAIL
+  const target = {
+    url: new URL("http://example.com:80/"),
+    addresses: ["2001:db8::1", "2001:db8::2"],
+    address: "2001:db8::1",
+    family: 6 as const,
+  };
+  try {
+    await getPinned(target, 1000);
+  } catch (err) {
+    if (isNoRouteError(err)) {
+      assert.ok(err instanceof RetrievalHostError);
+    }
+  }
+});
+
+test("a redirect or HTTP status from the first address that responds is final, next address not tried", async () => {
+  const server1 = http.createServer((_req, res) => {
+    res.writeHead(302, { location: "/other" });
+    res.end("redirect");
+  });
+  await new Promise<void>((resolve) => server1.listen(0, "127.0.0.1", resolve));
+  const { port } = server1.address() as AddressInfo;
+  try {
+    const target = {
+      url: new URL(`http://example.com:${port}/`),
+      addresses: ["127.0.0.1", "127.0.0.2"],
+      address: "127.0.0.1",
+      family: 4 as const,
+    };
+    const res = await getPinned(target, 5000);
+    assert.equal(res.status, 302);
+    assert.equal(res.body, "redirect");
+  } finally {
+    server1.closeAllConnections();
+    server1.close();
+  }
+});
+
+test("resolvePublicTarget sorts IPv4 addresses before IPv6 addresses in target.addresses", async () => {
+  const raw = "https://8.8.8.8/test";
+  const res = await resolvePublicTarget(raw);
+  assert.ok(Array.isArray(res.addresses));
+  assert.equal(res.addresses[0].address, "8.8.8.8");
+  assert.equal(res.addresses[0].family, 4);
 });

@@ -36,8 +36,71 @@ const TOTAL_TIMEOUT_MS = 30_000;
  */
 export class RetrievalTransientError extends Error {}
 
-interface PinnedTarget {
+/**
+ * Thrown when this host cannot route to any of the target's checked addresses
+ * (e.g. ENETUNREACH or EADDRNOTAVAIL for an IPv6-only target on an IPv4-only host).
+ * This indicates a limitation of this worker's network setup, not a target failure,
+ * so the worker must not vote.
+ */
+export class RetrievalHostError extends Error {}
+
+class ResponseStartedError extends Error {
+  constructor(public readonly cause: unknown) {
+    super((cause as Error)?.message ?? String(cause));
+    this.name = "ResponseStartedError";
+  }
+}
+
+const NO_ROUTE_CODES = new Set(["ENETUNREACH", "EADDRNOTAVAIL"]);
+const CONNECT_FAIL_CODES = new Set([
+  "ECONNREFUSED",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "EADDRNOTAVAIL",
+  "ETIMEDOUT",
+]);
+
+export function isNoRouteError(err: unknown): boolean {
+  if (!err) return false;
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code && NO_ROUTE_CODES.has(code)) return true;
+  const msg = (err as Error).message ?? "";
+  return /ENETUNREACH|EADDRNOTAVAIL/.test(msg);
+}
+
+export function isConnectionFailure(err: unknown): boolean {
+  if (!err) return false;
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code && (CONNECT_FAIL_CODES.has(code) || NO_ROUTE_CODES.has(code))) {
+    return true;
+  }
+  const msg = (err as Error).message ?? "";
+  return (
+    /ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|EADDRNOTAVAIL|ETIMEDOUT/.test(msg) ||
+    /connect ECONNREFUSED|connect ETIMEDOUT|connect ENETUNREACH|connect EHOSTUNREACH|connect EADDRNOTAVAIL/.test(msg) ||
+    /no response within/.test(msg)
+  );
+}
+
+export interface PinnedAddress {
+  address: string;
+  family: 4 | 6;
+}
+
+export type TargetAddress = string | { address: string; family?: number };
+
+export function normalizeAddress(addr: TargetAddress): PinnedAddress {
+  if (typeof addr === "string") {
+    const fam = isIP(addr);
+    return { address: addr, family: fam === 6 ? 6 : 4 };
+  }
+  const fam = addr.family ?? (isIP(addr.address) || 4);
+  return { address: addr.address, family: fam === 6 ? 6 : 4 };
+}
+
+export interface PinnedTarget {
   url: URL;
+  addresses?: PinnedAddress[];
   address: string;
   family: 4 | 6;
 }
@@ -82,59 +145,146 @@ export async function resolvePublicTarget(raw: string, opts: { allowPrivate: boo
   if (!opts.allowPrivate && addresses.some((a) => isPrivateAddress(a.address))) {
     throw new Error(`retrieval target ${host} resolves to a non-public address`);
   }
-  // IPv4 first: plenty of hosts have no IPv6 route.
-  const chosen = addresses.find((a) => a.family === 4) ?? addresses[0];
-  return { url, address: chosen.address, family: chosen.family === 6 ? 6 : 4 };
+  // IPv4 first, then IPv6: plenty of hosts have no IPv6 route.
+  const sorted: Array<{ address: string; family: 4 | 6 }> = [
+    ...addresses.filter((a) => a.family === 4),
+    ...addresses.filter((a) => a.family === 6),
+  ].map((a) => ({ address: a.address, family: (a.family === 6 ? 6 : 4) as 4 | 6 }));
+
+  const chosen = sorted[0];
+  return {
+    url,
+    addresses: sorted,
+    address: chosen.address,
+    family: chosen.family,
+  };
 }
 
-/** One GET to the pinned address, never following redirects. Resolves with
- * any HTTP response; rejects with RetrievalTransientError when no response
- * could be obtained. */
-export function getPinned(target: PinnedTarget, totalTimeoutMs = TOTAL_TIMEOUT_MS): Promise<{ status: number; body: string }> {
+function connectAndFetch(
+  url: URL,
+  targetAddr: { address: string; family: 4 | 6 },
+  timeoutMs: number
+): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const transport = target.url.protocol === "https:" ? https : http;
+    let responseStarted = false;
+    const transport = url.protocol === "https:" ? https : http;
     const req = transport.get(
-      target.url,
+      url,
       {
         headers: { accept: "application/json, text/plain;q=0.9, */*;q=0.1" },
-        timeout: TIMEOUT_MS,
-        // Connect to the address that was vetted, whatever DNS says now.
+        timeout: Math.min(TIMEOUT_MS, timeoutMs),
         lookup: (_hostname, options, callback) => {
           if (typeof options === "object" && options.all) {
             (callback as (err: null, addresses: Array<{ address: string; family: number }>) => void)(null, [
-              { address: target.address, family: target.family },
+              { address: targetAddr.address, family: targetAddr.family },
             ]);
           } else {
-            (callback as (err: null, address: string, family: number) => void)(null, target.address, target.family);
+            (callback as (err: null, address: string, family: number) => void)(
+              null,
+              targetAddr.address,
+              targetAddr.family
+            );
           }
         },
       },
       (res) => {
+        responseStarted = true;
         const chunks: Buffer[] = [];
         let size = 0;
         res.on("data", (chunk: Buffer) => {
           size += chunk.length;
           if (size > MAX_BODY_BYTES) {
             req.destroy();
-            reject(new Error("retrieval response too large"));
+            reject(new ResponseStartedError(new Error("retrieval response too large")));
             return;
           }
           chunks.push(chunk);
         });
         res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
-        res.on("error", (err) => reject(new RetrievalTransientError(`response interrupted: ${err.message}`)));
+        res.on("error", (err) =>
+          reject(new ResponseStartedError(new RetrievalTransientError(`response interrupted: ${err.message}`)))
+        );
       }
     );
-    req.on("timeout", () => req.destroy(new RetrievalTransientError(`no response within ${TIMEOUT_MS / 1000}s`)));
-    const deadline = setTimeout(
-      () => req.destroy(new RetrievalTransientError(`not finished within ${totalTimeoutMs / 1000}s`)),
-      totalTimeoutMs
-    );
+
+    req.on("timeout", () => {
+      req.destroy(new RetrievalTransientError(`no response within ${TIMEOUT_MS / 1000}s`));
+    });
+
+    const deadline = setTimeout(() => {
+      req.destroy(new RetrievalTransientError(`not finished within ${timeoutMs / 1000}s`));
+    }, timeoutMs);
+
     req.on("close", () => clearTimeout(deadline));
-    req.on("error", (err) =>
-      reject(err instanceof RetrievalTransientError ? err : new RetrievalTransientError(`request failed: ${err.message}`))
-    );
+
+    req.on("error", (err) => {
+      if (responseStarted) {
+        reject(new ResponseStartedError(err));
+      } else {
+        reject(err);
+      }
+    });
   });
+}
+
+/** One GET to the pinned address(es), never following redirects. Tries each
+ * checked address in turn on connection failure. Resolves with any HTTP response;
+ * throws RetrievalHostError when all addresses fail with host routing errors (e.g. ENETUNREACH),
+ * or rejects with RetrievalTransientError when no response could be obtained. */
+export async function getPinned(
+  target: PinnedTarget | { url: URL; addresses?: TargetAddress[]; address?: string; family?: 4 | 6 },
+  totalTimeoutMs = TOTAL_TIMEOUT_MS
+): Promise<{ status: number; body: string }> {
+  const rawAddresses =
+    target.addresses && target.addresses.length > 0
+      ? target.addresses
+      : target.address
+      ? [target.address]
+      : [];
+
+  if (rawAddresses.length === 0) {
+    throw new Error(`retrieval target has no address to connect to`);
+  }
+
+  const addresses = rawAddresses.map(normalizeAddress);
+  const deadline = Date.now() + totalTimeoutMs;
+  const errors: unknown[] = [];
+
+  for (let i = 0; i < addresses.length; i++) {
+    const current = addresses[i];
+    const remainingTimeout = deadline - Date.now();
+    if (remainingTimeout <= 0) {
+      throw new RetrievalTransientError(`not finished within ${totalTimeoutMs / 1000}s`);
+    }
+
+    try {
+      return await connectAndFetch(target.url, current, Math.min(remainingTimeout, totalTimeoutMs));
+    } catch (err) {
+      if (err instanceof ResponseStartedError) {
+        throw err.cause;
+      }
+
+      errors.push(err);
+
+      if (!isConnectionFailure(err)) {
+        throw err;
+      }
+    }
+  }
+
+  // When every attempt failed and the only errors were "no route for this family"
+  if (errors.length > 0 && errors.every(isNoRouteError)) {
+    const messages = errors.map((e) => (e as Error).message).join("; ");
+    throw new RetrievalHostError(`no route to target host: ${messages}`);
+  }
+
+  const lastErr = errors[errors.length - 1];
+  if (lastErr instanceof RetrievalTransientError) {
+    throw lastErr;
+  }
+  throw new RetrievalTransientError(
+    `request failed: ${(lastErr as Error)?.message ?? "all addresses failed"}`
+  );
 }
 
 const CANONICAL_ARRAY_INDEX = /^(0|[1-9]\d*)$/;
