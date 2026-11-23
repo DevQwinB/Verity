@@ -262,13 +262,16 @@ Deterministic tasks run in a sandboxed JavaScript runtime:
     Only `http:` and `https:` schemes are supported. The URL must resolve to a public IP
     address: loopback, private, and link-local IP addresses are rejected, and the request
     connects directly to the validated IP.
-14. **Redirects and response codes.** Redirects are not followed; HTTP 3xx status codes
+14. **Redirects, response codes, and encodings.** Redirects are not followed; HTTP 3xx status codes
     are treated as a mismatch. Definitive 4xx statuses (for example 404 or 410) and other
     non-2xx responses are also mismatches. Statuses 401, 403, 408, 429, 451 and anything
     from 500 up, DNS failures, timeouts, and network errors are treated as transient: the worker retries for up to `min(RETRIEVAL_RETRY_BUDGET_S, challenge window / 2)`
     seconds (default `RETRIEVAL_RETRY_BUDGET_S` is 120 s), verifies its own network
     connectivity, and only votes mismatch if its own connectivity is intact. Each HTTP request
-    times out after 10 s of silence or 30 s overall, and response bodies are capped at 1,000,000 bytes.
+    times out after 10 s of silence or 30 s overall, and response bodies are capped at 1,000,000 decompressed bytes.
+    Responses encoded with `Content-Encoding: gzip`, `x-gzip`, `deflate`, or `br` are decompressed;
+    any other non-identity encoding is treated as a mismatch. Response bodies are always decoded as UTF-8
+    with a leading byte-order mark (BOM) stripped (other charsets are not decoded).
 15. **JSON pointers.** If the response body is JSON, an optional RFC 6901 pointer (e.g. `/data/0/price`)
     selects the targeted value (`~1` escapes `/`, `~0` escapes `~`). The pointer must start
     with `/`; an empty pointer `""` selects the entire document. A pointer that fails to resolve

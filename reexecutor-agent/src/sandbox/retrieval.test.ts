@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { describe, it, test } from "node:test";
+import zlib from "node:zlib";
+import { canonicalHash } from "./canonical.js";
 import { RetrievalTransientError, getPinned, hasConnectivity, isInconclusiveStatus, isPrivateAddress, resolvePointer, resolvePublicTarget, runRetrieval } from "./retrieval.js";
 
 describe("isInconclusiveStatus", () => {
@@ -537,6 +539,138 @@ test("getPinned gives up on a server that keeps dripping bytes past the overall 
       return true;
     });
     assert.ok(Date.now() - started < 3000);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("BOM-prefixed JSON body yields the same output and outputHash as without BOM", async () => {
+  const jsonStr = JSON.stringify({ price: 1.23, name: "item" });
+  const bomBuffer = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(jsonStr, "utf8")]);
+
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    res.end(bomBuffer);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address() as AddressInfo;
+    const target = await resolvePublicTarget(`http://127.0.0.1:${port}/`, { allowPrivate: true });
+    const res = await getPinned(target);
+    assert.equal(res.body, jsonStr);
+
+    const parsed = JSON.parse(res.body);
+    assert.equal(resolvePointer(parsed, "/price"), 1.23);
+    assert.equal(canonicalHash(parsed), canonicalHash(JSON.parse(jsonStr)));
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("gzip-encoded body yields the same hash as the plain body", async () => {
+  const jsonStr = JSON.stringify({ price: 45.67, status: "active" });
+  const gzipped = zlib.gzipSync(Buffer.from(jsonStr, "utf8"));
+
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "content-encoding": "gzip",
+    });
+    res.end(gzipped);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address() as AddressInfo;
+    const target = await resolvePublicTarget(`http://127.0.0.1:${port}/`, { allowPrivate: true });
+    const res = await getPinned(target);
+    assert.equal(res.body, jsonStr);
+    assert.equal(canonicalHash(JSON.parse(res.body)), canonicalHash(JSON.parse(jsonStr)));
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("supports x-gzip, deflate and br content-encodings", async () => {
+  const plain = "decompressed content here";
+
+  for (const [encoding, compressed] of [
+    ["x-gzip", zlib.gzipSync(Buffer.from(plain))],
+    ["deflate", zlib.deflateSync(Buffer.from(plain))],
+    ["br", zlib.brotliCompressSync(Buffer.from(plain))],
+  ] as const) {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/plain",
+        "content-encoding": encoding,
+      });
+      res.end(compressed);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const { port } = server.address() as AddressInfo;
+      const target = await resolvePublicTarget(`http://127.0.0.1:${port}/`, { allowPrivate: true });
+      const res = await getPinned(target);
+      assert.equal(res.body, plain);
+    } finally {
+      server.closeAllConnections();
+      server.close();
+    }
+  }
+});
+
+test("gzip body that decompresses to more than 1,000,000 bytes is rejected without buffering it all", async () => {
+  // 1,050,000 bytes of repetitive characters compresses into ~1 KB
+  const largeData = Buffer.alloc(1_050_000, "a");
+  const compressedBomb = zlib.gzipSync(largeData);
+
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      "content-type": "text/plain",
+      "content-encoding": "gzip",
+    });
+    res.end(compressedBomb);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address() as AddressInfo;
+    const target = await resolvePublicTarget(`http://127.0.0.1:${port}/`, { allowPrivate: true });
+    await assert.rejects(
+      getPinned(target),
+      (err: Error) => {
+        assert(!(err instanceof RetrievalTransientError), "should be a plain Error");
+        assert.equal(err.message, "retrieval response too large");
+        return true;
+      }
+    );
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("unknown content-encoding gives a plain Error", async () => {
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      "content-type": "text/plain",
+      "content-encoding": "custom-compress",
+    });
+    res.end("some content");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address() as AddressInfo;
+    const target = await resolvePublicTarget(`http://127.0.0.1:${port}/`, { allowPrivate: true });
+    await assert.rejects(
+      getPinned(target),
+      (err: Error) => {
+        assert(!(err instanceof RetrievalTransientError), "should be a plain Error");
+        assert.match(err.message, /unsupported content-encoding: custom-compress/);
+        return true;
+      }
+    );
   } finally {
     server.closeAllConnections();
     server.close();

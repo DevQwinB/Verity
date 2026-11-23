@@ -2,6 +2,7 @@ import http from "node:http";
 import https from "node:https";
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
+import zlib from "node:zlib";
 import { canonicalHash } from "./canonical.js";
 import { isPrivateAddress } from "./address.js";
 
@@ -110,19 +111,63 @@ export function getPinned(target: PinnedTarget, totalTimeoutMs = TOTAL_TIMEOUT_M
         },
       },
       (res) => {
+        const rawEncoding = res.headers["content-encoding"];
+        const encoding = typeof rawEncoding === "string" ? rawEncoding.trim().toLowerCase() : "";
+
+        let stream: NodeJS.ReadableStream = res;
+        let decompressor: zlib.Gunzip | zlib.Inflate | zlib.BrotliDecompress | null = null;
+
+        if (encoding && encoding !== "identity") {
+          if (encoding === "gzip" || encoding === "x-gzip") {
+            decompressor = zlib.createGunzip();
+          } else if (encoding === "deflate") {
+            decompressor = zlib.createInflate();
+          } else if (encoding === "br") {
+            decompressor = zlib.createBrotliDecompress();
+          } else {
+            reject(new Error(`unsupported content-encoding: ${encoding}`));
+            res.destroy();
+            req.destroy();
+            return;
+          }
+
+          decompressor.on("error", (err) => {
+            res.destroy();
+            req.destroy();
+            reject(new Error(`decompression failed: ${err.message}`));
+          });
+
+          res.on("error", (err) => {
+            decompressor?.destroy();
+            reject(new RetrievalTransientError(`response interrupted: ${err.message}`));
+          });
+
+          res.pipe(decompressor);
+          stream = decompressor;
+        } else {
+          res.on("error", (err) => reject(new RetrievalTransientError(`response interrupted: ${err.message}`)));
+        }
+
         const chunks: Buffer[] = [];
         let size = 0;
-        res.on("data", (chunk: Buffer) => {
+        stream.on("data", (chunk: Buffer) => {
           size += chunk.length;
           if (size > MAX_BODY_BYTES) {
-            req.destroy();
             reject(new Error("retrieval response too large"));
+            if (decompressor) {
+              decompressor.destroy();
+            }
+            res.destroy();
+            req.destroy();
             return;
           }
           chunks.push(chunk);
         });
-        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
-        res.on("error", (err) => reject(new RetrievalTransientError(`response interrupted: ${err.message}`)));
+        stream.on("end", () => {
+          const decoder = new TextDecoder("utf-8");
+          const body = decoder.decode(Buffer.concat(chunks));
+          resolve({ status: res.statusCode ?? 0, body });
+        });
       }
     );
     req.on("timeout", () => req.destroy(new RetrievalTransientError(`no response within ${TIMEOUT_MS / 1000}s`)));
