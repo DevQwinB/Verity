@@ -127,6 +127,8 @@ not exist; it also creates the local database under `.pgdata/`.
 
 ### Prove it works end to end
 
+[![Scheduled E2E Smoke Test](https://github.com/DevQwinB/Verity/actions/workflows/e2e.yml/badge.svg)](https://github.com/DevQwinB/Verity/actions/workflows/e2e.yml)
+
 With `pnpm dev` running, in another terminal:
 
 ```bash

@@ -1,0 +1,118 @@
+name: Scheduled E2E Smoke Test
+
+on:
+  schedule:
+    # Run nightly at 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      smoke_slow:
+        description: 'Run slow smoke tests (also wait out one window)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Testnet Smoke Test (ephemeral deployment)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VERITY_DEPLOYMENT: ci-${{ github.run_id }}
+      SMOKE_SLOW: ${{ inputs.smoke_slow && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust toolchain
+        run: rustup show
+        working-directory: contracts
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts
+
+      - name: Install stellar-cli
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v25.2.0/stellar-cli-25.2.0-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C /usr/local/bin
+          stellar --version
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build contract packages
+        run: pnpm --filter escrow-gate --filter zk-verifier-registry build
+
+      - name: Deploy ephemeral testnet deployment
+        run: |
+          # Retry up to 2 times for testnet/friendbot flakiness
+          n=0
+          until [ "$n" -ge 2 ]; do
+            ./scripts/deploy_testnet.sh && break
+            n=$((n+1))
+            echo "::warning::deploy_testnet.sh failed, retrying ($n/2)..."
+            sleep 10
+          done
+
+      - name: Bootstrap re-executors
+        run: |
+          n=0
+          until [ "$n" -ge 2 ]; do
+            ./scripts/bootstrap_reexecutors.sh && break
+            n=$((n+1))
+            echo "::warning::bootstrap_reexecutors.sh failed, retrying ($n/2)..."
+            sleep 10
+          done
+
+      - name: Start local dev stack
+        run: |
+          pnpm dev --no-web > dev.log 2>&1 &
+          DEV_PID=$!
+          echo "DEV_PID=$DEV_PID" >> $GITHUB_ENV
+          
+          # Wait for health endpoint
+          echo "Waiting for Verity backend to become healthy..."
+          timeout 120 bash -c 'until curl -fs 127.0.0.1:3001/health/live >/dev/null 2>&1; do sleep 2; done'
+          echo "Backend is healthy!"
+
+      - name: Run E2E smoke test
+        run: |
+          pnpm smoke > smoke.log 2>&1 || (cat smoke.log && exit 1)
+          cat smoke.log
+
+      - name: Audit logs for leaked secret keys
+        if: always()
+        run: |
+          echo "Auditing dev.log and smoke.log for Ed25519 secret seed patterns (S[A-Z2-7]{55})..."
+          FOUND=0
+          if [ -f dev.log ] && grep -E 'S[A-Z2-7]{55}' dev.log; then
+            echo "::error::Leaked secret key pattern found in dev.log!"
+            FOUND=1
+          fi
+          if [ -f smoke.log ] && grep -E 'S[A-Z2-7]{55}' smoke.log; then
+            echo "::error::Leaked secret key pattern found in smoke.log!"
+            FOUND=1
+          fi
+          if [ "$FOUND" -eq 1 ]; then
+            exit 1
+          fi
+          echo "Audit passed: No secrets detected."
+
+      - name: Upload execution logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-smoke-logs-${{ github.run_id }}
+          path: |
+            dev.log
+            smoke.log
+          if-no-files-found: ignore
