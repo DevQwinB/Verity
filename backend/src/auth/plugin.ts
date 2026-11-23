@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import cors from "@fastify/cors";
 import { StrKey } from "@stellar/stellar-sdk";
 import { z } from "zod";
 import { env } from "../config/env.js";
@@ -12,6 +13,13 @@ declare module "fastify" {
 }
 
 export async function authPlugin(app: FastifyInstance) {
+  await app.register(cors, {
+    origin: "*",
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type"],
+    credentials: false,
+  });
+
   app.get("/auth", async (req) => {
     const query = z
       .object({
