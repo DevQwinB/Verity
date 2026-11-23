@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useWallet } from "../../../components/wallet-provider";
 import { Card, CardBody, CardHeader } from "../../../components/ui/card";
 import { Button } from "../../../components/ui/button";
+import { LiveStatus } from "../../../components/live-status";
 import { uploadArtifact, createSubmission, relaySubmission } from "../../../lib/client-api";
 import { signXdr } from "../../../lib/wallet";
 import { NETWORK_PASSPHRASE } from "../../../lib/config";
@@ -216,6 +217,18 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
   }
 
   const busy = step !== "idle" && step !== "error";
+  const stepLabel =
+    step === "uploading"
+      ? "Uploading artifacts..."
+      : step === "building"
+        ? "Building transaction..."
+        : step === "signing"
+          ? "Awaiting signature in Freighter..."
+          : step === "relaying"
+            ? "Submitting to testnet..."
+            : step === "done"
+              ? "Confirmed. Opening the submission..."
+              : "Submit for verification";
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -375,22 +388,18 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
         </p>
       )}
 
+      <LiveStatus message={busy ? stepLabel : connecting ? "Connecting..." : ""} />
+
       {account ? (
-        <Button onClick={handleSubmit} disabled={busy || !escrowRefTrimmed || !inputContent || !outputContent}>
-          {step === "uploading"
-            ? "Uploading artifacts..."
-            : step === "building"
-              ? "Building transaction..."
-              : step === "signing"
-                ? "Awaiting signature in Freighter..."
-                : step === "relaying"
-                  ? "Submitting to testnet..."
-                  : step === "done"
-                    ? "Confirmed. Opening the submission..."
-                    : "Submit for verification"}
+        <Button
+          onClick={handleSubmit}
+          disabled={busy || !escrowRefTrimmed || !inputContent || !outputContent}
+          aria-busy={busy}
+        >
+          {stepLabel}
         </Button>
       ) : (
-        <Button onClick={login} disabled={connecting}>
+        <Button onClick={login} disabled={connecting} aria-busy={connecting}>
           {connecting ? "Connecting..." : "Connect wallet to continue"}
         </Button>
       )}

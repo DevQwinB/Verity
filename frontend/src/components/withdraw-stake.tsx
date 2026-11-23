@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useWallet } from "./wallet-provider";
 import { Button } from "./ui/button";
+import { LiveStatus } from "./live-status";
 import { buildStakeWithdrawal, relayReexecutorStake } from "../lib/client-api";
 import { signXdr } from "../lib/wallet";
 import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../lib/config";
@@ -60,8 +61,18 @@ export function WithdrawStake({
     }
   }
 
+  const stepLabel =
+    busy === "building"
+      ? "Building transaction..."
+      : busy === "signing"
+        ? "Awaiting signature in Freighter..."
+        : busy === "relaying"
+          ? "Submitting to testnet..."
+          : "Withdraw stake";
+
   return (
     <div className="space-y-3">
+      <LiveStatus message={busy !== null ? stepLabel : ""} />
       <p className="max-w-prose text-sm text-text-secondary">
         This is your account. Stake above the {stroopsToXlm(floorStroops)} XLM floor can leave at
         any time; going below it stops new assignments, and the contract refuses that while any of
@@ -81,14 +92,13 @@ export function WithdrawStake({
             className="w-40 rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
           />
         </div>
-        <Button variant="secondary" onClick={handleWithdraw} disabled={busy !== null}>
-          {busy === "building"
-            ? "Building transaction..."
-            : busy === "signing"
-              ? "Awaiting signature in Freighter..."
-              : busy === "relaying"
-                ? "Submitting to testnet..."
-                : "Withdraw stake"}
+        <Button
+          variant="secondary"
+          onClick={handleWithdraw}
+          disabled={busy !== null}
+          aria-busy={busy !== null}
+        >
+          {stepLabel}
         </Button>
       </div>
       {error && (

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useWallet } from "../../../components/wallet-provider";
 import { Card, CardBody, CardHeader } from "../../../components/ui/card";
 import { Button, buttonClasses } from "../../../components/ui/button";
+import { LiveStatus } from "../../../components/live-status";
 import { registerReexecutor, relayReexecutorStake } from "../../../lib/client-api";
 import { signXdr } from "../../../lib/wallet";
 import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../../../lib/config";
@@ -27,6 +28,16 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
   const floorXlm = stroopsToXlm(config.min_stake_floor);
   const stake = xlmToStroops(stakeXlm);
   const belowFloor = stake !== null && stake < floor;
+
+  const busy = status === "building" || status === "signing" || status === "relaying";
+  const stepLabel =
+    status === "building"
+      ? "Building transaction..."
+      : status === "signing"
+        ? "Awaiting signature in Freighter..."
+        : status === "relaying"
+          ? "Submitting to testnet..."
+          : "Stake and register";
 
   async function handleRegister() {
     if (!account) return;
@@ -107,6 +118,7 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
           <h2 className="font-medium">Stake</h2>
         </CardHeader>
         <CardBody className="space-y-4">
+          <LiveStatus message={busy ? stepLabel : connecting ? "Connecting..." : ""} />
           {status === "done" && result ? (
             <div className="space-y-3 text-sm" role="status">
               <p className="text-status-verified">
@@ -161,17 +173,11 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
               )}
 
               {account ? (
-                <Button onClick={handleRegister} disabled={status !== "idle" && status !== "error"}>
-                  {status === "building"
-                    ? "Building transaction..."
-                    : status === "signing"
-                      ? "Awaiting signature in Freighter..."
-                      : status === "relaying"
-                        ? "Submitting to testnet..."
-                        : "Stake and register"}
+                <Button onClick={handleRegister} disabled={busy} aria-busy={busy}>
+                  {stepLabel}
                 </Button>
               ) : (
-                <Button onClick={login} disabled={connecting}>
+                <Button onClick={login} disabled={connecting} aria-busy={connecting}>
                   {connecting ? "Connecting..." : "Connect wallet to continue"}
                 </Button>
               )}
