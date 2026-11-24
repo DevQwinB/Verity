@@ -22,6 +22,12 @@ test("assignmentSeed produces deterministic sha256 golden vector", () => {
   assert.equal(seed, "0162bf36a0368e22c2d3386fd1f53f3af4fe907c8f8dc294fc3f3b95dfa004fa");
 });
 
+test("assignmentSeed with ledger hash entropy produces deterministic sha256 golden vector", () => {
+  // When entropy (submit ledger hash) is provided, seed = sha256(chainSubmissionId | ledgerHash)
+  const seed = assignmentSeed("11111111-1111-1111-1111-111111111111", "7", "abc123ledgerhash");
+  assert.equal(seed, "dce4b0191f01667a7e5893daf130f5e7b0921aebda3fc46ef5a939e6c51766f8");
+});
+
 test("rankBySeed produces deterministic golden orderings for given seeds", () => {
   const seed1 = assignmentSeed("11111111-1111-1111-1111-111111111111", "7");
   const accounts = [

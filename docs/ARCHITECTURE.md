@@ -174,8 +174,17 @@ Docker-free dev under `.pgdata/`. Tables: `marketplace`, `submission`,
 `submission_artifact`, `reexecutor`, `replay`, `spot_check`, `challenge`,
 `zk_proof`, `attestation_export`, `slashing_event`, `webhook_subscription`,
 `webhook_delivery`, `chain_cursor`.
-`replay.assignment_seed` stores the seed so anyone can reproduce an
-assignment.
+`submission.assignment_entropy` stores the submit ledger's hash fetched during
+`submission_created`. The assignment seed is computed as
+`sha256(chainSubmissionId | ledgerHash)` (falling back to
+`sha256(submissionId | chainSubmissionId)` for legacy rows without entropy).
+`replay.assignment_seed` and `spot_check.assignment_seed` store the seed, and
+`candidate_accounts` stores the ranked live re-executors at assignment time,
+allowing any third party to audit and recompute assignments:
+1. Obtain the submit ledger hash from `submission.assignment_entropy` or directly from Soroban RPC for the event's ledger.
+2. Recompute seed = `sha256(chainSubmissionId | ledgerHash)`.
+3. For each candidate account in `candidate_accounts`, calculate rank = `sha256(seed | candidate_account)` and sort ascending.
+4. Verify the assigned workers correspond to the top ranked accounts.
 
 ### Frontend (`frontend/`)
 

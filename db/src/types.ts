@@ -56,6 +56,8 @@ export interface SubmissionTable {
   min_challenger_bond: string | null;
   /** Last time the relay endpoint broadcast this draft's signed transaction. */
   relay_started_at: Timestamp | null;
+  /** Ledger hash from the submit transaction, used as entropy for deterministic worker assignment. */
+  assignment_entropy: string | null;
   created_at: GeneratedTimestamp;
   updated_at: GeneratedTimestamp;
 }
@@ -82,6 +84,7 @@ export interface ReplayTable {
   reexecutor_id: string;
   status: Generated<ReplayStatus>;
   assignment_seed: string | null;
+  candidate_accounts: string[] | null;
   replay_output_hash: string | null;
   match: boolean | null;
   latency_ms: number | null;
@@ -99,6 +102,8 @@ export interface SpotCheckTable {
   id: Generated<string>;
   submission_id: string;
   reexecutor_id: string;
+  assignment_seed: string | null;
+  candidate_accounts: string[] | null;
   sampled_at: GeneratedTimestamp;
   result: SpotCheckResult | null;
   evidence: unknown | null;

@@ -11,7 +11,10 @@ async function votingRules(): Promise<{ quorum: number; allowlist: boolean }> {
   return { quorum: Number(cfg.quorum_min_reexecutors), allowlist: cfg.reexecutor_allowlist };
 }
 
-export function assignmentSeed(submissionId: string, chainSubmissionId: string): string {
+export function assignmentSeed(submissionId: string, chainSubmissionId: string, entropy?: string | null): string {
+  if (entropy) {
+    return createHash("sha256").update(`${chainSubmissionId}|${entropy}`).digest("hex");
+  }
   return createHash("sha256").update(`${submissionId}|${chainSubmissionId}`).digest("hex");
 }
 
@@ -59,18 +62,30 @@ async function assignNext(
       await db.selectFrom(table).select("reexecutor_id").where("submission_id", "=", submissionId).execute()
     ).map((row) => row.reexecutor_id)
   );
-  const next = (await rankedLiveReexecutors(seed, allowlist)).filter((r) => !taken.has(r.id)).slice(0, count);
+  const ranked = await rankedLiveReexecutors(seed, allowlist);
+  const candidateAccounts = JSON.stringify(ranked.map((r) => r.stellar_account));
+  const next = ranked.filter((r) => !taken.has(r.id)).slice(0, count);
   for (const r of next) {
     if (table === "replay") {
       await db
         .insertInto("replay")
-        .values({ submission_id: submissionId, reexecutor_id: r.id, assignment_seed: seed })
+        .values({
+          submission_id: submissionId,
+          reexecutor_id: r.id,
+          assignment_seed: seed,
+          candidate_accounts: candidateAccounts as any,
+        })
         .onConflict((oc) => oc.columns(["submission_id", "reexecutor_id"]).doNothing())
         .execute();
     } else {
       await db
         .insertInto("spot_check")
-        .values({ submission_id: submissionId, reexecutor_id: r.id })
+        .values({
+          submission_id: submissionId,
+          reexecutor_id: r.id,
+          assignment_seed: seed,
+          candidate_accounts: candidateAccounts as any,
+        })
         .onConflict((oc) => oc.columns(["submission_id", "reexecutor_id"]).doNothing())
         .execute();
     }
@@ -96,6 +111,7 @@ export async function assignReplayJobs(params: {
   submissionId: string;
   chainSubmissionId: string;
   taskType: TaskType;
+  assignmentEntropy?: string | null;
   /** Force a full replay quorum even for a retrieval task — used when a
    * spot-check mismatches or a challenge is opened, where a single sampled
    * vote can never reach on-chain consensus on its own. */
@@ -103,7 +119,7 @@ export async function assignReplayJobs(params: {
 }) {
   if (params.taskType === "unverifiable") return;
   const { quorum, allowlist } = await votingRules();
-  const seed = assignmentSeed(params.submissionId, params.chainSubmissionId);
+  const seed = assignmentSeed(params.submissionId, params.chainSubmissionId, params.assignmentEntropy);
 
   if (params.taskType === "deterministic" || params.fullQuorum) {
     const held = await db
@@ -132,6 +148,7 @@ export async function escalateToFullReplay(submissionId: string) {
     submissionId: sub.id,
     chainSubmissionId: sub.chain_submission_id,
     taskType: sub.task_type,
+    assignmentEntropy: sub.assignment_entropy,
     fullQuorum: true,
   });
 }
@@ -163,7 +180,7 @@ export async function escalateAgentPendingSubmissions(agentId: string, exceptSub
 export async function topUpAssignments(): Promise<number> {
   const open = await db
     .selectFrom("submission")
-    .select(["id", "chain_submission_id", "task_type", "status"])
+    .select(["id", "chain_submission_id", "assignment_entropy", "task_type", "status"])
     .where("status", "in", ["pending", "disputed"])
     .where("chain_submission_id", "is not", null)
     // Once the window has closed on an unchallenged submission the sweep
@@ -182,7 +199,7 @@ export async function topUpAssignments(): Promise<number> {
   let added = 0;
 
   for (const sub of open) {
-    const seed = assignmentSeed(sub.id, sub.chain_submission_id!);
+    const seed = assignmentSeed(sub.id, sub.chain_submission_id!, sub.assignment_entropy);
     const replays = await db
       .selectFrom("replay")
       .select([
