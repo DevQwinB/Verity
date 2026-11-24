@@ -8,8 +8,19 @@ import { HttpError } from "../../http-error.js";
 import { assertPublicHttpUrl } from "../webhooks/url-guard.js";
 
 /** The events the backend actually dispatches. Keep in step with the
- * indexer (disputed) and verdict.ts (verified, slashed). */
-export const WEBHOOK_EVENTS = ["submission.verified", "submission.slashed", "submission.disputed"] as const;
+ * indexer (disputed) and verdict.ts (verified, slashed, expired_unverified). */
+export const WEBHOOK_EVENTS = [
+  "submission.verified",
+  "submission.slashed",
+  "submission.expired_unverified",
+  "submission.disputed",
+] as const;
+
+export const createWebhookBody = z.object({
+  url: z.string().url().max(2048),
+  secret: z.string().min(8).max(256),
+  events: z.array(z.enum(WEBHOOK_EVENTS)).min(1),
+});
 
 /** Every verdict event is delivered to each matching subscription, so the
  * number of subscriptions bounds the outbound requests one event can cause. */
@@ -74,13 +85,7 @@ export async function marketplacesRoutes(app: FastifyInstance, opts?: { db?: Kys
 
   app.post("/v1/marketplaces/:id/webhooks", { preHandler: requireAuth }, async (req, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
-    const body = z
-      .object({
-        url: z.string().url().max(2048),
-        secret: z.string().min(8).max(256),
-        events: z.array(z.enum(WEBHOOK_EVENTS)).min(1),
-      })
-      .parse(req.body);
+    const body = createWebhookBody.parse(req.body);
     if (!(await ownsMarketplace(params.id, req.stellarAccount, reply, database))) return notOwnerError;
     // Verify target URL is public before taking a database transaction lock
     await assertPublicHttpUrl(body.url);
@@ -103,7 +108,7 @@ export async function marketplacesRoutes(app: FastifyInstance, opts?: { db?: Kys
       if (Number(count) >= MAX_WEBHOOKS_PER_MARKETPLACE) {
         throw new HttpError(
           409,
-          `a marketplace can have at most ${MAX_WEBHOOKS_PER_MARKETPLACE} webhook subscriptions; deactivating one does not free its slot`
+          `a marketplace can have at most ${MAX_WEBHOOKS_PER_MARKETPLACE} webhook subscriptions; delete an existing subscription to free a slot`
         );
       }
       return trx
@@ -150,6 +155,23 @@ export async function marketplacesRoutes(app: FastifyInstance, opts?: { db?: Kys
       return { error: "webhook not found" };
     }
     return row;
+  });
+
+  app.delete("/v1/marketplaces/:id/webhooks/:webhookId", { preHandler: requireAuth }, async (req, reply) => {
+    const params = z.object({ id: z.string().uuid(), webhookId: z.string().uuid() }).parse(req.params);
+    if (!(await ownsMarketplace(params.id, req.stellarAccount, reply, database))) return notOwnerError;
+    const deleted = await database
+      .deleteFrom("webhook_subscription")
+      .where("id", "=", params.webhookId)
+      .where("marketplace_id", "=", params.id)
+      .returning("id")
+      .executeTakeFirst();
+    if (!deleted) {
+      reply.code(404);
+      return { error: "webhook not found" };
+    }
+    reply.code(204);
+    return;
   });
 }
 
