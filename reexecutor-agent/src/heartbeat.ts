@@ -6,7 +6,8 @@
 export function startHeartbeat(
   beat: () => Promise<void>,
   intervalMs: number,
-  onError: (err: Error) => void = () => {}
+  onError: (err: Error) => void = () => {},
+  onSuccess: () => void = () => {}
 ): { stop: () => void } {
   let inFlight = false;
   let failing = false;
@@ -16,6 +17,7 @@ export function startHeartbeat(
     beat()
       .then(() => {
         failing = false;
+        onSuccess();
       })
       .catch((err: unknown) => {
         if (!failing) onError(err instanceof Error ? err : new Error(String(err)));

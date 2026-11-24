@@ -28,4 +28,6 @@ COPY reexecutor-agent reexecutor-agent
 ENV NODE_ENV=production
 WORKDIR /app/reexecutor-agent
 USER node
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+  CMD [ -z "$METRICS_PORT" ] || wget -qO- "http://127.0.0.1:${METRICS_PORT}/healthz" >/dev/null || exit 1
 CMD ["node_modules/.bin/tsx", "src/index.ts"]
