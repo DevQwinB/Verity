@@ -122,7 +122,24 @@ const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
 /** When this process first failed to reach a submission's retrieval target.
  * Entries live only while the backend still lists the assignment (see
  * `pruneToListed`). */
-const firstUnreachableAt = new Map<string, number>();
+export const firstUnreachableAt = new Map<string, number>();
+
+export interface SubmissionSchedule {
+  nextAttemptAt: number;
+  attempts: number;
+  record?: SubmissionRecord;
+}
+
+export const submissionSchedules = new Map<string, SubmissionSchedule>();
+
+/**
+ * Calculates exponential backoff with jitter in ms: min(60s, baseMs * 2^attempts) +/- 20% jitter.
+ */
+export function calculateBackoffMs(attempts: number, baseMs: number = POLL_MS): number {
+  const exp = Math.min(60_000, baseMs * Math.pow(2, attempts));
+  const jitter = exp * (0.8 + Math.random() * 0.4);
+  return Math.round(jitter);
+}
 
 /**
  * Re-derives the output from the submission's own declared artifacts.
@@ -201,7 +218,7 @@ async function reExecute(
  * seconds later; without this we would re-run and re-send in the meantime.
  * Entries live only while the backend still lists the assignment (see
  * `pruneToListed`). */
-const attested = new Set<string>();
+export const attested = new Set<string>();
 
 /** Set when the contract says this account may not vote at all (stake below
  * the floor, or not approved). Replaying is pointless until that changes, so
@@ -210,16 +227,48 @@ let votingBlockedUntil = 0;
 
 async function processAssignment(a: Assignment) {
   if (attested.has(a.chain_submission_id)) return;
-  const record = (await client.get_submission({ id: BigInt(a.chain_submission_id) })).result;
-  if (!record) throw new Error("submission is not on-chain (yet)");
+  let schedule = submissionSchedules.get(a.chain_submission_id);
+  if (!schedule) {
+    schedule = { nextAttemptAt: 0, attempts: 0 };
+    submissionSchedules.set(a.chain_submission_id, schedule);
+  }
+
+  let record = schedule.record;
+  if (!record) {
+    record = (await client.get_submission({ id: BigInt(a.chain_submission_id) })).result;
+    if (!record) throw new Error("submission is not on-chain (yet)");
+    schedule.record = record;
+  }
+
   if (record.finalized) {
     attested.add(a.chain_submission_id);
     firstUnreachableAt.delete(a.chain_submission_id);
+    submissionSchedules.delete(a.chain_submission_id);
     return;
   }
 
   console.log(`${tag} re-executing ${record.task_type.tag.toLowerCase()} submission #${a.chain_submission_id}`);
-  const { outputHash, engine } = await reExecute(a, record);
+  let outputHash: string;
+  let engine: string;
+  try {
+    const res = await reExecute(a, record);
+    outputHash = res.outputHash;
+    engine = res.engine;
+  } catch (err) {
+    schedule.attempts += 1;
+    let delayMs = calculateBackoffMs(schedule.attempts, POLL_MS);
+    if (err instanceof RetrievalTransientError && err.retryAfterMs !== undefined) {
+      delayMs = Math.max(delayMs, err.retryAfterMs);
+      const budget = Math.min(RETRIEVAL_RETRY_BUDGET_S, Number(record.challenge_window_s) / 2);
+      const first = firstUnreachableAt.get(a.chain_submission_id) ?? Date.now() / 1000;
+      const giveUpAtMs = (Math.max(Number(record.submitted_at), first) + budget) * 1000;
+      if (Date.now() + delayMs > giveUpAtMs) {
+        delayMs = Math.max(0, giveUpAtMs - Date.now());
+      }
+    }
+    schedule.nextAttemptAt = Date.now() + delayMs;
+    throw err;
+  }
   const claimed = hex(record.claimed_output_hash);
   const matched = voteMatches(outputHash, claimed);
   console.log(`${tag}   engine=${engine}`);
@@ -248,11 +297,16 @@ async function processAssignment(a: Assignment) {
     // #23 AlreadyAttested: our vote is already on-chain. #32 ChallengeWindowClosed:
     // the submission was finalized before we got to it. Either way there is
     // nothing left for us to do for this submission.
-    if (code !== "23" && code !== "32") throw err;
+    if (code !== "23" && code !== "32") {
+      schedule.attempts += 1;
+      schedule.nextAttemptAt = Date.now() + calculateBackoffMs(schedule.attempts, POLL_MS);
+      throw err;
+    }
     console.log(`${tag}   nothing to do (already attested or already finalized)`);
   }
   attested.add(a.chain_submission_id);
   firstUnreachableAt.delete(a.chain_submission_id);
+  submissionSchedules.delete(a.chain_submission_id);
 }
 
 /** Drops per-submission state for everything the backend no longer lists, so
@@ -261,9 +315,21 @@ async function processAssignment(a: Assignment) {
  * with #23 AlreadyAttested, which `processAssignment` already treats as
  * nothing to do, so the worst case is one redundant RPC call, never a second
  * vote. */
-function pruneToListed(listed: ReadonlySet<string>) {
+export function pruneToListed(listed: ReadonlySet<string>) {
   for (const id of attested) if (!listed.has(id)) attested.delete(id);
   for (const id of firstUnreachableAt.keys()) if (!listed.has(id)) firstUnreachableAt.delete(id);
+  for (const id of submissionSchedules.keys()) if (!listed.has(id)) submissionSchedules.delete(id);
+}
+
+export function sortAssignmentsByDeadline(assignments: Assignment[]): Assignment[] {
+  return [...assignments].sort((a, b) => {
+    const recA = submissionSchedules.get(a.chain_submission_id)?.record;
+    const recB = submissionSchedules.get(b.chain_submission_id)?.record;
+    const deadlineA = recA ? Number(recA.submitted_at) + Number(recA.challenge_window_s) : Infinity;
+    const deadlineB = recB ? Number(recB.submitted_at) + Number(recB.challenge_window_s) : Infinity;
+    if (deadlineA !== deadlineB) return deadlineA - deadlineB;
+    return Number(a.chain_submission_id) - Number(b.chain_submission_id);
+  });
 }
 
 async function pollOnce(reexecutorId: string) {
@@ -272,13 +338,22 @@ async function pollOnce(reexecutorId: string) {
     spot_check_assignments: Assignment[];
   }>(`/v1/reexecutors/${reexecutorId}/assignments`);
   // Only after a successful fetch: if `api` throws, nothing is pruned.
-  pruneToListed(new Set([...replay_assignments, ...spot_check_assignments].map((a) => a.chain_submission_id)));
+  const allAssignments = [...replay_assignments, ...spot_check_assignments];
+  pruneToListed(new Set(allAssignments.map((a) => a.chain_submission_id)));
   // A sampled spot-check and a full replay are the same job for the worker:
   // re-derive the output, then put a bonded vote on-chain.
   // The poll above is what marks this worker online, so it runs even while
   // voting is blocked.
   if (Date.now() < votingBlockedUntil) return;
-  for (const assignment of [...replay_assignments, ...spot_check_assignments]) {
+
+  const now = Date.now();
+  const sorted = sortAssignmentsByDeadline(allAssignments);
+
+  for (const assignment of sorted) {
+    const sched = submissionSchedules.get(assignment.chain_submission_id);
+    if (sched && sched.nextAttemptAt > now) {
+      continue;
+    }
     try {
       await processAssignment(assignment);
     } catch (err) {
@@ -328,7 +403,9 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (process.env.NODE_ENV !== "test") {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
