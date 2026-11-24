@@ -34,9 +34,7 @@ pub enum Error {
     ChallengeWindowNotElapsed = 33,
     NoUnresolvedChallenge = 34,
     ChallengeAlreadyResolved = 35,
-    DeadlineInThePast = 36,
-    DeadlineNotElapsed = 37,
-    AlreadyReleased = 38,
+    AgentCannotChallenge = 36,
 
     NotUpheldResolution = 40,
     AlreadySlashed = 41,

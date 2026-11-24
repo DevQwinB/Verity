@@ -6,8 +6,15 @@
 //! Verity's own stack; shipped as integration documentation an external
 //! integrator can copy the pattern from (Rust) or reimplement against the
 //! exported EscrowGate contract spec (any language via stellar-sdk bindings).
+//!
+//! The contract is initialized atomically at deployment via `__constructor`,
+//! fixing the Verity `EscrowGate` and payment token addresses so setup cannot
+//! be front-run.
 
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, BytesN, Env};
+mod events;
+
+use events::{EscrowCreated, EscrowReleased};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
 use verity_common::{Error, SubmissionRecord, Verdict};
 
 /// Grace after an escrow's deadline before its poster may reclaim it. Covers
@@ -20,8 +27,7 @@ const REFUND_GRACE_S: u64 = 2 * escrow_gate::MAX_WINDOW_S;
 
 #[contracttype]
 #[derive(Clone)]
-enum DataKey {
-    Admin,
+pub(crate) enum DataKey {
     Gate,
     BondAsset,
     Escrow(u64),
@@ -38,13 +44,19 @@ struct EscrowRecord {
     released: bool,
 }
 
-#[contractevent]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EscrowRefunded {
-    #[topic]
-    pub escrow_id: u64,
-    pub poster: Address,
-    pub amount: i128,
+// The thresholds EscrowGate uses (contracts/escrow-gate/src/storage.rs). An
+// entry is extended whenever it is written, so a bounty that waits weeks for
+// work does not have its record archived before release() needs it.
+const BUMP_THRESHOLD: u32 = 100_000;
+const BUMP_TO: u32 = 500_000;
+
+/// Extends an escrow's record and the instance. The instance holds the gate,
+/// the token and the id counter, and its TTL also covers the contract code.
+fn bump(e: &Env, escrow_id: u64) {
+    e.storage()
+        .persistent()
+        .extend_ttl(&DataKey::Escrow(escrow_id), BUMP_THRESHOLD, BUMP_TO);
+    e.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
 }
 
 #[contract]
@@ -62,15 +74,11 @@ fn escrow_ref_for(e: &Env, escrow_id: u64) -> BytesN<32> {
 
 #[contractimpl]
 impl ExampleMarketplaceEscrow {
-    pub fn initialize(e: Env, admin: Address, gate: Address, bond_asset: Address) -> Result<(), Error> {
-        if e.storage().instance().has(&DataKey::Admin) {
-            return Err(Error::AlreadyInitialized);
-        }
-        admin.require_auth();
-        e.storage().instance().set(&DataKey::Admin, &admin);
+    /// Runs once, atomically with deployment, so nobody can front-run the contract
+    /// setup by claiming a fake gate or token.
+    pub fn __constructor(e: Env, gate: Address, token: Address) {
         e.storage().instance().set(&DataKey::Gate, &gate);
-        e.storage().instance().set(&DataKey::BondAsset, &bond_asset);
-        Ok(())
+        e.storage().instance().set(&DataKey::BondAsset, &token);
     }
 
     /// The bounty poster escrows funds for a specific payee agent, unrelated
@@ -86,8 +94,13 @@ impl ExampleMarketplaceEscrow {
         deadline: u64,
     ) -> Result<u64, Error> {
         poster.require_auth();
-        if deadline <= e.ledger().timestamp() {
-            return Err(Error::DeadlineInThePast);
+        // An escrow of zero could never be released: EscrowGate refuses a
+        // submission with no escrow value, and release() needs the two amounts
+        // to be equal. A negative one would only fail later, inside the token
+        // transfer, with a host error. Both are refused here, before anything
+        // moves.
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
         }
         let bond_asset: Address = e
             .storage()
@@ -101,8 +114,22 @@ impl ExampleMarketplaceEscrow {
         e.storage().instance().set(&DataKey::NextId, &(id + 1));
         e.storage().persistent().set(
             &DataKey::Escrow(id),
-            &EscrowRecord { payee, poster, amount, deadline, released: false },
+            &EscrowRecord {
+                payee: payee.clone(),
+                poster: poster.clone(),
+                amount,
+                released: false,
+            },
         );
+        bump(&e, id);
+
+        EscrowCreated {
+            escrow_id: id,
+            poster,
+            payee,
+            amount,
+        }
+        .publish(&e);
         Ok(id)
     }
 
@@ -158,20 +185,26 @@ impl ExampleMarketplaceEscrow {
         let token = soroban_sdk::token::TokenClient::new(&e, &bond_asset);
         let contract_address = e.current_contract_address();
 
-        match verdict {
-            Verdict::Verified => {
-                token.transfer(&contract_address, rec.payee.clone(), &rec.amount);
-                rec.released = true;
-            }
-            Verdict::Slashed | Verdict::ExpiredUnverified => {
-                token.transfer(&contract_address, rec.poster.clone(), &rec.amount);
-                rec.released = true;
-            }
+        let to = match verdict {
+            Verdict::Verified => rec.payee.clone(),
+            Verdict::Slashed | Verdict::ExpiredUnverified => rec.poster.clone(),
             Verdict::Pending | Verdict::Disputed => {
                 return Err(Error::ChallengeWindowNotElapsed);
             }
-        }
+        };
+        token.transfer(&contract_address, to.clone(), &rec.amount);
+        rec.released = true;
         e.storage().persistent().set(&DataKey::Escrow(escrow_id), &rec);
+        bump(&e, escrow_id);
+
+        EscrowReleased {
+            escrow_id,
+            submission_id,
+            to,
+            amount: rec.amount,
+            verdict,
+        }
+        .publish(&e);
         Ok(())
     }
 

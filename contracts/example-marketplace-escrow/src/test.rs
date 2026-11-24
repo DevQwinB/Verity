@@ -1,12 +1,17 @@
 #![cfg(test)]
 
-use crate::{ExampleMarketplaceEscrow, ExampleMarketplaceEscrowClient};
+use crate::events::{EscrowCreated, EscrowReleased};
+use crate::{DataKey, ExampleMarketplaceEscrow, ExampleMarketplaceEscrowClient};
 use escrow_gate::{EscrowGate, EscrowGateClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    events::Event as _,
+    testutils::{
+        storage::{Instance as _, Persistent as _},
+        Address as _, Events as _, Ledger as _,
+    },
     token, Address, BytesN, Env,
 };
-use verity_common::{ConfigRecord, Error, TaskType};
+use verity_common::{ConfigRecord, Error, TaskType, Verdict};
 
 const XLM: i128 = 10_000_000;
 
@@ -47,9 +52,8 @@ fn setup() -> TestSetup {
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
 
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(), sac.address()));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id, &sac.address());
 
     TestSetup {
         e,
@@ -100,9 +104,8 @@ fn release_pays_agent_only_after_gate_verifies() {
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
 
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(), sac.address()));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id, &sac.address());
 
     let poster = Address::generate(&e);
     let agent = Address::generate(&e);
@@ -153,9 +156,8 @@ fn release_refunds_poster_when_gate_slashes() {
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
 
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(), sac.address()));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id, &sac.address());
 
     let poster = Address::generate(&e);
     let agent = Address::generate(&e);
@@ -219,12 +221,14 @@ fn release_refunds_poster_on_expired_unverified() {
 }
 
 #[test]
-fn initialize_twice_returns_already_initialized() {
+fn constructor_arguments_are_stored() {
     let setup = setup();
-    let other_admin = Address::generate(&setup.e);
-    let other_gate = Address::generate(&setup.e);
-    let res = setup.mkt.try_initialize(&other_admin, &other_gate, &setup.mkt_id);
-    assert_eq!(res, Err(Ok(Error::AlreadyInitialized)));
+    setup.e.as_contract(&setup.mkt_id, || {
+        let stored_gate: Address = setup.e.storage().instance().get(&DataKey::Gate).unwrap();
+        let stored_token: Address = setup.e.storage().instance().get(&DataKey::BondAsset).unwrap();
+        assert_eq!(stored_gate, setup.gate.address);
+        assert_eq!(stored_token, setup.token.address);
+    });
 }
 
 #[test]
@@ -272,9 +276,8 @@ fn release_rejects_submission_from_other_agent() {
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
 
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(), sac.address()));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id, &sac.address());
 
     let poster = Address::generate(&e);
     let payee = Address::generate(&e);
@@ -317,9 +320,8 @@ fn release_rejects_mismatched_escrow_value() {
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
 
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(), sac.address()));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id, &sac.address());
 
     let poster = Address::generate(&e);
     let payee = Address::generate(&e);
@@ -361,9 +363,8 @@ fn release_rejects_mismatched_escrow_ref() {
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
 
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(), sac.address()));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id, &sac.address());
 
     let poster = Address::generate(&e);
     let payee = Address::generate(&e);
@@ -402,9 +403,8 @@ fn release_rejects_unknown_submission() {
     let token_admin = token::StellarAssetClient::new(&e, &sac.address());
 
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(), sac.address()));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id, &sac.address());
 
     let poster = Address::generate(&e);
     let payee = Address::generate(&e);
@@ -417,100 +417,228 @@ fn release_rejects_unknown_submission() {
     assert_eq!(token.balance(&mkt_id), 1000 * XLM);
 }
 
-// ---- refunding an escrow the payee never delivered on ----
+// ---- amounts, events and storage TTLs ----
+
+fn escrow_ttl(setup: &TestSetup, escrow_id: u64) -> u32 {
+    setup.e.as_contract(&setup.mkt_id, || {
+        setup
+            .e
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Escrow(escrow_id))
+    })
+}
+
+fn instance_ttl(setup: &TestSetup) -> u32 {
+    setup
+        .e
+        .as_contract(&setup.mkt_id, || setup.e.storage().instance().get_ttl())
+}
+
+/// Three re-executors vote mismatch, which is a slashing consensus.
+fn vote_mismatch(setup: &TestSetup, submission_id: u64) {
+    for _ in 0..3 {
+        let rex = Address::generate(&setup.e);
+        setup.token_admin.mint(&rex, &(2000 * XLM));
+        setup.gate.register_reexecutor(&rex, &(600 * XLM));
+        setup.gate.attest_replay(
+            &rex,
+            &submission_id,
+            &BytesN::from_array(&setup.e, &[9u8; 32]),
+            &false,
+        );
+    }
+}
 
 #[test]
-fn create_escrow_rejects_a_deadline_in_the_past() {
+fn create_escrow_rejects_a_zero_or_negative_amount_and_moves_nothing() {
     let setup = setup();
     let poster = Address::generate(&setup.e);
     let payee = Address::generate(&setup.e);
     setup.token_admin.mint(&poster, &(1000 * XLM));
-    let now = setup.e.ledger().timestamp();
 
-    for invalid in [now.saturating_sub(1), now] {
-        let res = setup.mkt.try_create_escrow(&poster, &payee, &(1000 * XLM), &invalid);
-        assert_eq!(res, Err(Ok(Error::DeadlineInThePast)));
+    for amount in [0, -1, -(1000 * XLM)] {
+        assert_eq!(
+            setup.mkt.try_create_escrow(&poster, &payee, &amount),
+            Err(Ok(Error::InvalidAmount)),
+            "{amount}"
+        );
     }
     assert_eq!(setup.token.balance(&poster), 1000 * XLM);
     assert_eq!(setup.token.balance(&setup.mkt_id), 0);
+
+    // No id was used up by the refused calls: the first real escrow is 0.
+    assert_eq!(setup.mkt.create_escrow(&poster, &payee, &1), 0);
+    assert_eq!(setup.token.balance(&setup.mkt_id), 1);
 }
 
 #[test]
-fn refund_waits_for_the_deadline_and_the_grace_period() {
+fn create_escrow_publishes_escrow_created() {
     let setup = setup();
     let poster = Address::generate(&setup.e);
     let payee = Address::generate(&setup.e);
     setup.token_admin.mint(&poster, &(1000 * XLM));
-    let start = setup.e.ledger().timestamp();
-    let deadline = start + 1000;
-    let escrow_id = setup.mkt.create_escrow(&poster, &payee, &(1000 * XLM), &deadline);
 
-    // Before the deadline, and even after it while in-flight work could
-    // still be verifying, the poster cannot take the funds back.
-    for at in [deadline - 1, deadline, deadline + crate::REFUND_GRACE_S - 1] {
-        setup.e.ledger().set_timestamp(at);
-        let res = setup.mkt.try_refund_expired(&escrow_id);
-        assert_eq!(res, Err(Ok(Error::DeadlineNotElapsed)), "at {at}");
+    let first = setup.mkt.create_escrow(&poster, &payee, &(600 * XLM));
+    let expected = EscrowCreated {
+        escrow_id: first,
+        poster: poster.clone(),
+        payee: payee.clone(),
+        amount: 600 * XLM,
     }
-    assert_eq!(setup.token.balance(&poster), 0);
-    assert_eq!(setup.token.balance(&setup.mkt_id), 1000 * XLM);
+    .to_xdr(&setup.e, &setup.mkt_id);
+    assert!(setup.e.events().all().events().contains(&expected));
 
-    // Once the grace period is over the poster gets the full amount back.
-    setup.e.ledger().set_timestamp(deadline + crate::REFUND_GRACE_S);
-    setup.mkt.refund_expired(&escrow_id);
-    assert_eq!(setup.token.balance(&poster), 1000 * XLM);
-    assert_eq!(setup.token.balance(&setup.mkt_id), 0);
+    // The second escrow carries its own id and amount.
+    let second = setup.mkt.create_escrow(&poster, &payee, &(400 * XLM));
+    assert_eq!((first, second), (0, 1));
+    let expected = EscrowCreated {
+        escrow_id: second,
+        poster: poster.clone(),
+        payee: payee.clone(),
+        amount: 400 * XLM,
+    }
+    .to_xdr(&setup.e, &setup.mkt_id);
+    assert!(setup.e.events().all().events().contains(&expected));
 }
 
 #[test]
-fn refund_after_a_release_is_rejected() {
+fn release_publishes_escrow_released_to_the_payee_when_verified() {
+    let setup = setup();
+    let poster = Address::generate(&setup.e);
+    let agent = Address::generate(&setup.e);
+    // An earlier escrow, so that the escrow and the submission below do not
+    // share an id and the event cannot swap them unnoticed.
+    let earlier = Address::generate(&setup.e);
+    setup.token_admin.mint(&earlier, &XLM);
+    setup.mkt.create_escrow(&earlier, &agent, &XLM);
+    let (escrow_id, submission_id) = create_escrow_and_submission(&setup, &poster, &agent);
+    assert_ne!(escrow_id, submission_id);
+    let released = |to: &Address, verdict: Verdict| {
+        EscrowReleased {
+            escrow_id,
+            submission_id,
+            to: to.clone(),
+            amount: 1000 * XLM,
+            verdict,
+        }
+        .to_xdr(&setup.e, &setup.mkt_id)
+    };
+
+    // A release that is refused publishes nothing.
+    assert_eq!(
+        setup.mkt.try_release(&escrow_id, &submission_id),
+        Err(Ok(Error::ChallengeWindowNotElapsed))
+    );
+    let to_agent = released(&agent, Verdict::Verified);
+    let to_poster = released(&poster, Verdict::Verified);
+    assert!(!setup.e.events().all().events().contains(&to_agent));
+
+    setup
+        .e
+        .ledger()
+        .set_timestamp(setup.e.ledger().timestamp() + 3601);
+    setup.mkt.release(&escrow_id, &submission_id);
+    let events = setup.e.events().all();
+    assert!(events.events().contains(&to_agent));
+    assert!(!events.events().contains(&to_poster));
+}
+
+#[test]
+fn release_publishes_escrow_released_to_the_poster_when_slashed() {
+    let setup = setup();
+    let poster = Address::generate(&setup.e);
+    let agent = Address::generate(&setup.e);
+    let (escrow_id, submission_id) = create_escrow_and_submission(&setup, &poster, &agent);
+    vote_mismatch(&setup, submission_id);
+
+    setup.mkt.release(&escrow_id, &submission_id);
+    let expected = EscrowReleased {
+        escrow_id,
+        submission_id,
+        to: poster.clone(),
+        amount: 1000 * XLM,
+        verdict: Verdict::Slashed,
+    }
+    .to_xdr(&setup.e, &setup.mkt_id);
+    assert!(setup.e.events().all().events().contains(&expected));
+    assert_eq!(setup.token.balance(&poster), 1000 * XLM);
+}
+
+#[test]
+fn release_publishes_escrow_released_to_the_poster_when_expired_unverified() {
     let setup = setup();
     let poster = Address::generate(&setup.e);
     let agent = Address::generate(&setup.e);
     let (escrow_id, submission_id) = create_escrow_and_submission(&setup, &poster, &agent);
 
-    setup.e.ledger().set_timestamp(setup.e.ledger().timestamp() + 3601);
-    setup.mkt.release(&escrow_id, &submission_id);
-
-    // Advancing past the deadline changes nothing: the escrow is settled.
+    // One mismatch vote and no quorum: the window closes with nothing established.
+    let rex = Address::generate(&setup.e);
+    setup.token_admin.mint(&rex, &(2000 * XLM));
+    setup.gate.register_reexecutor(&rex, &(600 * XLM));
+    setup.gate.attest_replay(
+        &rex,
+        &submission_id,
+        &BytesN::from_array(&setup.e, &[9u8; 32]),
+        &false,
+    );
     setup
         .e
         .ledger()
-        .set_timestamp(far_deadline(&setup.e) + crate::REFUND_GRACE_S);
-    let res = setup.mkt.try_refund_expired(&escrow_id);
-    assert_eq!(res, Err(Ok(Error::AlreadyReleased)));
-    assert_eq!(setup.token.balance(&setup.mkt_id), 0);
+        .set_timestamp(setup.e.ledger().timestamp() + 3601);
+
+    setup.mkt.release(&escrow_id, &submission_id);
+    let expected = EscrowReleased {
+        escrow_id,
+        submission_id,
+        to: poster.clone(),
+        amount: 1000 * XLM,
+        verdict: Verdict::ExpiredUnverified,
+    }
+    .to_xdr(&setup.e, &setup.mkt_id);
+    assert!(setup.e.events().all().events().contains(&expected));
 }
 
 #[test]
-fn release_after_a_refund_is_a_no_op() {
+fn create_escrow_extends_the_record_and_the_instance() {
+    let setup = setup();
+    let poster = Address::generate(&setup.e);
+    let payee = Address::generate(&setup.e);
+    setup.token_admin.mint(&poster, &(1000 * XLM));
+
+    let escrow_id = setup.mkt.create_escrow(&poster, &payee, &(600 * XLM));
+    // The thresholds EscrowGate uses: extended to 500,000 ledgers.
+    assert_eq!(escrow_ttl(&setup, escrow_id), 500_000);
+    assert_eq!(instance_ttl(&setup), 500_000);
+
+    // A later escrow tops the instance up again once it has decayed below
+    // 100,000 ledgers, and does not touch the first escrow's record.
+    setup.e.ledger().with_mut(|l| l.sequence_number += 450_000);
+    assert_eq!(instance_ttl(&setup), 50_000);
+    let later = setup.mkt.create_escrow(&poster, &payee, &(400 * XLM));
+    assert_eq!(instance_ttl(&setup), 500_000);
+    assert_eq!(escrow_ttl(&setup, later), 500_000);
+    assert_eq!(escrow_ttl(&setup, escrow_id), 50_000);
+}
+
+#[test]
+fn release_extends_the_record_and_the_instance() {
     let setup = setup();
     let poster = Address::generate(&setup.e);
     let agent = Address::generate(&setup.e);
-    let start = setup.e.ledger().timestamp();
+    let (escrow_id, submission_id) = create_escrow_and_submission(&setup, &poster, &agent);
 
-    setup.token_admin.mint(&poster, &(1000 * XLM));
-    setup.token_admin.mint(&agent, &(1000 * XLM));
-    let escrow_id = setup.mkt.create_escrow(&poster, &agent, &(1000 * XLM), &(start + 1000));
-    let submission_id = setup.gate.submit(
-        &agent,
-        &crate::escrow_ref_for(&setup.e, escrow_id),
-        &(1000 * XLM),
-        &TaskType::Deterministic,
-        &BytesN::from_array(&setup.e, &[2u8; 32]),
-        &BytesN::from_array(&setup.e, &[3u8; 32]),
-        &(50 * XLM),
-    );
+    // The bounty waits a long time: both TTLs decay below the threshold.
+    setup.e.ledger().with_mut(|l| l.sequence_number += 450_000);
+    setup
+        .e
+        .ledger()
+        .set_timestamp(setup.e.ledger().timestamp() + 3601);
+    assert_eq!(escrow_ttl(&setup, escrow_id), 50_000);
+    assert_eq!(instance_ttl(&setup), 50_000);
 
-    setup.e.ledger().set_timestamp(start + 1000 + crate::REFUND_GRACE_S);
-    setup.mkt.refund_expired(&escrow_id);
-    assert_eq!(setup.token.balance(&poster), 1000 * XLM);
-    let agent_before = setup.token.balance(&agent);
-
-    // The submission may still settle later, but the money is already back
-    // with the poster, so release must not pay the agent a second time.
-    setup.e.ledger().set_timestamp(start + 1000 + crate::REFUND_GRACE_S + 3601);
     setup.mkt.release(&escrow_id, &submission_id);
-    assert_eq!(setup.token.balance(&agent), agent_before);
-    assert_eq!(setup.token.balance(&setup.mkt_id), 0);
+    assert_eq!(escrow_ttl(&setup, escrow_id), 500_000);
+    assert_eq!(instance_ttl(&setup), 500_000);
+    assert_eq!(setup.token.balance(&agent), 2000 * XLM);
 }
