@@ -43,7 +43,7 @@ chain wins, and the backend should reconcile to it.
 | `common` | Shared types (`SubmissionRecord`, `ConfigRecord`, `Verdict`, `Resolution`, `ResolutionMethod`, `TaskType`, …) and the single `Error` enum. |
 | `escrow-gate` | The core. Holds bonds and stakes, records submissions, replay votes and challenges, and computes verdicts. Entrypoints: `submit`, `register_reexecutor`, `withdraw_stake`, `attest_replay`, `release_attestation_lock`, `open_challenge`, `resolve_challenge`, `finalize`, `slash`, admin `update_config` / `set_reexecutor_approved`, and getters. |
 | `zk-verifier-registry` | Deployed **empty** as the Phase 2 anchor. `escrow-gate` rejects the ZK resolution method outright, so nothing can report a ZK-verified result. |
-| `example-marketplace-escrow` | Reference integration only. Not deployed. |
+| `example-marketplace-escrow` | Reference escrow integration, deployed alongside `escrow-gate` on testnet and exercised end-to-end by `escrow-honest` / `escrow-dishonest` in `backend/src/smoke/run.ts` (no real external marketplace is integrated yet). Binds submissions via `escrow_ref` encoded as a 32-byte value with the big-endian `u64` escrow ID in the final 8 bytes (`bytes[24..32]`). |
 
 Rules that hold in the contract and must keep holding (PRD §8; the proptest
 model in `escrow-gate/src/test/proptest_model.rs` covers consensus):

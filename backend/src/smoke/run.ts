@@ -1,5 +1,18 @@
 import "../config/net.js";
-import { Keypair, TransactionBuilder } from "@stellar/stellar-sdk";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  Address,
+  BASE_FEE,
+  Contract,
+  Keypair,
+  TransactionBuilder,
+  nativeToScVal,
+  rpc,
+  scValToNative,
+  xdr,
+} from "@stellar/stellar-sdk";
 import { basicNodeSigner } from "@stellar/stellar-sdk/contract";
 import { Client as EscrowGateClient } from "escrow-gate";
 
@@ -102,7 +115,8 @@ async function submit(
   name: string,
   task:
     | { type: "deterministic"; functionSource: string; input: unknown; claimedOutput: unknown }
-    | { type: "retrieval"; spec: { url: string; pointer?: string }; claimedOutput: unknown }
+    | { type: "retrieval"; spec: { url: string; pointer?: string }; claimedOutput: unknown },
+  opts?: { escrowRef?: string; escrowValue?: bigint }
 ): Promise<Submitted> {
   const inputJson = canonicalJson(task.type === "deterministic" ? task.input : task.spec);
   const input = await upload(agent.token, inputJson);
@@ -114,7 +128,7 @@ async function submit(
   const created = await call("/v1/submissions", {
     token: agent.token,
     body: {
-      escrow_ref: key,
+      escrow_ref: opts?.escrowRef ?? key,
       task_type: task.type,
       input_hash: input.content_hash,
       input_ref: input.storage_ref,
@@ -122,7 +136,7 @@ async function submit(
       claimed_output_ref: output.storage_ref,
       function_hash: fn?.content_hash,
       function_ref: fn?.storage_ref,
-      escrow_value: String(100n * XLM),
+      escrow_value: String(opts?.escrowValue ?? 100n * XLM),
       bond_amount: String(5n * XLM),
       idempotency_key: key,
     },
@@ -201,11 +215,81 @@ function expectNobodySlashed(d: any) {
 
 const DOUBLE = "return { doubled: input.n * 2, source: 'replay' };";
 
+const soroban = new rpc.Server(RPC_URL);
+
+/** Encodes a u64 escrow ID as 32-byte hex (big-endian u64 in the final 8 bytes),
+ * matching `escrow_ref_for` in `example-marketplace-escrow`. */
+function escrowRefFor(escrowId: bigint): string {
+  const buf = Buffer.alloc(32);
+  buf.writeBigUInt64BE(escrowId, 24);
+  return buf.toString("hex");
+}
+
+async function simulateRead(contractId: string, caller: string, method: string, args: xdr.ScVal[]): Promise<unknown> {
+  const acc = await soroban.getAccount(caller);
+  const tx = new TransactionBuilder(acc, { fee: BASE_FEE, networkPassphrase: cfg.network_passphrase })
+    .addOperation(new Contract(contractId).call(method, ...args))
+    .setTimeout(30)
+    .build();
+  const sim = await soroban.simulateTransaction(tx);
+  if (rpc.Api.isSimulationError(sim) || !sim.result) {
+    throw new Error(`simulate ${method} failed: ${rpc.Api.isSimulationError(sim) ? sim.error : "no result"}`);
+  }
+  return scValToNative(sim.result.retval);
+}
+
+async function readTokenBalance(sacId: string, account: string): Promise<bigint> {
+  const val = await simulateRead(sacId, account, "balance", [Address.fromString(account).toScVal()]);
+  return BigInt(val as bigint | number | string);
+}
+
+async function readEscrow(
+  contractId: string,
+  caller: string,
+  escrowId: bigint
+): Promise<{ payee: string; poster: string; amount: bigint; released: boolean } | null> {
+  const val = await simulateRead(contractId, caller, "get_escrow", [nativeToScVal(escrowId, { type: "u64" })]);
+  return (val as { payee: string; poster: string; amount: bigint; released: boolean } | undefined) ?? null;
+}
+
+async function invokeContract(
+  contractId: string,
+  signer: Keypair,
+  method: string,
+  args: xdr.ScVal[]
+): Promise<{ hash: string; value: unknown }> {
+  const acc = await soroban.getAccount(signer.publicKey());
+  const tx = new TransactionBuilder(acc, { fee: BASE_FEE, networkPassphrase: cfg.network_passphrase })
+    .addOperation(new Contract(contractId).call(method, ...args))
+    .setTimeout(60)
+    .build();
+  const prepared = await soroban.prepareTransaction(tx);
+  prepared.sign(signer);
+  const sent = await soroban.sendTransaction(prepared);
+  if (sent.status === "ERROR") {
+    throw new Error(`sendTransaction(${method}) failed: ${JSON.stringify(sent.errorResult)}`);
+  }
+  const res = await waitFor(`tx ${sent.hash} (${method})`, 60, async () => {
+    const r = await soroban.getTransaction(sent.hash);
+    return r.status === "NOT_FOUND" ? null : r;
+  });
+  if (res.status !== "SUCCESS") {
+    throw new Error(`tx ${sent.hash} (${method}) failed with status ${res.status}`);
+  }
+  return { hash: sent.hash, value: res.returnValue ? scValToNative(res.returnValue) : undefined };
+}
+
 /** A scenario does its on-chain work (sequentially: every transaction it
  * signs shares an account sequence with the others) and may return the part
  * that only waits and checks. Those parts run together afterwards, so three
  * scenarios that each wait out a challenge window take one window, not three. */
-type Scenario = (ctx: { agent: Actor; challenger: Actor; rogue: Actor | null }) => Promise<void | (() => Promise<void>)>;
+type Scenario = (ctx: {
+  agent: Actor;
+  challenger: Actor;
+  rogue: Actor | null;
+  escrowContractId: string | null;
+  nativeSacId: string | null;
+}) => Promise<void | (() => Promise<void>)>;
 
 /** Runs with at least a quorum of re-executors online. */
 const quorumScenarios: Record<string, Scenario> = {
@@ -384,6 +468,104 @@ const quorumScenarios: Record<string, Scenario> = {
     if (withdrawn !== XLM) throw new Error(`expected a 1 XLM withdrawal, stake fell by ${withdrawn}`);
     console.log(`  withdrew 1 XLM of stake: tx ${relayed.tx_hash}`);
   },
+
+  async "escrow-honest"({ agent, challenger, escrowContractId, nativeSacId }) {
+    if (!escrowContractId || !nativeSacId) {
+      throw new Error("example_marketplace_escrow_contract_id and native_xlm_sac_address are required in deployment JSON");
+    }
+    const amount = 100n * XLM;
+    const posterAddr = challenger.keypair.publicKey();
+    const agentAddr = agent.keypair.publicKey();
+    const agentBefore = await readTokenBalance(nativeSacId, agentAddr);
+
+    const created = await invokeContract(escrowContractId, challenger.keypair, "create_escrow", [
+      Address.fromString(posterAddr).toScVal(),
+      Address.fromString(agentAddr).toScVal(),
+      nativeToScVal(amount, { type: "i128" }),
+    ]);
+    const escrowId = BigInt(created.value as bigint | number | string);
+    console.log(`  create_escrow(#${escrowId}, 100 XLM) tx ${created.hash}`);
+
+    const { id, chainId } = await submit(
+      agent,
+      "escrow-honest",
+      {
+        type: "deterministic",
+        functionSource: DOUBLE,
+        input: { n: 21 },
+        claimedOutput: { source: "replay", doubled: 42 },
+      },
+      { escrowRef: escrowRefFor(escrowId), escrowValue: amount }
+    );
+
+    expectNobodySlashed(await expectVerdict(id, "verified", "reexecution_consensus"));
+
+    const released = await invokeContract(escrowContractId, challenger.keypair, "release", [
+      nativeToScVal(escrowId, { type: "u64" }),
+      nativeToScVal(BigInt(chainId), { type: "u64" }),
+    ]);
+    console.log(`  release(#${escrowId}) tx ${released.hash}`);
+
+    const agentAfter = await readTokenBalance(nativeSacId, agentAddr);
+    const delta = agentAfter - agentBefore;
+    if (delta <= amount - XLM || delta > amount) {
+      throw new Error(`expected agent balance to increase by ~${amount} stroops (net of tx fee), got delta=${delta}`);
+    }
+    const rec = await readEscrow(escrowContractId, posterAddr, escrowId);
+    if (!rec?.released) throw new Error(`expected escrow #${escrowId} to be marked released`);
+    console.log(`  agent received escrow payout (+${delta} stroops net of submit fee); released=${rec.released}`);
+  },
+
+  async "escrow-dishonest"({ agent, challenger, escrowContractId, nativeSacId }) {
+    if (!escrowContractId || !nativeSacId) {
+      throw new Error("example_marketplace_escrow_contract_id and native_xlm_sac_address are required in deployment JSON");
+    }
+    const amount = 100n * XLM;
+    const posterAddr = challenger.keypair.publicKey();
+    const agentAddr = agent.keypair.publicKey();
+    const posterBefore = await readTokenBalance(nativeSacId, posterAddr);
+    const agentBefore = await readTokenBalance(nativeSacId, agentAddr);
+
+    const created = await invokeContract(escrowContractId, challenger.keypair, "create_escrow", [
+      Address.fromString(posterAddr).toScVal(),
+      Address.fromString(agentAddr).toScVal(),
+      nativeToScVal(amount, { type: "i128" }),
+    ]);
+    const escrowId = BigInt(created.value as bigint | number | string);
+    console.log(`  create_escrow(#${escrowId}, 100 XLM) tx ${created.hash}`);
+
+    const { id, chainId } = await submit(
+      agent,
+      "escrow-dishonest",
+      {
+        type: "deterministic",
+        functionSource: DOUBLE,
+        input: { n: 21 },
+        claimedOutput: { source: "replay", doubled: 9000 },
+      },
+      { escrowRef: escrowRefFor(escrowId), escrowValue: amount }
+    );
+
+    expectNobodySlashed(await expectVerdict(id, "slashed", "reexecution_consensus"));
+
+    const released = await invokeContract(escrowContractId, challenger.keypair, "release", [
+      nativeToScVal(escrowId, { type: "u64" }),
+      nativeToScVal(BigInt(chainId), { type: "u64" }),
+    ]);
+    console.log(`  release(#${escrowId}) tx ${released.hash}`);
+
+    const posterAfter = await readTokenBalance(nativeSacId, posterAddr);
+    const agentAfter = await readTokenBalance(nativeSacId, agentAddr);
+    if (posterBefore - posterAfter >= XLM || posterAfter <= posterBefore - amount) {
+      throw new Error(`expected poster to receive ${amount} stroops refund (net of tx fees), before=${posterBefore}, after=${posterAfter}`);
+    }
+    if (agentAfter >= agentBefore) {
+      throw new Error(`expected dishonest agent not to profit, before=${agentBefore}, after=${agentAfter}`);
+    }
+    const rec = await readEscrow(escrowContractId, posterAddr, escrowId);
+    if (!rec?.released) throw new Error(`expected escrow #${escrowId} to be marked released`);
+    console.log(`  poster refunded (net fee ${posterBefore - posterAfter} stroops); agent lost bond (${agentBefore - agentAfter} stroops); released=${rec.released}`);
+  },
 };
 
 /** Runs with FEWER than a quorum online, so no consensus can ever form. */
@@ -477,7 +659,19 @@ async function main() {
   const agent = await actor(agentSecret);
   const challenger = await actor(challengerSecret);
   const rogue = process.env.SMOKE_ROGUE_SECRET ? await actor(process.env.SMOKE_ROGUE_SECRET) : null;
+
+  let deploymentMeta: { example_marketplace_escrow_contract_id?: string; native_xlm_sac_address?: string } = {};
+  try {
+    const deployPath = resolve(dirname(fileURLToPath(import.meta.url)), "../../../deployments", `${health.deployment}.json`);
+    deploymentMeta = JSON.parse(readFileSync(deployPath, "utf8"));
+  } catch {
+    // Optional if SMOKE_EXAMPLE_ESCROW_CONTRACT_ID / SMOKE_NATIVE_SAC_ADDRESS are used or escrow scenarios are skipped.
+  }
+  const escrowContractId = process.env.SMOKE_EXAMPLE_ESCROW_CONTRACT_ID ?? deploymentMeta.example_marketplace_escrow_contract_id ?? null;
+  const nativeSacId = process.env.SMOKE_NATIVE_SAC_ADDRESS ?? deploymentMeta.native_xlm_sac_address ?? null;
+
   console.log(`[smoke] backend    ${BASE} (deployment '${health.deployment}', contract ${expectedContract})`);
+  if (escrowContractId) console.log(`[smoke] escrow     ${escrowContractId}`);
   console.log(`[smoke] agent      ${agent.keypair.publicKey()}`);
   console.log(`[smoke] challenger ${challenger.keypair.publicKey()}`);
   if (rogue) console.log(`[smoke] rogue      ${rogue.keypair.publicKey()}`);
@@ -508,7 +702,7 @@ async function main() {
     if (only.length > 0 && !only.includes(name)) continue;
     console.log(`\n[smoke] scenario: ${name}`);
     try {
-      const finish = await run({ agent, challenger, rogue });
+      const finish = await run({ agent, challenger, rogue, escrowContractId, nativeSacId });
       if (finish) {
         waiting.push({ name, finish });
         continue;

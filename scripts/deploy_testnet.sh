@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Deploys a fresh EscrowGate and ZKVerifierRegistry to Stellar testnet and
-# records them in deployments/<name>.json. Each contract is deployed and
-# configured in one transaction (constructor args), so there is never a
-# deployed-but-unclaimed contract somebody else could initialise.
+# Deploys a fresh EscrowGate, ExampleMarketplaceEscrow, and ZKVerifierRegistry
+# to Stellar testnet and records them in deployments/<name>.json. Each contract
+# is deployed and configured in one transaction (constructor args), so there is
+# never a deployed-but-unclaimed contract somebody else could initialise.
 #
 # This always creates NEW contracts — EscrowGate has no upgrade entrypoint —
 # so it refuses to replace an existing deployment record unless --force is
@@ -98,6 +98,7 @@ stellar contract build
 
 WASM_DIR="$CONTRACTS_DIR/target/wasm32v1-none/release"
 GATE_WASM="$WASM_DIR/escrow_gate.wasm"
+ESCROW_WASM="$WASM_DIR/example_marketplace_escrow.wasm"
 REGISTRY_WASM="$WASM_DIR/zk_verifier_registry.wasm"
 
 RECOVERY_FILE="$(mktemp "${TMPDIR:-/tmp}/verity-$DEPLOYMENT-deploy.XXXXXX")"
@@ -127,6 +128,17 @@ GATE_ID=$(stellar contract deploy \
   --config "$GATE_CONFIG")
 echo "EscrowGate contract id: $GATE_ID"
 echo "escrow_gate_contract_id=$GATE_ID" >> "$RECOVERY_FILE"
+
+echo "==> Deploying ExampleMarketplaceEscrow"
+ESCROW_ID=$(stellar contract deploy \
+  --wasm "$ESCROW_WASM" \
+  --source "$DEPLOYER" \
+  --network "$NETWORK" \
+  -- \
+  --gate "$GATE_ID" \
+  --asset "$NATIVE_SAC")
+echo "ExampleMarketplaceEscrow contract id: $ESCROW_ID"
+echo "example_marketplace_escrow_contract_id=$ESCROW_ID" >> "$RECOVERY_FILE"
 
 # EscrowGate does not consult the registry in Phase 1 (resolve_challenge
 # rejects ZkProof); it is deployed as the anchor Phase 2 verifiers register in.
@@ -173,6 +185,7 @@ cat > "$DEPLOY_JSON.tmp" <<EOF
   "network": "$NETWORK",
   "network_passphrase": "$NETWORK_PASSPHRASE",
   "escrow_gate_contract_id": "$GATE_ID",
+  "example_marketplace_escrow_contract_id": "$ESCROW_ID",
   "zk_verifier_registry_contract_id": "$REGISTRY_ID",
   "native_xlm_sac_address": "$NATIVE_SAC",
   "deployer_public_key": "$DEPLOYER_ADDR",

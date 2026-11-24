@@ -136,11 +136,17 @@ export async function submissionsRoutes(app: FastifyInstance) {
     // Build and simulate: assertSimulated checks that simulation succeeded
     // so a submission the contract would reject (bond too low, etc.)
     // fails before creating a draft row.
+    const resolveEscrowRef = (raw: string): Buffer => {
+      if (/^(0x)?[0-9a-fA-F]{64}$/.test(raw)) {
+        return bufFromHex(raw.startsWith("0x") ? raw.slice(2) : raw);
+      }
+      return sha256Bytes(raw);
+    };
     const client = escrowGateFor(agent);
     const assembled = await buildWithAccountCheck(() =>
       client.submit({
         agent,
-        escrow_ref: sha256Bytes(body.escrow_ref),
+        escrow_ref: resolveEscrowRef(body.escrow_ref),
         escrow_value: BigInt(body.escrow_value),
         task_type: toChainTaskType(body.task_type),
         input_hash: bufFromHex(body.input_hash),
