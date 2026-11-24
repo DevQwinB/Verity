@@ -1,8 +1,9 @@
 import { cache } from "react";
+import { createHash } from "node:crypto";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound, unstable_rethrow } from "next/navigation";
-import { backendGetOrNull } from "../../../lib/server-api";
+import { backendGetImmutable, backendGetOrNull } from "../../../lib/server-api";
 import type { Artifact, Attestation, SubmissionDetail, ProofStatus } from "../../../lib/types";
 import { Card, CardBody, CardHeader } from "../../../components/ui/card";
 import { Badge } from "../../../components/ui/badge";
@@ -40,12 +41,18 @@ export async function generateMetadata({
 const linkClass = "text-accent underline-offset-2 hover:underline";
 
 /** The stored artifact behind a storage_ref, decoded for display. Null when
- * there is none or it cannot be read. */
+ * there is none or it cannot be read. Throws if sha256 does not match. */
 async function loadArtifact(ref: string | null): Promise<string | null> {
   const hash = ref?.split(/[\\/]/).pop();
   if (!hash || !/^[0-9a-f]{64}$/.test(hash)) return null;
-  const artifact = await backendGetOrNull<Artifact>(`/v1/artifacts/${hash}`);
-  return artifact ? Buffer.from(artifact.content_base64, "base64").toString("utf8") : null;
+  const artifact = await backendGetImmutable<Artifact>(`/v1/artifacts/${hash}`);
+  if (!artifact) return null;
+  const buf = Buffer.from(artifact.content_base64, "base64");
+  const actualHash = createHash("sha256").update(buf).digest("hex");
+  if (actualHash !== hash) {
+    throw new Error(`Artifact hash mismatch: expected ${hash}, got ${actualHash}`);
+  }
+  return buf.toString("utf8");
 }
 
 type Loaded<T> = { ok: true; value: T } | { ok: false };
@@ -75,7 +82,7 @@ export default async function SubmissionDetailPage({
   const isDraft = submission.chain_submission_id === null;
 
   const [proof, attestation, inputText, functionText, outputText] = await Promise.all([
-    settle(`/v1/submissions/${id}/proof`, backendGetOrNull<ProofStatus>(`/v1/submissions/${id}/proof`)),
+    settle(`/v1/submissions/${id}/proof`, backendGetImmutable<ProofStatus>(`/v1/submissions/${id}/proof`)),
     settle(
       `/v1/submissions/${id}/attestation`,
       detail.has_attestation
@@ -441,6 +448,8 @@ function Fact({ label, children }: { label: string; children: React.ReactNode })
   );
 }
 
+const PREVIEW_CHAR_LIMIT = 4096;
+
 function ArtifactBlock({
   label,
   hash,
@@ -452,6 +461,9 @@ function ArtifactBlock({
   text: string | null;
   failed?: boolean;
 }) {
+  const isTruncated = text !== null && text.length > PREVIEW_CHAR_LIMIT;
+  const preview = isTruncated ? text.slice(0, PREVIEW_CHAR_LIMIT) : text;
+
   return (
     <div>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -462,6 +474,20 @@ function ArtifactBlock({
         <p className="mt-2 text-sm text-text-tertiary">Could not be loaded right now.</p>
       ) : text === null ? (
         <p className="mt-2 text-sm text-text-tertiary">Not stored on this deployment.</p>
+      ) : isTruncated ? (
+        <div className="mt-2 space-y-2">
+          <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border-subtle bg-surface p-3 font-mono text-xs leading-relaxed">
+            {preview}
+          </pre>
+          <details className="text-xs text-text-secondary">
+            <summary className="cursor-pointer text-accent underline-offset-2 hover:underline">
+              Show all ({Math.round(text.length / 1024)} KB)
+            </summary>
+            <pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border-subtle bg-surface p-3 font-mono text-xs leading-relaxed">
+              {text}
+            </pre>
+          </details>
+        </div>
       ) : (
         <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border-subtle bg-surface p-3 font-mono text-xs leading-relaxed">
           {text}
