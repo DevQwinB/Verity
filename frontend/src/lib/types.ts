@@ -65,6 +65,8 @@ export interface SpotCheck {
   id: string;
   submission_id: string;
   reexecutor_id: string;
+  assignment_seed?: string | null;
+  candidate_accounts?: string[] | null;
   sampled_at: string;
   result: SpotCheckResult | null;
   evidence: unknown;

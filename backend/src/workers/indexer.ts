@@ -86,12 +86,25 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           .executeTakeFirst();
       }
       if (row) {
+        let ledgerHash: string | null = null;
+        try {
+          const ledgersRes = await server.getLedgers({ startLedger: ledger, pagination: { limit: 1 } });
+          const ledgerEntry = ledgersRes.ledgers?.[0];
+          if (ledgerEntry && ledgerEntry.sequence === ledger) {
+            ledgerHash = ledgerEntry.hash;
+          }
+        } catch (err) {
+          // getLedgers error or transient RPC failure: rethrow so the event is retried
+          throw err;
+        }
+
         const sub = await readSubmission(chainSubmissionId);
         await db
           .updateTable("submission")
           .set({
             chain_submission_id: chainSubmissionId,
             chain_tx_hash: txHash,
+            assignment_entropy: ledgerHash ?? row.assignment_entropy,
             escrow_value: v.escrow_value.toString(),
             min_challenger_bond: sub ? minChallengerBond(sub).toString() : row.min_challenger_bond,
             challenge_window_s: sub ? Number(sub.challenge_window_s) : row.challenge_window_s,
@@ -106,6 +119,7 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           submissionId: row.id,
           chainSubmissionId,
           taskType: row.task_type,
+          assignmentEntropy: ledgerHash ?? row.assignment_entropy,
         });
       }
       break;
