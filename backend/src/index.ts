@@ -1,10 +1,22 @@
 import { buildApp } from "./app.js";
 import { env } from "./config/env.js";
 import { db } from "./db.js";
+import { checkNetwork, server } from "./chain/rpc.js";
 import { startIndexer } from "./workers/indexer.js";
 import { startScheduler } from "./workers/scheduler.js";
 
 async function main() {
+  try {
+    const net = await server.getNetwork();
+    const networkErr = checkNetwork(env.NETWORK_PASSPHRASE, net.passphrase);
+    if (networkErr) {
+      console.error(networkErr);
+      process.exit(1);
+    }
+  } catch (err) {
+    console.warn("[startup] warning: could not reach SOROBAN_RPC_URL to verify network passphrase:", err);
+  }
+
   const app = buildApp();
   await app.listen({ port: env.PORT, host: "0.0.0.0" });
 
