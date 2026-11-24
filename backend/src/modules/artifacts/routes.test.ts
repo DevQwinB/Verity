@@ -29,7 +29,7 @@ const { artifactBodyLimit } = await import("./routes.js");
 const { buildApp } = await import("../../app.js");
 const { issueJwt } = await import("../../auth/sep10.js");
 
-const app = buildApp();
+const app = await buildApp();
 app.log.level = "silent";
 after(() => app.close());
 

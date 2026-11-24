@@ -16,7 +16,10 @@ export function artifactBodyLimit(maxBytes: number): number {
 }
 
 export async function artifactsRoutes(app: FastifyInstance) {
-  // Stricter than the global limit: each upload can write up to ARTIFACT_MAX_BYTES to disk.
+  // Stricter than the global limit: each upload can write up to ARTIFACT_MAX_BYTES
+  // to disk. The limit applies per account and per client address, so rotating
+  // tokens while keeping the same address cannot buy more uploads.
+  //
   // The body limit follows ARTIFACT_MAX_BYTES and not the app-wide 1 MiB. Under that one,
   // base64 capped an artifact at about 786 KB whatever the setting said, and a larger one
   // was refused before the check below could name the real limit.
