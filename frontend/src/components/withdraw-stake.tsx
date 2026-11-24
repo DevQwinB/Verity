@@ -6,8 +6,8 @@ import { useWallet } from "./wallet-provider";
 import { Button } from "./ui/button";
 import { LiveStatus } from "./live-status";
 import { buildStakeWithdrawal, relayReexecutorStake } from "../lib/client-api";
-import { signXdr } from "../lib/wallet";
-import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../lib/config";
+import { assertWalletNetwork, signXdr, WalletError, wrongNetworkMessage } from "../lib/wallet";
+import { TESTNET_EXPLORER_TX } from "../lib/config";
 import { stroopsToXlm, xlmToStroops } from "../lib/format";
 
 /** Lets a re-executor take stake back out. Renders nothing unless the
@@ -17,22 +17,32 @@ export function WithdrawStake({
   account,
   stakeStroops,
   floorStroops,
+  networkPassphrase,
 }: {
   reexecutorId: string;
   account: string;
   stakeStroops: string;
   floorStroops: string;
+  networkPassphrase: string;
 }) {
   const router = useRouter();
   const wallet = useWallet();
   const [amountXlm, setAmountXlm] = useState("");
-  const [busy, setBusy] = useState<null | "building" | "signing" | "relaying">(null);
+  const [busy, setBusy] = useState<null | "checking" | "building" | "signing" | "relaying">(null);
   const [error, setError] = useState<string | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
 
   if (wallet.account !== account || BigInt(stakeStroops) === BigInt(0)) return null;
 
+  const wrongNetworkNotice = !wallet.networkOk
+    ? wallet.problem?.code === "wrong-network"
+      ? wallet.problem.message
+      : wrongNetworkMessage()
+    : null;
+  const displayError = wrongNetworkNotice ?? error;
+
   async function handleWithdraw() {
+    if (!wallet.networkOk) return;
     setError(null);
     setTxHash(null);
     const amount = xlmToStroops(amountXlm);
@@ -45,16 +55,22 @@ export function WithdrawStake({
       return;
     }
     try {
+      setBusy("checking");
+      await assertWalletNetwork(networkPassphrase);
       setBusy("building");
       const { unsigned_transaction_xdr } = await buildStakeWithdrawal(reexecutorId, amount.toString());
       setBusy("signing");
-      const signed = await signXdr(unsigned_transaction_xdr, { networkPassphrase: NETWORK_PASSPHRASE, address: account });
+      const signed = await signXdr(unsigned_transaction_xdr, { networkPassphrase, address: account });
       setBusy("relaying");
       const { tx_hash } = await relayReexecutorStake(reexecutorId, signed);
       setTxHash(tx_hash);
       setAmountXlm("");
       router.refresh();
     } catch (err) {
+      if (err instanceof WalletError && err.code === "wrong-network") {
+        wallet.reportWrongNetwork(err.message);
+        return;
+      }
       setError(err instanceof Error ? err.message : "The withdrawal could not be completed.");
     } finally {
       setBusy(null);
@@ -62,13 +78,15 @@ export function WithdrawStake({
   }
 
   const stepLabel =
-    busy === "building"
-      ? "Building transaction..."
-      : busy === "signing"
-        ? "Awaiting signature in Freighter..."
-        : busy === "relaying"
-          ? "Submitting to testnet..."
-          : "Withdraw stake";
+    busy === "checking"
+      ? "Checking Freighter..."
+      : busy === "building"
+        ? "Building transaction..."
+        : busy === "signing"
+          ? "Awaiting signature in Freighter..."
+          : busy === "relaying"
+            ? "Submitting to testnet..."
+            : "Withdraw stake";
 
   return (
     <div className="space-y-3">
@@ -95,15 +113,15 @@ export function WithdrawStake({
         <Button
           variant="secondary"
           onClick={handleWithdraw}
-          disabled={busy !== null}
+          disabled={busy !== null || !wallet.networkOk}
           aria-busy={busy !== null}
         >
           {stepLabel}
         </Button>
       </div>
-      {error && (
+      {displayError && (
         <p role="alert" className="text-sm text-status-slashed">
-          {error}
+          {displayError}
         </p>
       )}
       {txHash && (

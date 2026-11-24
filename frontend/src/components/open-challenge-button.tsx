@@ -6,8 +6,8 @@ import { useWallet } from "./wallet-provider";
 import { Button } from "./ui/button";
 import { LiveStatus } from "./live-status";
 import { openChallenge, relayChallenge } from "../lib/client-api";
-import { signXdr } from "../lib/wallet";
-import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../lib/config";
+import { assertWalletNetwork, signXdr, WalletError, wrongNetworkMessage } from "../lib/wallet";
+import { TESTNET_EXPLORER_TX } from "../lib/config";
 import { stroopsToXlm, xlmToStroops } from "../lib/format";
 
 const POLL_EVERY_MS = 3000;
@@ -22,20 +22,29 @@ export function OpenChallengeButton({
   submissionId,
   deadlineIso,
   minBondStroops,
+  networkPassphrase,
 }: {
   submissionId: string;
   deadlineIso: string;
   /** The contract's floor for this submission; null if not mirrored yet. */
   minBondStroops: string | null;
+  networkPassphrase: string;
 }) {
   const router = useRouter();
-  const { account, connecting, login } = useWallet();
+  const { account, connecting, networkOk, problem, login, reportWrongNetwork } = useWallet();
   const [bondXlm, setBondXlm] = useState(minBondStroops ? stroopsToXlm(minBondStroops) : "");
-  const [busy, setBusy] = useState<null | "building" | "signing" | "relaying">(null);
+  const [busy, setBusy] = useState<null | "checking" | "building" | "signing" | "relaying">(null);
   const [error, setError] = useState<string | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
   const [stalled, setStalled] = useState(false);
   const [windowOpen, setWindowOpen] = useState(() => Date.now() < new Date(deadlineIso).getTime());
+
+  const wrongNetworkNotice = !networkOk
+    ? problem?.code === "wrong-network"
+      ? problem.message
+      : wrongNetworkMessage()
+    : null;
+  const displayError = wrongNetworkNotice ?? error;
 
   useEffect(() => {
     const id = setInterval(() => setWindowOpen(Date.now() < new Date(deadlineIso).getTime()), 1000);
@@ -61,7 +70,7 @@ export function OpenChallengeButton({
   }, [txHash, router]);
 
   async function handleChallenge() {
-    if (!account) return;
+    if (!account || !networkOk) return;
     setError(null);
     const bond = xlmToStroops(bondXlm);
     if (bond === null) {
@@ -73,11 +82,13 @@ export function OpenChallengeButton({
       return;
     }
     try {
+      setBusy("checking");
+      await assertWalletNetwork(networkPassphrase);
       setBusy("building");
       const { unsigned_transaction_xdr } = await openChallenge(submissionId, bond.toString());
       setBusy("signing");
       const signed = await signXdr(unsigned_transaction_xdr, {
-        networkPassphrase: NETWORK_PASSPHRASE,
+        networkPassphrase,
         address: account,
       });
       setBusy("relaying");
@@ -85,6 +96,10 @@ export function OpenChallengeButton({
       setStalled(false);
       setTxHash(tx_hash);
     } catch (err) {
+      if (err instanceof WalletError && err.code === "wrong-network") {
+        reportWrongNetwork(err.message);
+        return;
+      }
       setError(err instanceof Error ? err.message : "The challenge could not be opened.");
     } finally {
       setBusy(null);
@@ -122,23 +137,22 @@ export function OpenChallengeButton({
 
   if (!account) {
     return (
-      <>
-        <LiveStatus message={connecting ? "Connecting..." : ""} />
-        <Button variant="secondary" onClick={login} disabled={connecting} aria-busy={connecting}>
-          {connecting ? "Connecting..." : "Connect wallet to open a challenge"}
-        </Button>
-      </>
+      <Button variant="secondary" onClick={login} disabled={connecting} aria-busy={connecting}>
+        {connecting ? "Connecting..." : "Connect wallet to open a challenge"}
+      </Button>
     );
   }
 
   const stepLabel =
-    busy === "building"
-      ? "Building transaction..."
-      : busy === "signing"
-        ? "Awaiting signature in Freighter..."
-        : busy === "relaying"
-          ? "Submitting to testnet..."
-          : "Open challenge";
+    busy === "checking"
+      ? "Checking Freighter..."
+      : busy === "building"
+        ? "Building transaction..."
+        : busy === "signing"
+          ? "Awaiting signature in Freighter..."
+          : busy === "relaying"
+            ? "Submitting to testnet..."
+            : "Open challenge";
 
   return (
     <div className="space-y-3">
@@ -165,7 +179,7 @@ export function OpenChallengeButton({
         <Button
           variant="danger"
           onClick={handleChallenge}
-          disabled={busy !== null}
+          disabled={busy !== null || !networkOk}
           aria-busy={busy !== null}
         >
           {stepLabel}
@@ -176,9 +190,9 @@ export function OpenChallengeButton({
           ? `Minimum ${stroopsToXlm(minBondStroops)} XLM for this submission, set by the contract.`
           : "The contract sets a minimum in proportion to the escrow value."}
       </p>
-      {error && (
+      {displayError && (
         <p role="alert" className="text-sm text-status-slashed">
-          {error}
+          {displayError}
         </p>
       )}
     </div>

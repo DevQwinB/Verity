@@ -7,40 +7,62 @@ import { Card, CardBody, CardHeader } from "../../../components/ui/card";
 import { Button, buttonClasses } from "../../../components/ui/button";
 import { LiveStatus } from "../../../components/live-status";
 import { registerReexecutor, relayReexecutorStake } from "../../../lib/client-api";
-import { signXdr } from "../../../lib/wallet";
-import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../../../lib/config";
+import { assertWalletNetwork, signXdr, WalletError, wrongNetworkMessage } from "../../../lib/wallet";
+import { TESTNET_EXPLORER_TX } from "../../../lib/config";
 import { stroopsToXlm, xlmToStroops } from "../../../lib/format";
 import type { GateConfig } from "../../../lib/types";
 
-type Status = "idle" | "building" | "signing" | "relaying" | "done" | "error";
+type Status = "idle" | "checking" | "building" | "signing" | "relaying" | "done" | "error";
 
 /** `config` is the contract's live rule set: the stake floor, the slash
  * rate, and whether voting needs the admin's approval. */
 export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
-  const { account, connecting, login } = useWallet();
+  const { account, connecting, networkOk, problem, login, reportWrongNetwork } = useWallet();
   // Twice the floor by default: a single slash then leaves the account active.
   const [stakeXlm, setStakeXlm] = useState(stroopsToXlm((BigInt(config.min_stake_floor) * BigInt(2)).toString()));
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<{ id: string; txHash: string; stake: bigint } | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const floor = BigInt(config.min_stake_floor);
   const floorXlm = stroopsToXlm(config.min_stake_floor);
   const stake = xlmToStroops(stakeXlm);
   const belowFloor = stake !== null && stake < floor;
+  const wrongNetworkNotice = !networkOk
+    ? problem?.code === "wrong-network"
+      ? problem.message
+      : wrongNetworkMessage()
+    : null;
+  const displayError = wrongNetworkNotice ?? error;
 
-  const busy = status === "building" || status === "signing" || status === "relaying";
+  const workerCommand = `git clone https://github.com/DevQwinB/Verity && cd Verity && pnpm install
+BACKEND_URL=${config.public_api_url} \\
+NETWORK_PASSPHRASE="${config.network_passphrase}" \\
+ESCROW_GATE_CONTRACT_ID=${config.escrow_gate_contract_id} \\
+REEXECUTOR_SECRET_KEY=<secret of the account you staked with> \\
+pnpm --filter @verity/reexecutor-agent start`;
+
+  function handleCopy() {
+    navigator.clipboard.writeText(workerCommand);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  const busy = status === "checking" || status === "building" || status === "signing" || status === "relaying";
   const stepLabel =
-    status === "building"
-      ? "Building transaction..."
-      : status === "signing"
-        ? "Awaiting signature in Freighter..."
-        : status === "relaying"
-          ? "Submitting to testnet..."
-          : "Stake and register";
+    status === "checking"
+      ? "Checking Freighter..."
+      : status === "building"
+        ? "Building transaction..."
+        : status === "signing"
+          ? "Awaiting signature in Freighter..."
+          : status === "relaying"
+            ? "Submitting to testnet..."
+            : "Stake and register";
 
   async function handleRegister() {
-    if (!account) return;
+    if (!account || !networkOk) return;
     setError(null);
     if (stake === null) {
       setError("Enter the stake as a positive XLM amount, for example 1000.");
@@ -48,12 +70,15 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
       return;
     }
     try {
+      setStatus("checking");
+      await assertWalletNetwork(config.network_passphrase);
+
       setStatus("building");
       const { reexecutor, unsigned_transaction_xdr } = await registerReexecutor(stake.toString());
 
       setStatus("signing");
       const signed = await signXdr(unsigned_transaction_xdr, {
-        networkPassphrase: NETWORK_PASSPHRASE,
+        networkPassphrase: config.network_passphrase,
         address: account,
       });
 
@@ -62,6 +87,11 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
       setResult({ id: reexecutor.id, txHash: tx_hash, stake });
       setStatus("done");
     } catch (err) {
+      if (err instanceof WalletError && err.code === "wrong-network") {
+        reportWrongNetwork(err.message);
+        setStatus("idle");
+        return;
+      }
       setError(err instanceof Error ? err.message : "Registration failed.");
       setStatus("error");
     }
@@ -100,10 +130,7 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
             )}
             <li>
               Staking alone does nothing. Work is only assigned to an account whose worker is
-              running and polling. Start one with your own key:{" "}
-              <code className="rounded-md bg-surface px-1.5 py-0.5 font-mono text-xs text-text-primary">
-                pnpm --filter @verity/reexecutor-agent start
-              </code>
+              running and polling. See the worker setup instructions below.
             </li>
             <li>
               A vote that a bonded consensus proves wrong costs {config.reexecutor_slash_bps / 100}% of
@@ -118,7 +145,7 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
           <h2 className="font-medium">Stake</h2>
         </CardHeader>
         <CardBody className="space-y-4">
-          <LiveStatus message={busy ? stepLabel : connecting ? "Connecting..." : ""} />
+          <LiveStatus message={busy ? stepLabel : ""} />
           {status === "done" && result ? (
             <div className="space-y-3 text-sm" role="status">
               <p className="text-status-verified">
@@ -166,14 +193,14 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
                 </p>
               </div>
 
-              {error && (
+              {displayError && (
                 <p role="alert" className="text-sm text-status-slashed">
-                  {error}
+                  {displayError}
                 </p>
               )}
 
               {account ? (
-                <Button onClick={handleRegister} disabled={busy} aria-busy={busy}>
+                <Button onClick={handleRegister} disabled={busy || !networkOk} aria-busy={busy}>
                   {stepLabel}
                 </Button>
               ) : (
@@ -183,6 +210,48 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
               )}
             </>
           )}
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <h2 className="font-medium">Worker setup</h2>
+        </CardHeader>
+        <CardBody className="space-y-3">
+          <p className="text-sm text-text-secondary">
+            Work is only assigned to accounts whose worker is actively running and polling. Start one with this deployment&apos;s settings:
+          </p>
+          <div className="relative">
+            <pre className="overflow-x-auto rounded-lg border border-border-strong bg-surface p-4 font-mono text-xs text-text-primary">
+              {workerCommand}
+            </pre>
+            <button
+              type="button"
+              onClick={handleCopy}
+              className="absolute right-3 top-3 rounded-md border border-border-strong bg-surface-muted px-2.5 py-1 text-xs font-medium text-text-secondary transition-colors hover:bg-surface hover:text-text-primary"
+            >
+              {copied ? "Copied!" : "Copy"}
+            </button>
+          </div>
+          <p className="text-xs text-status-pending">
+            Warning: Never paste your secret key into this website — only provide it directly in your own shell or a .env file.
+          </p>
+          <p className="text-xs text-text-tertiary">
+            See{" "}
+            <a
+              href="https://github.com/DevQwinB/Verity/blob/main/reexecutor-agent/.env.example"
+              target="_blank"
+              rel="noreferrer"
+              className="text-accent underline-offset-2 hover:underline"
+            >
+              reexecutor-agent/.env.example
+            </a>{" "}
+            for all configuration options, or run using Docker with{" "}
+            <code className="rounded bg-surface px-1 py-0.5 font-mono text-xs text-text-primary">
+              reexecutor-agent/Dockerfile
+            </code>
+            .
+          </p>
         </CardBody>
       </Card>
     </div>
