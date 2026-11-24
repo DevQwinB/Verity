@@ -72,10 +72,11 @@ tops it up.
 
 ## 3. Start it
 
-> **Note on docker-compose.yml:** The container images build and the full stack
-> has been run from them with services started one by one, but `docker-compose.yml`
-> itself has not been executed end-to-end as the development environment lacked a
-> compose provider.
+> **Note on docker-compose.yml:** The container images build and CI starts
+> the full stack (`compose-up` job: Postgres, migrations, backend, and dashboard),
+> verifying that migrations complete, the backend answers `/health/live` and
+> database checks, and the frontend serves HTTP 200. The full stack with
+> re-executors has also been validated against testnet with the smoke test.
 
 ```bash
 docker compose --profile fleet up -d --build

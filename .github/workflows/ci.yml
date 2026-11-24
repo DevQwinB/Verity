@@ -122,3 +122,72 @@ jobs:
         run: docker compose config -q
       - name: Validate fleet profile compose config
         run: docker compose --profile fleet config -q
+
+  compose-up:
+    name: Docker Compose stack startup
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Configure and start compose stack
+        run: |
+          set -euo pipefail
+          ESCROW_GATE=$(jq -r .escrow_gate_contract_id deployments/testnet.json)
+          ZK_REGISTRY=$(jq -r .zk_verifier_registry_contract_id deployments/testnet.json)
+          BOND_ASSET=$(jq -r .native_xlm_sac_address deployments/testnet.json)
+          POSTGRES_PW="test-pw-$(openssl rand -hex 12)"
+          KEEPER_KEY=$(node -e "import('@stellar/stellar-sdk').then(({Keypair})=>console.log(Keypair.random().secret()))")
+          SEP10_KEY=$(node -e "import('@stellar/stellar-sdk').then(({Keypair})=>console.log(Keypair.random().secret()))")
+          JWT_SEC=$(openssl rand -hex 32)
+
+          cat <<EOF > .env
+          ESCROW_GATE_CONTRACT_ID=${ESCROW_GATE}
+          ZK_VERIFIER_REGISTRY_CONTRACT_ID=${ZK_REGISTRY}
+          BOND_ASSET_CONTRACT_ID=${BOND_ASSET}
+          POSTGRES_PASSWORD=${POSTGRES_PW}
+          KEEPER_SECRET_KEY=${KEEPER_KEY}
+          SEP10_SIGNING_SECRET=${SEP10_KEY}
+          JWT_SECRET=${JWT_SEC}
+          WEB_AUTH_DOMAIN=127.0.0.1:3001
+          HOME_DOMAIN=127.0.0.1
+          DEPLOYMENT_NAME=testnet
+          EOF
+
+          docker compose up -d --build --wait postgres backend frontend
+      - name: Verify services health and migration
+        run: |
+          set -euo pipefail
+          # Confirm migrate exited with 0
+          MIGRATE_EXIT=$(docker compose ps -a migrate --format '{{.ExitCode}}')
+          if [ "${MIGRATE_EXIT}" != "0" ]; then
+            echo "migrate container did not exit with code 0 (got ${MIGRATE_EXIT})"
+            exit 1
+          fi
+
+          # Verify backend /health/live and frontend /
+          curl -fsS http://127.0.0.1:3001/health/live
+          curl -fsS http://127.0.0.1:3000/ > /dev/null
+
+          # Query /health; verify database check is healthy
+          HEALTH_JSON=$(curl -fsS http://127.0.0.1:3001/health || true)
+          echo "Health response: ${HEALTH_JSON}"
+          if [ -n "${HEALTH_JSON}" ]; then
+            DB_OK=$(echo "${HEALTH_JSON}" | jq -r '.checks.database // empty')
+            if [ "${DB_OK}" != "true" ]; then
+              echo "Database health check failed: ${DB_OK}"
+              exit 1
+            fi
+          fi
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -v

@@ -685,11 +685,12 @@ full tally.
 - **False-accept rate** needs a manual audit sample and is reported as `null`.
 - **One backend instance** runs the indexer and keeper; artifacts are on its
   local disk; webhooks are delivered once with no retry.
-- **Containers.** The three images build, and the full stack has been run
-  from them (Postgres, migrations, backend, three re-executors, dashboard)
-  and passed the smoke test, using podman with the services started one by
-  one. `docker-compose.yml` describes the same services but has not itself
-  been executed: the machine this was developed on has no compose provider.
+- **Containers.** The three images build, and CI starts the full stack from
+  `docker-compose.yml` (`compose-up` job: Postgres, migrations, backend,
+  and dashboard), verifying that migrations complete successfully with exit 0,
+  the backend answers `/health/live` (and database check on `/health`), and the
+  dashboard serves HTTP 200. The full stack with re-executors has also been
+  exercised end-to-end with the smoke test.
 
 ## License
 
