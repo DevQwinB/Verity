@@ -10,6 +10,10 @@ import { hasConnectivity, RetrievalTransientError, runRetrieval } from "./sandbo
 import { assertSep10Challenge } from "./sep10.js";
 import { NO_OUTPUT_HASH, voteMatches } from "./vote.js";
 import { startHeartbeat } from "./heartbeat.js";
+import { setTimeout as sleep } from "node:timers/promises";
+
+export const stopping = new AbortController();
+let currentProcessingPromise: Promise<void> | null = null;
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:3001";
 const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
@@ -267,6 +271,7 @@ function pruneToListed(listed: ReadonlySet<string>) {
 }
 
 async function pollOnce(reexecutorId: string) {
+  if (stopping.signal.aborted) return;
   const { replay_assignments, spot_check_assignments } = await api<{
     replay_assignments: Assignment[];
     spot_check_assignments: Assignment[];
@@ -279,10 +284,17 @@ async function pollOnce(reexecutorId: string) {
   // voting is blocked.
   if (Date.now() < votingBlockedUntil) return;
   for (const assignment of [...replay_assignments, ...spot_check_assignments]) {
+    if (stopping.signal.aborted) {
+      console.log(`${tag} shutdown requested, skipping assignment #${assignment.chain_submission_id}`);
+      break;
+    }
     try {
-      await processAssignment(assignment);
+      currentProcessingPromise = processAssignment(assignment);
+      await currentProcessingPromise;
     } catch (err) {
       console.error(`${tag}   assignment #${assignment.chain_submission_id} failed, will retry:`, (err as Error).message);
+    } finally {
+      currentProcessingPromise = null;
     }
   }
 }
@@ -312,23 +324,54 @@ async function main() {
   // A replay can run for minutes; the assignment poll cannot, so liveness
   // is reported on its own timer. A backend that predates the endpoint
   // answers 404 and the poll keeps the worker online as before.
-  startHeartbeat(
+  const heartbeat = startHeartbeat(
     () => api<unknown>(`/v1/reexecutors/${reexecutor.id}/heartbeat`, { method: "POST" }).then(() => {}),
     HEARTBEAT_MS,
     (err) => console.warn(`${tag} heartbeat failed (the assignment poll still reports liveness):`, err.message)
   );
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
+
+  let signalCount = 0;
+  const onSignal = (signal: string) => {
+    signalCount++;
+    if (signalCount > 1) {
+      console.log(`[reexecutor-agent] second ${signal} received, exiting immediately`);
+      process.exit(130);
+    }
+    console.log(`[reexecutor-agent] ${signal} received, shutting down gracefully (max 25s)`);
+    stopping.abort();
+  };
+
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
+  process.on("SIGINT", () => onSignal("SIGINT"));
+
+  while (!stopping.signal.aborted) {
     try {
       await pollOnce(reexecutor.id);
     } catch (err) {
       console.error(`${tag} poll failed, will retry:`, (err as Error).message);
     }
-    await new Promise((r) => setTimeout(r, POLL_MS));
+    if (stopping.signal.aborted) break;
+    try {
+      await sleep(POLL_MS, undefined, { signal: stopping.signal });
+    } catch (err) {
+      if ((err as Error).name === "AbortError") break;
+      throw err;
+    }
   }
+
+  heartbeat.stop();
+  if (currentProcessingPromise) {
+    console.log("[reexecutor-agent] waiting for in-flight assignment to complete (up to 25s)...");
+    const timeout = new Promise<void>((resolve) => setTimeout(resolve, 25_000));
+    await Promise.race([currentProcessingPromise, timeout]);
+  }
+  console.log("[reexecutor-agent] stopped");
+  process.exit(0);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (process.env.NODE_ENV !== "test") {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

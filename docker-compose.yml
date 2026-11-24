@@ -19,6 +19,7 @@ x-reexecutor: &reexecutor
     dockerfile: reexecutor-agent/Dockerfile
   restart: unless-stopped
   profiles: [fleet]
+  stop_grace_period: 30s
   depends_on:
     backend:
       condition: service_healthy
