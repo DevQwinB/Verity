@@ -15,6 +15,44 @@ import { dispatchWebhook } from "../modules/webhooks/dispatcher.js";
 import { recordTerminalVerdict } from "../modules/submissions/verdict.js";
 import { isTransientError } from "./transient.js";
 
+let serverInstance = server;
+let finalizeOnChainFn = finalizeOnChain;
+let readSubmissionFn = readSubmission;
+
+export function setServerForTesting(s: typeof server) {
+  serverInstance = s;
+}
+
+export function resetServerForTesting() {
+  serverInstance = server;
+}
+
+export function setFinalizeOnChainForTesting(fn: typeof finalizeOnChain) {
+  finalizeOnChainFn = fn;
+}
+
+export function resetFinalizeOnChainForTesting() {
+  finalizeOnChainFn = finalizeOnChain;
+}
+
+export function setReadSubmissionForTesting(fn: typeof readSubmission) {
+  readSubmissionFn = fn;
+}
+
+export function resetReadSubmissionForTesting() {
+  readSubmissionFn = readSubmission;
+}
+
+const inFlightFinalizes = new Set<Promise<void>>();
+
+export function inFlightFinalizeCount(): number {
+  return inFlightFinalizes.size;
+}
+
+export function waitForInFlightFinalizes(): Promise<void> {
+  return Promise.allSettled(Array.from(inFlightFinalizes)).then(() => {});
+}
+
 const CONTRACT_ID = env.ESCROW_GATE_CONTRACT_ID;
 
 const PAGE_SIZE = 100;
@@ -33,7 +71,7 @@ async function getCursor(): Promise<Cursor> {
     .where("contract_id", "=", CONTRACT_ID)
     .executeTakeFirst();
   if (row) return { pagingToken: row.last_paging_token, ledger: Number(row.last_ledger) };
-  const latest = await server.getLatestLedger();
+  const latest = await serverInstance.getLatestLedger();
   const start = Math.max(latest.sequence - 100, 1);
   await db
     .insertInto("chain_cursor")
@@ -60,7 +98,7 @@ function ledgerOfPagingToken(token: string): number {
 /** Idempotent by construction: every handler upserts on a unique key derived
  * from on-chain identity (chain_submission_id, (submission,reexecutor) pair,
  * etc.), so replaying the same event twice (e.g. after a restart) is safe. */
-async function handleEvent(topic: unknown[], value: unknown, ledger: number, txHash: string) {
+export async function handleEvent(topic: unknown[], value: unknown, ledger: number, txHash: string) {
   const kind = topic[0] as string;
 
   switch (kind) {
@@ -249,12 +287,20 @@ async function handleEvent(topic: unknown[], value: unknown, ledger: number, txH
           await escalateToFullReplay(sub.id);
           await escalateAgentPendingSubmissions(sub.agent_id, sub.id);
         }
-        // Opportunistic: the vote above is already recorded, and the
-        // scheduler retries early finalization on its own, so a failure
-        // here must never cost us the event.
-        await maybeEarlyFinalize(sub.id, chainSubmissionId).catch((err) =>
-          console.error(`[indexer] early finalize of submission #${chainSubmissionId} failed, scheduler will retry:`, err)
-        );
+        // Non-blocking: early finalize is dispatched outside the event loop
+        // so the indexer never waits on keeper transactions. The scheduler
+        // also checks early finalization periodically.
+        const finalizePromise = maybeEarlyFinalize(sub.id, chainSubmissionId)
+          .catch((err) =>
+            console.error(
+              `[indexer] early finalize of submission #${chainSubmissionId} failed, scheduler will retry:`,
+              err
+            )
+          )
+          .finally(() => {
+            inFlightFinalizes.delete(finalizePromise);
+          });
+        inFlightFinalizes.add(finalizePromise);
       }
       break;
     }
@@ -419,10 +465,10 @@ export async function maybeEarlyFinalize(submissionRowId: string, chainSubmissio
     .where("id", "=", submissionRowId)
     .executeTakeFirst();
   if (!sub || sub.status !== "pending") return;
-  const record = await readSubmission(chainSubmissionId);
+  const record = await readSubmissionFn(chainSubmissionId);
   if (!record || record.finalized || !consensusOutcome(record)) return;
 
-  const { status, txHash } = await finalizeOnChain(chainSubmissionId);
+  const { status, txHash } = await finalizeOnChainFn(chainSubmissionId);
   await recordTerminalVerdict(submissionRowId, status, txHash);
 }
 
@@ -439,7 +485,7 @@ export async function pollOnce(): Promise<number> {
 
   let res;
   try {
-    res = await server.getEvents(
+    res = await serverInstance.getEvents(
       cursor.pagingToken
         ? { filters, cursor: cursor.pagingToken, limit: PAGE_SIZE }
         : { filters, startLedger: cursor.ledger, limit: PAGE_SIZE }
@@ -449,7 +495,7 @@ export async function pollOnce(): Promise<number> {
     // backend was down for a while) is rejected outright on every poll, so
     // restart from the oldest retained ledger; the scheduler's on-chain
     // reconcile pass repairs any verdicts whose events were missed.
-    const health = await server.getHealth();
+    const health = await serverInstance.getHealth();
     if (cursor.ledger < health.oldestLedger || cursor.ledger > health.latestLedger) {
       const restart = Math.min(Math.max(cursor.ledger, health.oldestLedger + 10), health.latestLedger);
       console.warn(`[indexer] cursor ledger ${cursor.ledger} outside RPC retention, restarting from ${restart}`);
@@ -488,10 +534,11 @@ export async function pollOnce(): Promise<number> {
   return processed;
 }
 
-/** Self-rescheduling, never overlapping: a slow poll (e.g. one that submits
- * a finalize tx and waits ~3-5s for confirmation) must fully finish before
- * the next tick starts, or two ticks can both observe the same unprocessed
- * event and race to finalize the same submission concurrently. */
+/** Self-rescheduling, never overlapping: a slow poll must fully finish before
+ * the next tick starts, ensuring cursor updates remain strictly sequential.
+ * Early finalize is dispatched asynchronously outside the event loop, relying
+ * on withKeeperLock for transaction serialization and idempotent terminal verdict
+ * recording. */
 export function startIndexer(intervalMs = 4000): { stop: () => void } {
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
