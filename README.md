@@ -325,7 +325,7 @@ call it was built for.
 | `POST /v1/reexecutors/:id/relay` | Bearer | relay a signed stake or withdrawal (403 unless yours) |
 | `POST /v1/reexecutors/:id/heartbeat` | Bearer | marks a worker online without fetching work (204; 403 unless yours) |
 | `POST /v1/reexecutors/sync` | Bearer | mirror existing on-chain stake |
-| `GET /v1/reexecutors[/:id]` | — | stake, standing, record |
+| `GET /v1/reexecutors[/:id]` | — | stake, standing, record; paginated (`?limit=&offset=`) |
 | `GET /v1/reexecutors/:id/assignments` | Bearer | work queue (403 for another account's id) |
 | `GET /v1/challenges` | — | |
 | `GET /v1/taxonomy` | — | |
