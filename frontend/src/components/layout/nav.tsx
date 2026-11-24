@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { List, X } from "@phosphor-icons/react/dist/ssr";
@@ -23,6 +23,19 @@ export function Nav() {
   const pathname = usePathname();
   const { account, connecting, problem, login, logout, dismissProblem } = useWallet();
   const [menuOpen, setMenuOpen] = useState(false);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setMenuOpen(false);
+        toggleRef.current?.focus();
+      }
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [menuOpen]);
 
   return (
     <header className="sticky top-0 z-20 border-b border-border-subtle bg-surface/90 backdrop-blur">
@@ -74,6 +87,7 @@ export function Nav() {
             </Button>
           )}
           <Button
+            ref={toggleRef}
             variant="ghost"
             className="px-2 md:hidden"
             aria-label={menuOpen ? "Close menu" : "Open menu"}
