@@ -23,11 +23,37 @@ interface ReexecutorStats {
 
 const NO_STATS: ReexecutorStats = { attested: 0, agreed: 0, disagreed: 0, missed: 0 };
 
+export const reexecutorsQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+});
+
+export function buildReexecutorsListQuery(dbInstance: typeof db, limit: number, offset: number) {
+  return dbInstance
+    .selectFrom("reexecutor")
+    .selectAll()
+    .where((eb) =>
+      eb.or([
+        eb("stake_amount", ">", "0"),
+        eb("slashed_count", ">", 0),
+        eb("chain_stake_tx_hash", "is not", null),
+      ])
+    )
+    .orderBy("stake_amount", "desc")
+    .orderBy("joined_at")
+    .orderBy("id")
+    .limit(limit)
+    .offset(offset);
+}
+
 /** A re-executor's track record, counted from its recorded assignments and
  * the on-chain outcome of each submission. Only a verdict reached by bonded
  * consensus says anything about whether a vote was right; a window that
  * elapsed does not, so those votes count as attested and nothing more. */
-async function statsByReexecutor(reexecutorId?: string): Promise<Map<string, ReexecutorStats>> {
+export async function statsByReexecutor(reexecutorIds?: string | string[]): Promise<Map<string, ReexecutorStats>> {
+  if (Array.isArray(reexecutorIds) && reexecutorIds.length === 0) {
+    return new Map();
+  }
   const onRightSide = sql<boolean>`(replay.match and submission.status = 'verified') or (not replay.match and submission.status = 'slashed')`;
   const settledByConsensus = sql<boolean>`replay.status = 'confirmed_onchain' and submission.resolution_method = 'reexecution_consensus' and submission.status in ('verified','slashed')`;
   let qb = db
@@ -41,7 +67,11 @@ async function statsByReexecutor(reexecutorId?: string): Promise<Map<string, Ree
       sql<string>`count(*) filter (where replay.status = 'missed')`.as("missed"),
     ])
     .groupBy("replay.reexecutor_id");
-  if (reexecutorId) qb = qb.where("replay.reexecutor_id", "=", reexecutorId);
+  if (Array.isArray(reexecutorIds)) {
+    qb = qb.where("replay.reexecutor_id", "in", reexecutorIds);
+  } else if (reexecutorIds) {
+    qb = qb.where("replay.reexecutor_id", "=", reexecutorIds);
+  }
   const rows = await qb.execute();
   return new Map(
     rows.map((r) => [
@@ -215,23 +245,32 @@ export async function reexecutorsRoutes(app: FastifyInstance) {
     };
   });
 
-  app.get("/v1/reexecutors", async () => {
-    const rows = await db
+  app.get("/v1/reexecutors", async (req, reply) => {
+    const query = reexecutorsQuerySchema.parse(req.query);
+    const limit = query.limit ?? 50;
+    const offset = query.offset ?? 0;
+
+    const filtered = db
       .selectFrom("reexecutor")
-      .selectAll()
-      // A row created for a stake transaction that was never signed is not a
-      // re-executor. One that staked and later withdrew or was slashed is.
       .where((eb) =>
         eb.or([
           eb("stake_amount", ">", "0"),
           eb("slashed_count", ">", 0),
           eb("chain_stake_tx_hash", "is not", null),
         ])
-      )
-      .orderBy("stake_amount", "desc")
-      .orderBy("joined_at")
-      .execute();
-    const [stats, cfg] = await Promise.all([statsByReexecutor(), getGateConfig()]);
+      );
+
+    const [rows, { total }] = await Promise.all([
+      buildReexecutorsListQuery(db, limit, offset).execute(),
+      filtered.select((eb) => eb.fn.countAll().as("total")).executeTakeFirstOrThrow(),
+    ]);
+
+    reply.header("x-total-count", String(Number(total)));
+    reply.header("x-limit", String(limit));
+    reply.header("x-offset", String(offset));
+
+    const ids = rows.map((r) => r.id);
+    const [stats, cfg] = await Promise.all([statsByReexecutor(ids), getGateConfig()]);
     return rows.map((row) => present(row, stats.get(row.id) ?? NO_STATS, cfg.reexecutor_allowlist));
   });
 

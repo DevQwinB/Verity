@@ -5,16 +5,34 @@ import type { GateConfig, Reexecutor } from "../../lib/types";
 import { Card, CardBody } from "../../components/ui/card";
 import { buttonClasses } from "../../components/ui/button";
 import { ReexecutorStatus } from "../../components/reexecutor-status";
+import { Pager, PAGE_SIZE, parsePage } from "../../components/pager";
 import { cn } from "../../lib/utils";
 import { stroopsToXlm, truncateMiddle, formatRelativeTime } from "../../lib/format";
 
 export const metadata: Metadata = { title: "Re-executors" };
 
-export default async function ReexecutorsPage() {
-  const [reexecutors, config] = await Promise.all([
-    backendGet<Reexecutor[]>("/v1/reexecutors"),
+export default async function ReexecutorsPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ page?: string }>;
+}) {
+  const params = await searchParams;
+  const page = parsePage(params.page);
+
+  const query = new URLSearchParams({
+    limit: String(PAGE_SIZE + 1),
+    offset: String((page - 1) * PAGE_SIZE),
+  });
+
+  const [rows, config] = await Promise.all([
+    backendGet<Reexecutor[]>(`/v1/reexecutors?${query}`),
     backendGet<GateConfig>("/v1/config"),
   ]);
+  const reexecutors = rows.slice(0, PAGE_SIZE);
+
+  const hrefFor = (nextPage = 1) => {
+    return nextPage > 1 ? `/reexecutors?page=${nextPage}` : "/reexecutors";
+  };
 
   return (
     <div className="space-y-6">
@@ -88,6 +106,8 @@ export default async function ReexecutorsPage() {
           </CardBody>
         </Card>
       )}
+
+      <Pager page={page} hasNext={rows.length > PAGE_SIZE} hrefFor={hrefFor} />
     </div>
   );
 }
