@@ -8,14 +8,47 @@ import { Card, CardBody, CardHeader } from "../../../components/ui/card";
 import { Badge } from "../../../components/ui/badge";
 import { VerdictBadge } from "../../../components/verdict-badge";
 import { AutoRefresh } from "../../../components/auto-refresh";
+import { submissionFingerprint } from "../../../lib/submission-status";
 import { stroopsToXlm, truncateMiddle, formatDuration, formatRelativeTime, windowDeadlineIso } from "../../../lib/format";
 import { TESTNET_EXPLORER_ACCOUNT, TESTNET_EXPLORER_TX } from "../../../lib/config";
 import { ChallengeWindowCountdown } from "../../../components/challenge-window-countdown";
 import { OpenChallengeButton } from "../../../components/open-challenge-button";
 
-const loadSubmissionDetail = cache((id: string) =>
-  backendGetOrNull<SubmissionDetail>(`/v1/submissions/${id}`)
-);
+/** How long the last rendered copy of a submission may stand in for a read
+ * that failed. Every background refresh renders this read again, and a page
+ * that throws then would be replaced by app/error.tsx; rendering the copy the
+ * visitor is already looking at keeps it on screen, and the poll that noticed
+ * the change is retried because the page's fingerprint did not move. It is
+ * only used while the read fails, and only briefly, so a recovered backend is
+ * never held back by it. */
+const LAST_GOOD_MS = 60_000;
+const LAST_GOOD_MAX = 64;
+const lastGood = new Map<string, { at: number; detail: SubmissionDetail }>();
+
+function keepLastGood(id: string, detail: SubmissionDetail) {
+  lastGood.delete(id);
+  lastGood.set(id, { at: Date.now(), detail });
+  const now = Date.now();
+  for (const [key, kept] of lastGood) {
+    if (lastGood.size <= LAST_GOOD_MAX && now - kept.at < LAST_GOOD_MS) break;
+    lastGood.delete(key);
+  }
+}
+
+const loadSubmissionDetail = cache(async (id: string): Promise<SubmissionDetail | null> => {
+  try {
+    const detail = await backendGetOrNull<SubmissionDetail>(`/v1/submissions/${id}`);
+    if (detail) keepLastGood(id, detail);
+    return detail;
+  } catch (err) {
+    // Next's own control-flow errors (dynamic rendering, redirects) must pass.
+    unstable_rethrow(err);
+    const kept = lastGood.get(id);
+    if (!kept || Date.now() - kept.at >= LAST_GOOD_MS) throw err;
+    console.error(`submission page: ${id} could not be read; rendering the last copy`, err);
+    return kept.detail;
+  }
+});
 
 export async function generateMetadata({
   params,
@@ -95,7 +128,12 @@ export default async function SubmissionDetailPage({
 
   return (
     <div className="space-y-6">
-      {live && <AutoRefresh statusPath={`/api/submissions/${id}/status`} />}
+      {live && (
+        <AutoRefresh
+          statusPath={`/api/submissions/${id}/status`}
+          initialFingerprint={submissionFingerprint(detail)}
+        />
+      )}
 
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">

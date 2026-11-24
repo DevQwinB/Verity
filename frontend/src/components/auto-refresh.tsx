@@ -11,10 +11,25 @@ const MAX_DELAY_MS = 60_000;
  * unsettled submission), and it pauses while the tab is in the background.
  *
  * A cheap status route is polled first; the page is only re-rendered when its
- * fingerprint changes. A failed poll therefore leaves the last good page on
- * screen (router.refresh() would otherwise throw the backend's 5xx into
- * app/error.tsx) and backs off 5s, 10s, 20s… up to a minute. */
-export function AutoRefresh({ everyMs = 5000, statusPath }: { everyMs?: number; statusPath: string }) {
+ * fingerprint differs from the one the page was rendered with. A failed poll
+ * leaves the last good page on screen and backs off 5s, 10s, 20s… up to a
+ * minute. A refresh whose own read fails renders the page's last copy rather
+ * than app/error.tsx, so the page is kept and the change retried.
+ *
+ * `initialFingerprint` comes from the data this page rendered with, so a
+ * change that lands between that render and the first poll is still seen. The
+ * effect's baseline is only ever replaced by a render that commits, so a
+ * refresh that did not succeed leaves the old baseline in place and the same
+ * change is retried on the next tick. */
+export function AutoRefresh({
+  everyMs = 5000,
+  statusPath,
+  initialFingerprint,
+}: {
+  everyMs?: number;
+  statusPath: string;
+  initialFingerprint: string;
+}) {
   const router = useRouter();
   const [, startTransition] = useTransition();
   const [paused, setPaused] = useState(false);
@@ -23,7 +38,7 @@ export function AutoRefresh({ everyMs = 5000, statusPath }: { everyMs?: number; 
     let timer: ReturnType<typeof setTimeout> | undefined;
     let failures = 0;
     let cancelled = false;
-    let lastFingerprint: string | null = null;
+    let lastFingerprint = initialFingerprint;
     const controller = new AbortController();
 
     const schedule = (ms: number) => {
@@ -41,17 +56,17 @@ export function AutoRefresh({ everyMs = 5000, statusPath }: { everyMs?: number; 
       try {
         const res = await fetch(statusPath, { cache: "no-store", signal: controller.signal });
         if (!res.ok) throw new Error(`status ${res.status}`);
-        const fingerprint = JSON.stringify(await res.json());
+        const { fingerprint } = (await res.json()) as { fingerprint: string };
         failures = 0;
         setPaused(false);
-        if (lastFingerprint !== null && fingerprint !== lastFingerprint) {
-          // Keep the old fingerprint until the refresh is accepted, so a
-          // failed attempt is retried on the next tick.
+        if (fingerprint !== lastFingerprint) {
+          // Deliberately not advancing lastFingerprint: only a committed
+          // render re-runs this effect with a new baseline, so a refresh that
+          // fails is retried instead of the change being forgotten.
           startTransition(() => {
             router.refresh();
           });
         }
-        lastFingerprint = fingerprint;
         schedule(everyMs);
       } catch {
         if (cancelled) return;
@@ -67,7 +82,7 @@ export function AutoRefresh({ everyMs = 5000, statusPath }: { everyMs?: number; 
       controller.abort();
       if (timer) clearTimeout(timer);
     };
-  }, [router, everyMs, statusPath, startTransition]);
+  }, [router, everyMs, statusPath, initialFingerprint, startTransition]);
 
   if (!paused) return null;
   return (
