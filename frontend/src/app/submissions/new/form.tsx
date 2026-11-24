@@ -6,10 +6,12 @@ import { useWallet } from "../../../components/wallet-provider";
 import { Card, CardBody, CardHeader } from "../../../components/ui/card";
 import { Button } from "../../../components/ui/button";
 import { uploadArtifact, createSubmission, relaySubmission } from "../../../lib/client-api";
-import { signXdr } from "../../../lib/wallet";
-import { NETWORK_PASSPHRASE } from "../../../lib/config";
+import { assertWalletNetwork, signXdr, WalletError, wrongNetworkMessage } from "../../../lib/wallet";
 import { canonicalJson, parseJsonOrText } from "../../../lib/canonical";
-import { bpsToPercent, formatDuration, stroopsToXlm, xlmToStroops } from "../../../lib/format";
+import { EXAMPLES, EXAMPLE_LIST, generateExampleEscrowRef, type ExampleId, type SubmissionExample } from "../../../lib/examples";
+import { bpsToPercent, formatDuration, formatUnits, mapTrustlineError, parseUnits, resolveBondAsset, trustlineNote } from "../../../lib/format";
+import { validateRetrievalSpec } from "../../../lib/retrieval-spec";
+import { cn } from "../../../lib/utils";
 import type { GateConfig, TaskType } from "../../../lib/types";
 
 function textToBase64(text: string): string {
@@ -35,51 +37,16 @@ function utf8ByteLength(text: string): number {
 
 const formatKb = (bytes: number) => `${(bytes / 1000).toFixed(1)} KB`;
 
-function checkArtifactSize(name: string, text: string) {
+function checkArtifactSize(name: string, text: string, maxBytes: number = MAX_UPLOAD_ARTIFACT_BYTES) {
   const bytes = utf8ByteLength(text);
-  if (bytes > MAX_UPLOAD_ARTIFACT_BYTES) {
+  if (bytes > maxBytes) {
     throw new Error(
-      `The ${name} is ${formatKb(bytes)}. The largest artifact the dashboard can upload is about ${formatKb(MAX_UPLOAD_ARTIFACT_BYTES)}.`
+      `The ${name} is ${formatKb(bytes)}. The largest artifact the dashboard can upload is about ${formatKb(maxBytes)}.`
     );
   }
 }
 
-type Step = "idle" | "uploading" | "building" | "signing" | "relaying" | "done" | "error";
-
-/** A malformed retrieval spec is expensive: every re-executor fails to replay
- * it, votes "mismatch", and the agent's own bond is slashed (see
- * reexecutor-agent/src/sandbox/retrieval.ts). Catch what the worker would
- * reject here, before anything is uploaded or signed. */
-function validateRetrievalSpec(value: unknown): void {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(
-      'The request spec must be a JSON object, e.g. {"url": "https://...", "pointer": "/field"}.'
-    );
-  }
-  const spec = value as Record<string, unknown>;
-  const url = spec.url;
-  if (typeof url !== "string") {
-    throw new Error('The request spec needs a "url" starting with http:// or https://.');
-  }
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new Error(`"${url}" is not a valid URL. Use a full address like https://example.com/data.json.`);
-  }
-  // new URL() accepts javascript: and ftp: too; the worker only replays http(s).
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error('The "url" must start with http:// or https://.');
-  }
-  if (Object.hasOwn(spec, "pointer") && spec.pointer !== undefined) {
-    const pointer = spec.pointer;
-    if (typeof pointer !== "string" || (pointer !== "" && !pointer.startsWith("/"))) {
-      throw new Error(
-        'The "pointer" must be a JSON Pointer string: "" for the whole document, or starting with "/", e.g. "/network_passphrase".'
-      );
-    }
-  }
-}
+type Step = "idle" | "checking" | "uploading" | "building" | "signing" | "relaying" | "done" | "error";
 
 // The reference is free text that is hashed on-chain and shown in lists, so it is capped for sanity; keep it in line with any backend limit.
 const ESCROW_REF_MAX_LENGTH = 128;
@@ -88,24 +55,45 @@ const ESCROW_REF_MAX_LENGTH = 128;
  * window shown here are the ones EscrowGate will actually apply. */
 export function NewSubmissionForm({ config }: { config: GateConfig }) {
   const router = useRouter();
-  const { account, connecting, login } = useWallet();
+  const { account, connecting, networkOk, problem, login, reportWrongNetwork } = useWallet();
+  const taskTypeId = useId();
+  const asset = resolveBondAsset(config.bond_asset);
   // One key for this form: retrying after a declined signature reuses the
   // same draft instead of leaving a new unsigned one behind each time.
   const idempotencyKey = useRef<string | null>(null);
 
+  const maxArtifactBytes = Math.min(
+    config.artifact_max_bytes ?? MAX_UPLOAD_ARTIFACT_BYTES,
+    MAX_UPLOAD_ARTIFACT_BYTES
+  );
+
   const [escrowRef, setEscrowRef] = useState("");
   const [taskType, setTaskType] = useState<TaskType>("deterministic");
-  const [escrowValueXlm, setEscrowValueXlm] = useState("100");
-  const [bondXlm, setBondXlm] = useState("5");
+  const [escrowValueInput, setEscrowValueInput] = useState("100");
+  const [bondInput, setBondInput] = useState("5");
   const [inputContent, setInputContent] = useState("");
   const [functionContent, setFunctionContent] = useState("");
   const [outputContent, setOutputContent] = useState("");
+  const [activeExample, setActiveExample] = useState<ExampleId | null>(null);
   const [step, setStep] = useState<Step>("idle");
   const [error, setError] = useState<string | null>(null);
 
+  const filledExample = activeExample ? EXAMPLE_LIST.find((e) => e.id === activeExample) ?? null : null;
+
+  function applyExample(example: SubmissionExample) {
+    idempotencyKey.current = null;
+    setError(null);
+    setTaskType(example.taskType);
+    setEscrowRef(generateExampleEscrowRef());
+    setInputContent(example.input);
+    setFunctionContent(example.functionBody);
+    setOutputContent(example.output);
+    setActiveExample(example.id);
+  }
+
   const escrowRefTrimmed = escrowRef.trim();
-  const escrowValue = xlmToStroops(escrowValueXlm);
-  const bondValue = xlmToStroops(bondXlm);
+  const escrowValue = parseUnits(escrowValueInput, asset.decimals);
+  const bondValue = parseUnits(bondInput, asset.decimals);
   const minBond =
     escrowValue === null ? null : (escrowValue * BigInt(config.agent_bond_min_bps)) / BigInt(10_000);
   const windowS =
@@ -117,15 +105,15 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
    * wallet prompt appears. */
   function prepareAmounts(): { escrowValue: string; bond: string } {
     if (escrowValue === null) {
-      throw new Error("Enter the escrow value as a positive XLM amount, for example 100.");
+      throw new Error(`Enter the escrow value as a positive ${asset.symbol} amount, for example 100.`);
     }
-    const bond = xlmToStroops(bondXlm);
+    const bond = parseUnits(bondInput, asset.decimals);
     if (bond === null) {
-      throw new Error("Enter the bond as a positive XLM amount, for example 5.");
+      throw new Error(`Enter the bond as a positive ${asset.symbol} amount, for example 5.`);
     }
     if (minBond !== null && bond < minBond) {
       throw new Error(
-        `The bond must be at least ${stroopsToXlm(minBond.toString())} XLM: ${bpsToPercent(config.agent_bond_min_bps)} of the escrow value.`
+        `The bond must be at least ${formatUnits(minBond.toString(), asset.decimals, asset.symbol)}: ${bpsToPercent(config.agent_bond_min_bps)} of the escrow value.`
       );
     }
     return { escrowValue: escrowValue.toString(), bond: bond.toString() };
@@ -156,14 +144,14 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
     const output = canonicalJson(parseJsonOrText(outputContent));
     // Checked here, before anything is uploaded, so an oversize artifact is
     // named instead of failing the upload with a bare "Request body is too large".
-    checkArtifactSize("input", input);
-    checkArtifactSize("claimed output", output);
-    if (taskType === "deterministic") checkArtifactSize("function", functionContent);
+    checkArtifactSize("input", input, maxArtifactBytes);
+    checkArtifactSize("claimed output", output, maxArtifactBytes);
+    if (taskType === "deterministic") checkArtifactSize("function", functionContent, maxArtifactBytes);
     return { input, output };
   }
 
   async function handleSubmit() {
-    if (!account) return;
+    if (!account || !networkOk) return;
     setError(null);
     try {
       if (!escrowRefTrimmed) {
@@ -171,6 +159,8 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
       }
       const amounts = prepareAmounts();
       const artifacts = prepareArtifacts();
+      setStep("checking");
+      await assertWalletNetwork(config.network_passphrase);
       setStep("uploading");
       const input = await uploadArtifact(textToBase64(artifacts.input), "application/json");
       const output = await uploadArtifact(textToBase64(artifacts.output), "application/json");
@@ -180,7 +170,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
           : null;
 
       setStep("building");
-      const { submission, unsigned_transaction_xdr, network_passphrase } = await createSubmission({
+      const { submission, unsigned_transaction_xdr } = await createSubmission({
         escrow_ref: escrowRefTrimmed,
         task_type: taskType,
         input_hash: input.content_hash,
@@ -201,7 +191,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
 
       setStep("signing");
       const signed = await signXdr(unsigned_transaction_xdr, {
-        networkPassphrase: network_passphrase || NETWORK_PASSPHRASE,
+        networkPassphrase: config.network_passphrase,
         address: account,
       });
 
@@ -210,12 +200,23 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
       setStep("done");
       router.push(`/submissions/${submission.id}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Submission failed.");
+      if (err instanceof WalletError && err.code === "wrong-network") {
+        reportWrongNetwork(err.message);
+        setStep("idle");
+        return;
+      }
+      setError(err instanceof Error ? mapTrustlineError(err, asset.symbol) : "Submission failed.");
       setStep("error");
     }
   }
 
   const busy = step !== "idle" && step !== "error";
+  const wrongNetworkNotice = !networkOk
+    ? problem?.code === "wrong-network"
+      ? problem.message
+      : wrongNetworkMessage()
+    : null;
+  const displayError = wrongNetworkNotice ?? error;
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -250,56 +251,107 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
             )}
           </Field>
 
-          <Field label="Task type">
-            {(control) => (
-              <select
-                {...control}
-                value={taskType}
-                onChange={(e) => setTaskType(e.target.value as TaskType)}
-                className={inputClass}
+          <div className="space-y-2">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <label htmlFor={taskTypeId} className="block text-sm text-text-secondary">
+                Task type
+              </label>
+              <div
+                className="flex flex-wrap items-center gap-1.5"
+                role="group"
+                aria-label="Fill in an example"
               >
-                <option value="deterministic">Deterministic (replay-verified)</option>
-                <option value="retrieval">Retrieval (spot-checked)</option>
-              </select>
+                <span className="text-xs text-text-tertiary">Fill in an example:</span>
+                {EXAMPLE_LIST.map((example) => {
+                  const selected = activeExample === example.id;
+                  const isWrong = example.expectedOutcome === "slashed";
+                  return (
+                    <Button
+                      key={example.id}
+                      type="button"
+                      variant="secondary"
+                      disabled={busy}
+                      aria-pressed={selected}
+                      onClick={() => applyExample(example)}
+                      className={cn(
+                        "px-2.5 py-1 text-xs",
+                        isWrong && "border-status-slashed/40 text-status-slashed hover:bg-status-slashed/10",
+                        selected && !isWrong && "border-accent text-accent",
+                        selected && isWrong && "border-status-slashed bg-status-slashed/10"
+                      )}
+                    >
+                      {example.label}
+                    </Button>
+                  );
+                })}
+              </div>
+            </div>
+            <select
+              id={taskTypeId}
+              value={taskType}
+              onChange={(e) => {
+                setTaskType(e.target.value as TaskType);
+                setActiveExample(null);
+              }}
+              className={inputClass}
+            >
+              <option value="deterministic">Deterministic (replay-verified)</option>
+              <option value="retrieval">Retrieval (spot-checked)</option>
+            </select>
+            {filledExample && (
+              <p
+                role="status"
+                className={cn(
+                  "rounded-lg border px-3 py-2 text-xs",
+                  filledExample.expectedOutcome === "slashed"
+                    ? "border-status-slashed/40 bg-status-slashed/10 text-status-slashed"
+                    : "border-border-subtle bg-surface text-text-secondary"
+                )}
+              >
+                {filledExample.note}
+              </p>
             )}
-          </Field>
+          </div>
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field
-              label="Escrow value (XLM)"
+              label={`Escrow value (${asset.symbol})`}
               helper={`What the work is worth to the marketplace. Sets the bond floor and the challenge window: ${formatDuration(windowS)} at this value.`}
             >
               {(control) => (
                 <input
                   {...control}
                   inputMode="decimal"
-                  value={escrowValueXlm}
-                  onChange={(e) => setEscrowValueXlm(e.target.value)}
-                  aria-invalid={escrowValueXlm !== "" && escrowValue === null}
+                  value={escrowValueInput}
+                  onChange={(e) => setEscrowValueInput(e.target.value)}
+                  aria-invalid={escrowValueInput !== "" && escrowValue === null}
                   className={`${inputClass} font-mono`}
                 />
               )}
             </Field>
             <Field
-              label="Agent bond (XLM)"
+              label={`Agent bond (${asset.symbol})`}
               helper={
                 minBond === null
                   ? `At least ${bpsToPercent(config.agent_bond_min_bps)} of the escrow value. Forfeited if the work is found wrong.`
-                  : `At least ${stroopsToXlm(minBond.toString())} XLM (${bpsToPercent(config.agent_bond_min_bps)} of the escrow value). Returned if verified, forfeited if the work is found wrong.`
+                  : `At least ${formatUnits(minBond.toString(), asset.decimals, asset.symbol)} (${bpsToPercent(config.agent_bond_min_bps)} of the escrow value). Returned if verified, forfeited if the work is found wrong.`
               }
             >
               {(control) => (
                 <input
                   {...control}
                   inputMode="decimal"
-                  value={bondXlm}
-                  onChange={(e) => setBondXlm(e.target.value)}
-                  aria-invalid={bondXlm !== "" && bondValue === null}
+                  value={bondInput}
+                  onChange={(e) => setBondInput(e.target.value)}
+                  aria-invalid={bondInput !== "" && bondValue === null}
                   className={`${inputClass} font-mono`}
                 />
               )}
             </Field>
           </div>
+          {asset.symbol !== "XLM" && (
+            <p className="text-xs text-text-tertiary">{trustlineNote(asset.symbol)}</p>
+          )}
         </CardBody>
       </Card>
 
@@ -312,21 +364,24 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
             label={taskType === "retrieval" ? "Request spec (JSON)" : "Input (JSON)"}
             helper={
               taskType === "retrieval"
-                ? "The public URL you fetched, plus an optional JSON pointer to the value you extracted. A sampled re-executor re-fetches it."
-                : "Passed to your function as `input`."
+                ? `The public URL you fetched, plus an optional JSON pointer to the value you extracted (up to ${formatKb(maxArtifactBytes)}). A sampled re-executor re-fetches it.`
+                : `Passed to your function as \`input\` (up to ${formatKb(maxArtifactBytes)}).`
             }
           >
             {(control) => (
               <textarea
                 {...control}
                 value={inputContent}
-                onChange={(e) => setInputContent(e.target.value)}
+                onChange={(e) => {
+                  setInputContent(e.target.value);
+                  setActiveExample(null);
+                }}
                 rows={3}
                 spellCheck={false}
                 placeholder={
                   taskType === "retrieval"
-                    ? '{"url": "https://horizon-testnet.stellar.org/", "pointer": "/network_passphrase"}'
-                    : '{"n": 21}'
+                    ? EXAMPLES.retrievalCorrect.input
+                    : EXAMPLES.deterministicCorrect.input
                 }
                 className={cnMono}
               />
@@ -335,16 +390,19 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
           {taskType === "deterministic" && (
             <Field
               label="Function body (JavaScript)"
-              helper="The body of a pure function of `input` that returns the result. Re-executors run this exact artifact in a WebAssembly sandbox with no network, files or clock: `Date` and `Math.random` do not exist there, and compute and memory are capped. A function that throws or exceeds the limits counts as a mismatch."
+              helper={`The body of a pure function of \`input\` that returns the result (up to ${formatKb(maxArtifactBytes)}). Re-executors run this exact artifact in a WebAssembly sandbox with no network, files or clock: \`Date\` and \`Math.random\` do not exist there, and compute and memory are capped. A function that throws or exceeds the limits counts as a mismatch.`}
             >
               {(control) => (
                 <textarea
                   {...control}
                   value={functionContent}
-                  onChange={(e) => setFunctionContent(e.target.value)}
+                  onChange={(e) => {
+                    setFunctionContent(e.target.value);
+                    setActiveExample(null);
+                  }}
                   rows={4}
                   spellCheck={false}
-                  placeholder="return { doubled: input.n * 2 };"
+                  placeholder={EXAMPLES.deterministicCorrect.functionBody}
                   className={cnMono}
                 />
               )}
@@ -352,16 +410,23 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
           )}
           <Field
             label="Claimed output"
-            helper="JSON or plain text. Normalised to canonical JSON before hashing, so key order and whitespace do not matter."
+            helper={`JSON or plain text (up to ${formatKb(maxArtifactBytes)}). Normalised to canonical JSON before hashing, so key order and whitespace do not matter.`}
           >
             {(control) => (
               <textarea
                 {...control}
                 value={outputContent}
-                onChange={(e) => setOutputContent(e.target.value)}
+                onChange={(e) => {
+                  setOutputContent(e.target.value);
+                  setActiveExample(null);
+                }}
                 rows={3}
                 spellCheck={false}
-                placeholder={taskType === "retrieval" ? "Test SDF Network ; September 2015" : '{"doubled": 42}'}
+                placeholder={
+                  taskType === "retrieval"
+                    ? EXAMPLES.retrievalCorrect.output
+                    : EXAMPLES.deterministicCorrect.output
+                }
                 className={cnMono}
               />
             )}
@@ -369,25 +434,27 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
         </CardBody>
       </Card>
 
-      {error && (
+      {displayError && (
         <p role="alert" className="text-sm text-status-slashed">
-          {error}
+          {displayError}
         </p>
       )}
 
       {account ? (
-        <Button onClick={handleSubmit} disabled={busy || !escrowRefTrimmed || !inputContent || !outputContent}>
-          {step === "uploading"
-            ? "Uploading artifacts..."
-            : step === "building"
-              ? "Building transaction..."
-              : step === "signing"
-                ? "Awaiting signature in Freighter..."
-                : step === "relaying"
-                  ? "Submitting to testnet..."
-                  : step === "done"
-                    ? "Confirmed. Opening the submission..."
-                    : "Submit for verification"}
+        <Button onClick={handleSubmit} disabled={busy || !networkOk || !escrowRefTrimmed || !inputContent || !outputContent}>
+          {step === "checking"
+            ? "Checking Freighter..."
+            : step === "uploading"
+              ? "Uploading artifacts..."
+              : step === "building"
+                ? "Building transaction..."
+                : step === "signing"
+                  ? "Awaiting signature in Freighter..."
+                  : step === "relaying"
+                    ? "Submitting to testnet..."
+                    : step === "done"
+                      ? "Confirmed. Opening the submission..."
+                      : "Submit for verification"}
         </Button>
       ) : (
         <Button onClick={login} disabled={connecting}>
