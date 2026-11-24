@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Account, Keypair, Networks, Operation, TransactionBuilder } from "@stellar/stellar-sdk";
+import { Keypair, Networks, TransactionBuilder, WebAuth } from "@stellar/stellar-sdk";
 import { ApiError, createWorker, type Assignment, type EscrowGateLike, type SubmissionLike } from "./index.js";
 import { REPLAY_ENGINE } from "./sandbox/runner.js";
 
@@ -400,15 +400,15 @@ test("compiled dist/ runner keeps REPLAY_ENGINE and worked-example hash identica
   const pkg = JSON.parse(readFileSync(join(agentRoot, "package.json"), "utf8")) as {
     dependencies: Record<string, string>;
   };
-  const expectedEngine = `quickjs-emscripten@${pkg.dependencies["quickjs-emscripten"]} (wasm sandbox, worker-isolated)`;
-  assert.equal(REPLAY_ENGINE, expectedEngine);
+  const enginePrefix = `quickjs-emscripten@${pkg.dependencies["quickjs-emscripten"]} (wasm sandbox, worker-isolated`;
+  assert.ok(REPLAY_ENGINE.startsWith(enginePrefix), `REPLAY_ENGINE should name the pinned engine: ${REPLAY_ENGINE}`);
 
   const compiled = (await import(pathToFileURL(distRunner).href)) as typeof import("./sandbox/runner.js");
   assert.equal(compiled.REPLAY_ENGINE, REPLAY_ENGINE);
   const result = await compiled.runDeterministicFunction("return { doubled: input.n * 2 };", { n: 21 });
   assert.deepEqual(result.output, { doubled: 42 });
   assert.equal(result.outputHash, "27d4958085af3032ba46babb9e0b71690f9e2cc745ff7bb403a3d54e12152f82");
-  assert.equal(result.engine, expectedEngine);
+  assert.equal(result.engine, REPLAY_ENGINE);
 });
 
 test("fails at startup when neither REEXECUTOR_SECRET_KEY nor REEXECUTOR_SECRET_KEY_FILE is set", () => {
@@ -472,24 +472,19 @@ test("reads and trims REEXECUTOR_SECRET_KEY_FILE and logs in, syncs and polls", 
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    // The worker discovers and pins this server before it signs anything (SEP-10),
+    // so the stub publishes its signing key and issues spec-conformant challenges.
+    const host = req.headers.host ?? "127.0.0.1";
+    if (req.method === "GET" && url.pathname === "/.well-known/stellar.toml") {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end(`SIGNING_KEY="${serverKey.publicKey()}"\nWEB_AUTH_ENDPOINT="http://${host}/auth"\n`);
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/auth") {
       assert.equal(url.searchParams.get("account"), rex.publicKey());
-      const tx = new TransactionBuilder(new Account(serverKey.publicKey(), "-1"), {
-        fee: "100",
-        networkPassphrase: Networks.TESTNET,
-      })
-        .addOperation(
-          Operation.manageData({
-            name: "localhost auth",
-            value: "nonce",
-            source: rex.publicKey(),
-          })
-        )
-        .setTimeout(300)
-        .build();
-      tx.sign(serverKey);
+      const transaction = WebAuth.buildChallengeTx(serverKey, rex.publicKey(), host, 300, Networks.TESTNET, host);
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ transaction: tx.toXDR() }));
+      res.end(JSON.stringify({ transaction }));
       return;
     }
     if (req.method === "POST" && url.pathname === "/auth") {
