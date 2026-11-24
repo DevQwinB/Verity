@@ -2,8 +2,8 @@ import { cache } from "react";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound, unstable_rethrow } from "next/navigation";
-import { backendGetOrNull } from "../../../lib/server-api";
-import type { Artifact, Attestation, SubmissionDetail, ProofStatus } from "../../../lib/types";
+import { backendGet, backendGetOrNull } from "../../../lib/server-api";
+import type { Artifact, Attestation, GateConfig, SubmissionDetail, ProofStatus } from "../../../lib/types";
 import { Card, CardBody, CardHeader } from "../../../components/ui/card";
 import { Badge } from "../../../components/ui/badge";
 import { VerdictBadge } from "../../../components/verdict-badge";
@@ -12,6 +12,7 @@ import { stroopsToXlm, truncateMiddle, formatDuration, formatRelativeTime, recor
 import { TESTNET_EXPLORER_ACCOUNT, TESTNET_EXPLORER_TX } from "../../../lib/config";
 import { ChallengeWindowCountdown } from "../../../components/challenge-window-countdown";
 import { OpenChallengeButton } from "../../../components/open-challenge-button";
+import { AttestationCheck } from "../../../components/attestation-check";
 
 const loadSubmissionDetail = cache((id: string) =>
   backendGetOrNull<SubmissionDetail>(`/v1/submissions/${id}`)
@@ -74,7 +75,8 @@ export default async function SubmissionDetailPage({
 
   const isDraft = submission.chain_submission_id === null;
 
-  const [proof, attestation, inputText, functionText, outputText] = await Promise.all([
+  const [config, proof, attestation, inputText, functionText, outputText] = await Promise.all([
+    backendGet<GateConfig>("/v1/config"),
     settle(`/v1/submissions/${id}/proof`, backendGetOrNull<ProofStatus>(`/v1/submissions/${id}/proof`)),
     settle(
       `/v1/submissions/${id}/attestation`,
@@ -342,6 +344,7 @@ export default async function SubmissionDetailPage({
               submissionId={submission.id}
               deadlineIso={deadline}
               minBondStroops={submission.min_challenger_bond}
+              networkPassphrase={config.network_passphrase}
             />
           ) : (
             <p className="text-sm text-text-tertiary">
@@ -377,6 +380,10 @@ export default async function SubmissionDetailPage({
             <pre className="max-h-64 overflow-auto rounded-lg border border-border-subtle bg-surface p-3 font-mono text-xs leading-relaxed text-text-secondary">
               {JSON.stringify(attestation.value.payload, null, 2)}
             </pre>
+            <AttestationCheck
+              attestation={attestation.value}
+              chainSubmissionId={submission.chain_submission_id}
+            />
           </CardBody>
         </Card>
       )}
