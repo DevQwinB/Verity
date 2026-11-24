@@ -10,6 +10,28 @@ import { hasConnectivity, RetrievalTransientError, runRetrieval } from "./sandbo
 import { assertSep10Challenge } from "./sep10.js";
 import { NO_OUTPUT_HASH, voteMatches } from "./vote.js";
 import { startHeartbeat } from "./heartbeat.js";
+import { setTimeout as sleep } from "node:timers/promises";
+import { MetricsRegistry, startMetricsServer } from "./metrics.js";
+
+const METRICS_PORT = process.env.METRICS_PORT ? Number(process.env.METRICS_PORT) : undefined;
+const METRICS_HOST = process.env.METRICS_HOST ?? "127.0.0.1";
+
+export const metrics = new MetricsRegistry();
+metrics.registerCounter("verity_reexecutor_polls_total", "Total poll attempts");
+metrics.registerCounter("verity_reexecutor_votes_total", "Total votes submitted");
+metrics.registerCounter("verity_reexecutor_vote_errors_total", "Total vote submission errors");
+metrics.registerHistogram("verity_reexecutor_replay_duration_seconds", "Replay execution duration in seconds");
+metrics.registerCounter("verity_reexecutor_replay_infrastructure_errors_total", "Total replay infrastructure errors");
+metrics.registerCounter("verity_reexecutor_retrieval_transient_total", "Total retrieval transient errors");
+metrics.registerGauge("verity_reexecutor_assignments_pending", "Number of pending assignments");
+metrics.registerGauge("verity_reexecutor_voting_blocked", "Whether voting is currently blocked (1 or 0)");
+metrics.registerCounter("verity_reexecutor_heartbeat_failures_total", "Total heartbeat delivery failures");
+metrics.registerGauge("verity_reexecutor_last_poll_success_timestamp_seconds", "Timestamp in seconds of last successful poll");
+
+export const stopping = new AbortController();
+let currentProcessingPromise: Promise<void> | null = null;
+let lastPollOkAt: number | null = null;
+let heartbeatFailing = false;
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:3001";
 const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
@@ -219,7 +241,23 @@ async function processAssignment(a: Assignment) {
   }
 
   console.log(`${tag} re-executing ${record.task_type.tag.toLowerCase()} submission #${a.chain_submission_id}`);
-  const { outputHash, engine } = await reExecute(a, record);
+  const startTime = Date.now();
+  let res;
+  try {
+    res = await reExecute(a, record);
+  } catch (err) {
+    if (err instanceof ReplayInfrastructureError) {
+      metrics.incCounter("verity_reexecutor_replay_infrastructure_errors_total");
+    } else if (err instanceof RetrievalTransientError) {
+      metrics.incCounter("verity_reexecutor_retrieval_transient_total");
+    }
+    throw err;
+  } finally {
+    metrics.observeHistogram("verity_reexecutor_replay_duration_seconds", (Date.now() - startTime) / 1000, {
+      task_type: record.task_type.tag.toLowerCase(),
+    });
+  }
+  const { outputHash, engine } = res;
   const claimed = hex(record.claimed_output_hash);
   const matched = voteMatches(outputHash, claimed);
   console.log(`${tag}   engine=${engine}`);
@@ -234,12 +272,20 @@ async function processAssignment(a: Assignment) {
     });
     const sent = await tx.signAndSend();
     sent.result.unwrap();
+    metrics.incCounter("verity_reexecutor_votes_total", {
+      task_type: record.task_type.tag.toLowerCase(),
+      matched: String(matched),
+    });
     console.log(`${tag}   attest_replay tx: ${sent.sendTransactionResponse?.hash ?? "(confirmed)"}`);
   } catch (err) {
     const code = /Error\(Contract, #(\d+)\)/.exec((err as Error).message ?? "")?.[1];
+    if (code) {
+      metrics.incCounter("verity_reexecutor_vote_errors_total", { code });
+    }
     if (code === "20" || code === "27") {
       // #20 ReexecutorNotActive, #27 ReexecutorNotApproved.
       votingBlockedUntil = Date.now() + 60_000;
+      metrics.setGauge("verity_reexecutor_voting_blocked", 1);
       console.warn(
         `${tag}   EscrowGate refused the vote: this account is ${code === "20" ? "not active (stake below the floor)" : "not approved as a voter"}. Pausing work for 60s.`
       );
@@ -267,22 +313,42 @@ function pruneToListed(listed: ReadonlySet<string>) {
 }
 
 async function pollOnce(reexecutorId: string) {
-  const { replay_assignments, spot_check_assignments } = await api<{
-    replay_assignments: Assignment[];
-    spot_check_assignments: Assignment[];
-  }>(`/v1/reexecutors/${reexecutorId}/assignments`);
+  if (stopping.signal.aborted) return;
+  let data;
+  try {
+    data = await api<{
+      replay_assignments: Assignment[];
+      spot_check_assignments: Assignment[];
+    }>(`/v1/reexecutors/${reexecutorId}/assignments`);
+    metrics.incCounter("verity_reexecutor_polls_total", { result: "ok" });
+    lastPollOkAt = Date.now();
+    metrics.setGauge("verity_reexecutor_last_poll_success_timestamp_seconds", Math.round(lastPollOkAt / 1000));
+  } catch (err) {
+    metrics.incCounter("verity_reexecutor_polls_total", { result: "error" });
+    throw err;
+  }
+  const { replay_assignments, spot_check_assignments } = data;
+  const allAssignments = [...replay_assignments, ...spot_check_assignments];
+  metrics.setGauge("verity_reexecutor_assignments_pending", allAssignments.length);
+
   // Only after a successful fetch: if `api` throws, nothing is pruned.
-  pruneToListed(new Set([...replay_assignments, ...spot_check_assignments].map((a) => a.chain_submission_id)));
+  pruneToListed(new Set(allAssignments.map((a) => a.chain_submission_id)));
   // A sampled spot-check and a full replay are the same job for the worker:
   // re-derive the output, then put a bonded vote on-chain.
   // The poll above is what marks this worker online, so it runs even while
   // voting is blocked.
-  if (Date.now() < votingBlockedUntil) return;
-  for (const assignment of [...replay_assignments, ...spot_check_assignments]) {
+  const isBlocked = Date.now() < votingBlockedUntil;
+  metrics.setGauge("verity_reexecutor_voting_blocked", isBlocked ? 1 : 0);
+  if (isBlocked) return;
+  for (const assignment of allAssignments) {
+    if (stopping.signal.aborted) break;
     try {
-      await processAssignment(assignment);
+      currentProcessingPromise = processAssignment(assignment);
+      await currentProcessingPromise;
     } catch (err) {
       console.error(`${tag}   assignment #${assignment.chain_submission_id} failed, will retry:`, (err as Error).message);
+    } finally {
+      currentProcessingPromise = null;
     }
   }
 }
@@ -305,27 +371,81 @@ async function main() {
     console.warn("[reexecutor-agent] not approved as a voter — on a deployment with the allow-list on, no work is assigned until the admin approves this account");
   }
 
+  let metricsServer: { stop: () => Promise<void> } | undefined;
+  if (METRICS_PORT) {
+    console.log(`[reexecutor-agent] serving health and metrics on http://${METRICS_HOST}:${METRICS_PORT}`);
+    metricsServer = startMetricsServer(
+      METRICS_PORT,
+      METRICS_HOST,
+      () => ({
+        lastPollOkAt,
+        pollIntervalMs: POLL_MS,
+        votingBlockedUntil,
+        heartbeatFailing,
+      }),
+      metrics
+    );
+  }
+
   if (ONCE) {
     await pollOnce(reexecutor.id);
+    if (metricsServer) await metricsServer.stop();
     return;
   }
   // A replay can run for minutes; the assignment poll cannot, so liveness
   // is reported on its own timer. A backend that predates the endpoint
   // answers 404 and the poll keeps the worker online as before.
-  startHeartbeat(
+  const heartbeat = startHeartbeat(
     () => api<unknown>(`/v1/reexecutors/${reexecutor.id}/heartbeat`, { method: "POST" }).then(() => {}),
     HEARTBEAT_MS,
-    (err) => console.warn(`${tag} heartbeat failed (the assignment poll still reports liveness):`, err.message)
+    (err) => {
+      heartbeatFailing = true;
+      metrics.incCounter("verity_reexecutor_heartbeat_failures_total");
+      console.warn(`${tag} heartbeat failed (the assignment poll still reports liveness):`, err.message);
+    },
+    () => {
+      heartbeatFailing = false;
+    }
   );
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
+
+  let signalCount = 0;
+  const onSignal = (signal: string) => {
+    signalCount++;
+    if (signalCount > 1) {
+      console.log(`[reexecutor-agent] second ${signal} received, exiting immediately`);
+      process.exit(130);
+    }
+    console.log(`[reexecutor-agent] ${signal} received, shutting down gracefully (max 25s)`);
+    stopping.abort();
+  };
+
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
+  process.on("SIGINT", () => onSignal("SIGINT"));
+
+  while (!stopping.signal.aborted) {
     try {
       await pollOnce(reexecutor.id);
     } catch (err) {
       console.error(`${tag} poll failed, will retry:`, (err as Error).message);
     }
-    await new Promise((r) => setTimeout(r, POLL_MS));
+    if (stopping.signal.aborted) break;
+    try {
+      await sleep(POLL_MS, undefined, { signal: stopping.signal });
+    } catch (err) {
+      if ((err as Error).name === "AbortError") break;
+      throw err;
+    }
   }
+
+  heartbeat.stop();
+  if (metricsServer) await metricsServer.stop().catch((e) => console.error("error stopping metrics server", e));
+  if (currentProcessingPromise) {
+    console.log("[reexecutor-agent] waiting for in-flight assignment to complete (up to 25s)...");
+    const timeout = new Promise<void>((resolve) => setTimeout(resolve, 25_000));
+    await Promise.race([currentProcessingPromise, timeout]);
+  }
+  console.log("[reexecutor-agent] stopped");
+  process.exit(0);
 }
 
 main().catch((err) => {
