@@ -78,7 +78,18 @@ const schema = z.object({
   DRAFT_TTL_S: z.coerce.number().int().positive().default(3600),
 });
 
-const parsed = schema.safeParse(process.env);
+export const preprocessedSchema = z.preprocess((val) => {
+  if (typeof val !== "object" || val === null) return val;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(val)) {
+    if (v !== "") {
+      out[k] = v;
+    }
+  }
+  return out;
+}, schema);
+
+const parsed = preprocessedSchema.safeParse(process.env);
 if (!parsed.success) {
   console.error("Invalid environment configuration:");
   for (const issue of parsed.error.issues) {

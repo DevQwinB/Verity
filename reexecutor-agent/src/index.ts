@@ -23,7 +23,7 @@ const HEARTBEAT_MS = numberEnv("HEARTBEAT_INTERVAL_MS", 15_000, 1000);
 const RETRIEVAL_RETRY_BUDGET_S = numberEnv("RETRIEVAL_RETRY_BUDGET_S", 120, 1);
 // Any endpoint this worker must be able to reach anyway. If even this fails,
 // the problem is our network, and an unreachable target proves nothing.
-const CONNECTIVITY_CHECK_URL = process.env.CONNECTIVITY_CHECK_URL ?? RPC_URL;
+const CONNECTIVITY_CHECK_URL = process.env.CONNECTIVITY_CHECK_URL || RPC_URL;
 const ONCE = process.argv.includes("--once");
 
 function requireEnv(name: string): string {
@@ -38,7 +38,7 @@ function requireEnv(name: string): string {
 /** A numeric setting: unset or empty uses `fallback`; anything else must be a
  * finite number >= `min`, or the agent refuses to start. A bare `Number(...)`
  * turned a typo into NaN, i.e. a 1 ms poll loop or no retrieval retry wait. */
-function numberEnv(name: string, fallback: number, min: number): number {
+export function numberEnv(name: string, fallback: number, min: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return fallback;
   const value = Number(raw);

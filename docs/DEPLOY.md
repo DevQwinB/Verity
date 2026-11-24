@@ -277,16 +277,9 @@ integers except `REPLAY_OVERASSIGN` and `DB_STATEMENT_TIMEOUT_MS`, which also ac
 | `ATTESTATION_SIGNING_SECRET` | the keeper key | Stellar secret key that signs verdict attestations. Give it its own key so rotating the fund-moving keeper key does not change every future attestation's signer. |
 | `RATE_LIMIT_PER_MINUTE` | `300` | Requests per minute per account with a valid bearer token, otherwise per client address. `/health*` is exempt; `X-Forwarded-For` supplies the address only with `TRUST_PROXY=true`. |
 
-Outside Docker, add these settings to `backend/.env`, loaded by `dotenv`,
-and restart the backend. `backend/.env.example` shows commented defaults;
-uncomment only the values you want to override.
-
-The current `docker-compose.yml` passes a fixed `backend.environment` list
-and has no `env_file`; it does **not** forward these variables. Adding
-them to the root `.env` or `backend/.env` alone does not configure the
-container. Defaults apply unless you also add the desired variables to the
-backend service's `environment` mapping (or a Compose override) and recreate
-the backend container. This repository's Compose file is unchanged here.
+Add these settings to the root `.env` (forwarded to containers by `docker-compose.yml`)
+or to `backend/.env` outside Docker. `.env.example` and `backend/.env.example` show
+commented defaults; uncomment only the values you want to override.
 
 The request body limit is fixed at 1,048,576 bytes (1 MiB), including the JSON
 wrapper and base64 content. Base64 uses about four bytes per three decoded
