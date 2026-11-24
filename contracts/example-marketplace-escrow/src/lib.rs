@@ -13,9 +13,17 @@
 
 mod events;
 
-use events::{EscrowCreated, EscrowReleased};
+use events::{EscrowCreated, EscrowRefunded, EscrowReleased};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
 use verity_common::{Error, SubmissionRecord, Verdict};
+
+/// The longest challenge window `EscrowGate` accepts (`MAX_WINDOW_S` in
+/// contracts/escrow-gate/src/lib.rs): 7 days. Duplicated rather than shared,
+/// because depending on the `escrow-gate` crate at runtime would link its
+/// `#[contractimpl]` entrypoints into this contract's wasm and expose them as
+/// this contract's own. EscrowGate is only ever reached here by address, via
+/// `invoke_contract`; the crate is a dev-dependency for the tests alone.
+const MAX_CHALLENGE_WINDOW_S: u64 = 7 * 24 * 60 * 60; // 604_800
 
 /// Grace after an escrow's deadline before its poster may reclaim it. Covers
 /// the longest legitimate in-flight lifetime of work started before the
@@ -23,7 +31,7 @@ use verity_common::{Error, SubmissionRecord, Verdict};
 /// challenge window at the deadline, and a challenge opened as that window
 /// closes can run for one further window before `release()` sees a terminal
 /// verdict. Two maximum challenge windows bound that worst case.
-const REFUND_GRACE_S: u64 = 2 * escrow_gate::MAX_WINDOW_S;
+const REFUND_GRACE_S: u64 = 2 * MAX_CHALLENGE_WINDOW_S;
 
 #[contracttype]
 #[derive(Clone)]
@@ -102,6 +110,11 @@ impl ExampleMarketplaceEscrow {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
+        // A deadline already in the past would let the poster refund the
+        // moment the escrow is created, with no window for the payee at all.
+        if deadline <= e.ledger().timestamp() {
+            return Err(Error::DeadlineInThePast);
+        }
         let bond_asset: Address = e
             .storage()
             .instance()
@@ -118,6 +131,7 @@ impl ExampleMarketplaceEscrow {
                 payee: payee.clone(),
                 poster: poster.clone(),
                 amount,
+                deadline,
                 released: false,
             },
         );
