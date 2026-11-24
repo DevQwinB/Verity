@@ -34,7 +34,28 @@ const TOTAL_TIMEOUT_MS = 30_000;
  * anything (after the retry budget a still-failing target is voted as a
  * mismatch).
  */
-export class RetrievalTransientError extends Error {}
+export class RetrievalTransientError extends Error {
+  readonly retryAfterMs?: number;
+
+  constructor(message: string, retryAfterMs?: number) {
+    super(message);
+    this.name = "RetrievalTransientError";
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+export function parseRetryAfter(header: string | undefined): number | undefined {
+  if (!header) return undefined;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.round(seconds * 1000);
+  }
+  const dateMs = Date.parse(header);
+  if (!Number.isNaN(dateMs)) {
+    return Math.max(0, dateMs - Date.now());
+  }
+  return undefined;
+}
 
 interface PinnedTarget {
   url: URL;
@@ -90,7 +111,10 @@ export async function resolvePublicTarget(raw: string, opts: { allowPrivate: boo
 /** One GET to the pinned address, never following redirects. Resolves with
  * any HTTP response; rejects with RetrievalTransientError when no response
  * could be obtained. */
-export function getPinned(target: PinnedTarget, totalTimeoutMs = TOTAL_TIMEOUT_MS): Promise<{ status: number; body: string }> {
+export function getPinned(
+  target: PinnedTarget,
+  totalTimeoutMs = TOTAL_TIMEOUT_MS
+): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const transport = target.url.protocol === "https:" ? https : http;
     const req = transport.get(
@@ -121,7 +145,13 @@ export function getPinned(target: PinnedTarget, totalTimeoutMs = TOTAL_TIMEOUT_M
           }
           chunks.push(chunk);
         });
-        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString("utf8"),
+            headers: res.headers,
+          })
+        );
         res.on("error", (err) => reject(new RetrievalTransientError(`response interrupted: ${err.message}`)));
       }
     );
@@ -194,7 +224,8 @@ export async function runRetrieval(spec: RetrievalSpec): Promise<{ outputHash: s
   // legitimate mismatch anyway: the agent declared this URL, not another.
   if (res.status >= 300 && res.status < 400) throw new Error(`retrieval target redirected (HTTP ${res.status})`);
   if (isInconclusiveStatus(res.status)) {
-    throw new RetrievalTransientError(`retrieval target answered HTTP ${res.status}`);
+    const retryAfter = parseRetryAfter(res.headers["retry-after"]);
+    throw new RetrievalTransientError(`retrieval target answered HTTP ${res.status}`, retryAfter);
   }
   if (res.status < 200 || res.status >= 300) throw new Error(`retrieval target answered HTTP ${res.status}`);
 
