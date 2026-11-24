@@ -25,6 +25,7 @@ export async function recordTerminalVerdict(
   submissionRowId: string,
   status: string,
   txHash?: string | null,
+  closedAt?: Date,
   deps: VerdictDeps = {}
 ) {
   if (!TERMINAL.includes(status as TerminalStatus)) return;
@@ -75,7 +76,7 @@ export async function recordTerminalVerdict(
     // A challenge that lapsed without a resolution is closed out off-chain too.
     await database
       .updateTable("challenge")
-      .set({ resolved_at: new Date() })
+      .set({ resolved_at: closedAt ?? new Date() })
       .where("submission_id", "=", sub.id)
       .where("resolved_at", "is", null)
       .execute();

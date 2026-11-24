@@ -206,7 +206,7 @@ test("transitioning to expired_unverified delivers once to subscribed hooks and 
   });
 
   const txHash = "a".repeat(64);
-  await recordTerminalVerdict(SUBMISSION_ID, "expired_unverified", txHash, harness.deps);
+  await recordTerminalVerdict(SUBMISSION_ID, "expired_unverified", txHash, undefined, harness.deps);
   // Allow background Promise.allSettled in dispatchWebhook to settle.
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -232,7 +232,7 @@ test("transitioning to expired_unverified delivers once to subscribed hooks and 
   ]);
 
   // Repeating recordTerminalVerdict once already terminal must not fire again.
-  await recordTerminalVerdict(SUBMISSION_ID, "expired_unverified", txHash, harness.deps);
+  await recordTerminalVerdict(SUBMISSION_ID, "expired_unverified", txHash, undefined, harness.deps);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(harness.deliveries.length, 2);
 });
@@ -245,7 +245,7 @@ test("expired_unverified without txHash sends tx_hash: null, fills resolution_me
     chainResolutionMethod: { tag: "WindowElapsed" },
   });
 
-  await recordTerminalVerdict(SUBMISSION_ID, "expired_unverified", undefined, harness.deps);
+  await recordTerminalVerdict(SUBMISSION_ID, "expired_unverified", undefined, undefined, harness.deps);
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.deepEqual(harness.deliveries, [
@@ -276,7 +276,7 @@ test("verified and slashed continue to dispatch with the same payload shape", as
     });
 
     const txHash = "b".repeat(64);
-    await recordTerminalVerdict(SUBMISSION_ID, terminal, txHash, harness.deps);
+    await recordTerminalVerdict(SUBMISSION_ID, terminal, txHash, undefined, harness.deps);
     await new Promise((resolve) => setImmediate(resolve));
 
     assert.deepEqual(harness.deliveries, [
@@ -309,8 +309,8 @@ test("non-terminal statuses are ignored and dispatch no webhook", async () => {
     ],
   });
 
-  await recordTerminalVerdict(SUBMISSION_ID, "pending", null, harness.deps);
-  await recordTerminalVerdict(SUBMISSION_ID, "disputed", null, harness.deps);
+  await recordTerminalVerdict(SUBMISSION_ID, "pending", null, undefined, harness.deps);
+  await recordTerminalVerdict(SUBMISSION_ID, "disputed", null, undefined, harness.deps);
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(harness.deliveries.length, 0);

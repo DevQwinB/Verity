@@ -45,6 +45,13 @@ fn validate_config(cfg: &ConfigRecord) -> Result<(), Error> {
     {
         return Err(Error::InvalidConfig);
     }
+    // The tiers exist so that a larger escrow can be challenged for longer.
+    // With the small window the longer one, submit() would give a small job
+    // more time than a large one. Equal windows are fine: one window for
+    // every escrow, as the dev deployment has.
+    if cfg.window_tier_small_s > cfg.window_tier_large_s {
+        return Err(Error::InvalidConfig);
+    }
     if cfg.agent_bond_min_bps == 0 || cfg.agent_bond_min_bps > ConfigRecord::MAX_BPS {
         return Err(Error::InvalidConfig);
     }
@@ -488,6 +495,21 @@ impl EscrowGate {
         if sub.finalized {
             return Err(Error::ChallengeWindowClosed);
         }
+        // With no challenge open, the verdict of a window is settled the moment
+        // the window closes: finalize() only reads the tally, whenever somebody
+        // calls it. A vote accepted after that would change a verdict that was
+        // already decided, and the outcome would depend on who reached the
+        // chain first. The deadline second is closed, as it is for
+        // open_challenge and finalize.
+        //
+        // A challenged submission is the exception: resolve_challenge needs a
+        // consensus, and that may only form after the window, so votes on it
+        // are accepted until it is finalized.
+        if storage::get_challenge(&e, submission_id).is_none()
+            && e.ledger().timestamp() >= sub.submitted_at.saturating_add(sub.challenge_window_s)
+        {
+            return Err(Error::ChallengeWindowClosed);
+        }
         // The agent being checked cannot vote on its own work.
         if reexecutor == sub.agent {
             return Err(Error::AgentCannotAttest);
@@ -574,6 +596,15 @@ impl EscrowGate {
     ) -> Result<(), Error> {
         challenger.require_auth();
         let sub = storage::get_submission(&e, submission_id).ok_or(Error::SubmissionNotFound)?;
+        // The agent may not challenge its own submission, as it may not vote on
+        // it (AgentCannotAttest). On a slash the challenger is paid a share of
+        // the forfeited bond, so a self-challenge would hand part of that bond
+        // back to the party that forfeited it, and it would take the one
+        // challenge slot from an honest challenger. Only this address is
+        // refused: another address the agent controls looks like anyone else.
+        if challenger == sub.agent {
+            return Err(Error::AgentCannotChallenge);
+        }
         if sub.finalized {
             return Err(Error::ChallengeWindowClosed);
         }
@@ -726,6 +757,11 @@ impl EscrowGate {
     pub fn slash(e: Env, reexecutor: Address, submission_id: u64) -> Result<i128, Error> {
         if storage::is_slashed(&e, submission_id, &reexecutor) {
             return Err(Error::AlreadySlashed);
+        }
+        // Once the attestation lock has been released the vote is settled;
+        // stake deposited afterwards must never be taken for an older vote.
+        if storage::is_released(&e, submission_id, &reexecutor) {
+            return Err(Error::AttestationAlreadyReleased);
         }
         let sub = storage::get_submission(&e, submission_id).ok_or(Error::SubmissionNotFound)?;
         if !sub.finalized {
