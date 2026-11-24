@@ -1,15 +1,13 @@
 import "dotenv/config";
 import "./net.js";
-import { createHash } from "node:crypto";
 import { Keypair, TransactionBuilder } from "@stellar/stellar-sdk";
 import { basicNodeSigner } from "@stellar/stellar-sdk/contract";
 import { Client as EscrowGateClient } from "escrow-gate";
-import type { SubmissionRecord } from "escrow-gate";
-import { REPLAY_ENGINE, ReplayInfrastructureError, runDeterministicFunction } from "./sandbox/runner.js";
-import { hasConnectivity, RetrievalTransientError, runRetrieval } from "./sandbox/retrieval.js";
+import { REPLAY_ENGINE, runDeterministicFunction } from "./sandbox/runner.js";
+import { hasConnectivity, runRetrieval } from "./sandbox/retrieval.js";
 import { assertSep10Challenge } from "./sep10.js";
-import { NO_OUTPUT_HASH, voteMatches } from "./vote.js";
 import { startHeartbeat } from "./heartbeat.js";
+import { createWorker } from "./worker.js";
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:3001";
 const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
@@ -109,183 +107,30 @@ async function fetchArtifact(ref: string): Promise<Buffer> {
   return Buffer.from(content_base64, "base64");
 }
 
-interface Assignment {
-  function_ref: string | null;
-  input_ref: string | null;
-  chain_submission_id: string;
-}
-
-const noOutput = (why: string) => ({ outputHash: NO_OUTPUT_HASH, engine: why });
-
-const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
-
-/** When this process first failed to reach a submission's retrieval target.
- * Entries live only while the backend still lists the assignment (see
- * `pruneToListed`). */
-const firstUnreachableAt = new Map<string, number>();
-
-/**
- * Re-derives the output from the submission's own declared artifacts.
- *
- * A vote is bonded and irreversible, so the line between two kinds of
- * failure is the whole job here:
- *  - the *submission's* fault (it throws, exceeds the sandbox's limits, its
- *    spec is malformed, its target answers differently) resolves to a
- *    mismatch — an agent must not dodge a slash by submitting work that
- *    cannot be replayed;
- *  - *this worker's* trouble (backend or network unreachable, sandbox could
- *    not run on this host) throws instead. Nothing is voted and the
- *    assignment is retried on the next poll.
- *
- * What the agent committed to is read from the contract, not from the
- * backend: the task type, and the hash the input must have.
- */
-async function reExecute(
-  a: Assignment,
-  record: SubmissionRecord
-): Promise<{ outputHash: string; engine: string }> {
-  if (!a.input_ref) return noOutput("none (no input artifact declared)");
-  const inputBytes = await fetchArtifact(a.input_ref);
-  if (createHash("sha256").update(inputBytes).digest("hex") !== hex(record.input_hash)) {
-    // Not the agent's doing: the contract holds the right hash, the backend
-    // handed over something else. Refuse to vote on the wrong input.
-    throw new Error("backend served an input artifact that does not match the on-chain input_hash");
-  }
-
-  if (record.task_type.tag === "Retrieval") {
-    let spec;
-    try {
-      spec = JSON.parse(inputBytes.toString("utf8"));
-    } catch {
-      return noOutput("retrieval failed: the request spec is not JSON");
-    }
-    try {
-      return await runRetrieval(spec);
-    } catch (err) {
-      const message = (err as Error).message;
-      if (!(err instanceof RetrievalTransientError)) return noOutput(`retrieval failed: ${message}`);
-
-      const now = Date.now() / 1000;
-      const first = firstUnreachableAt.get(a.chain_submission_id) ?? now;
-      firstUnreachableAt.set(a.chain_submission_id, first);
-      const budget = Math.min(RETRIEVAL_RETRY_BUDGET_S, Number(record.challenge_window_s) / 2);
-      const giveUpAt = Math.max(Number(record.submitted_at), first) + budget;
-      if (now < giveUpAt) {
-        throw new Error(`retrieval inconclusive (${message}); retrying for another ${Math.ceil(giveUpAt - now)}s before judging`);
-      }
-      if (!(await hasConnectivity(CONNECTIVITY_CHECK_URL))) {
-        throw new Error(`retrieval inconclusive (${message}) and this host has no outbound connectivity; not voting`);
-      }
-      return noOutput(`retrieval failed: target unreachable for ${Math.round(budget)}s while this host was online (${message})`);
-    }
-  }
-
-  if (!a.function_ref) return noOutput("none (no function artifact declared)");
-  const functionSource = (await fetchArtifact(a.function_ref)).toString("utf8");
-  let input: unknown;
-  try {
-    input = JSON.parse(inputBytes.toString("utf8"));
-  } catch {
-    return noOutput("replay failed: the input artifact is not JSON");
-  }
-  try {
-    return await runDeterministicFunction(functionSource, input);
-  } catch (err) {
-    if (err instanceof ReplayInfrastructureError) throw err;
-    return noOutput(`replay failed: ${(err as Error).message}`);
-  }
-}
-
-/** Submissions this process has already voted on. The backend keeps listing
- * an assignment until its indexer sees our ReplayAttested event a few
- * seconds later; without this we would re-run and re-send in the meantime.
- * Entries live only while the backend still lists the assignment (see
- * `pruneToListed`). */
-const attested = new Set<string>();
-
-/** Set when the contract says this account may not vote at all (stake below
- * the floor, or not approved). Replaying is pointless until that changes, so
- * work is paused for a while instead of being retried every poll. */
-let votingBlockedUntil = 0;
-
-async function processAssignment(a: Assignment) {
-  if (attested.has(a.chain_submission_id)) return;
-  const record = (await client.get_submission({ id: BigInt(a.chain_submission_id) })).result;
-  if (!record) throw new Error("submission is not on-chain (yet)");
-  if (record.finalized) {
-    attested.add(a.chain_submission_id);
-    firstUnreachableAt.delete(a.chain_submission_id);
-    return;
-  }
-
-  console.log(`${tag} re-executing ${record.task_type.tag.toLowerCase()} submission #${a.chain_submission_id}`);
-  const { outputHash, engine } = await reExecute(a, record);
-  const claimed = hex(record.claimed_output_hash);
-  const matched = voteMatches(outputHash, claimed);
-  console.log(`${tag}   engine=${engine}`);
-  console.log(`${tag}   output=${outputHash} claimed=${claimed} matched=${matched}`);
-
-  try {
+const worker = createWorker({
+  api,
+  getSubmission: async (id) => (await client.get_submission({ id })).result,
+  attest: async ({ submissionId, outputHash, matched }) => {
     const tx = await client.attest_replay({
       reexecutor: publicKey,
-      submission_id: BigInt(a.chain_submission_id),
-      output_hash: Buffer.from(outputHash, "hex"),
+      submission_id: submissionId,
+      output_hash: outputHash,
       matched,
     });
     const sent = await tx.signAndSend();
     sent.result.unwrap();
-    console.log(`${tag}   attest_replay tx: ${sent.sendTransactionResponse?.hash ?? "(confirmed)"}`);
-  } catch (err) {
-    const code = /Error\(Contract, #(\d+)\)/.exec((err as Error).message ?? "")?.[1];
-    if (code === "20" || code === "27") {
-      // #20 ReexecutorNotActive, #27 ReexecutorNotApproved.
-      votingBlockedUntil = Date.now() + 60_000;
-      console.warn(
-        `${tag}   EscrowGate refused the vote: this account is ${code === "20" ? "not active (stake below the floor)" : "not approved as a voter"}. Pausing work for 60s.`
-      );
-      return;
-    }
-    // #23 AlreadyAttested: our vote is already on-chain. #32 ChallengeWindowClosed:
-    // the submission was finalized before we got to it. Either way there is
-    // nothing left for us to do for this submission.
-    if (code !== "23" && code !== "32") throw err;
-    console.log(`${tag}   nothing to do (already attested or already finalized)`);
-  }
-  attested.add(a.chain_submission_id);
-  firstUnreachableAt.delete(a.chain_submission_id);
-}
-
-/** Drops per-submission state for everything the backend no longer lists, so
- * a worker that runs for weeks only holds state for its current assignments.
- * Safe even if a pruned id is listed again later: `attest_replay` then fails
- * with #23 AlreadyAttested, which `processAssignment` already treats as
- * nothing to do, so the worst case is one redundant RPC call, never a second
- * vote. */
-function pruneToListed(listed: ReadonlySet<string>) {
-  for (const id of attested) if (!listed.has(id)) attested.delete(id);
-  for (const id of firstUnreachableAt.keys()) if (!listed.has(id)) firstUnreachableAt.delete(id);
-}
-
-async function pollOnce(reexecutorId: string) {
-  const { replay_assignments, spot_check_assignments } = await api<{
-    replay_assignments: Assignment[];
-    spot_check_assignments: Assignment[];
-  }>(`/v1/reexecutors/${reexecutorId}/assignments`);
-  // Only after a successful fetch: if `api` throws, nothing is pruned.
-  pruneToListed(new Set([...replay_assignments, ...spot_check_assignments].map((a) => a.chain_submission_id)));
-  // A sampled spot-check and a full replay are the same job for the worker:
-  // re-derive the output, then put a bonded vote on-chain.
-  // The poll above is what marks this worker online, so it runs even while
-  // voting is blocked.
-  if (Date.now() < votingBlockedUntil) return;
-  for (const assignment of [...replay_assignments, ...spot_check_assignments]) {
-    try {
-      await processAssignment(assignment);
-    } catch (err) {
-      console.error(`${tag}   assignment #${assignment.chain_submission_id} failed, will retry:`, (err as Error).message);
-    }
-  }
-}
+    return { hash: sent.sendTransactionResponse?.hash };
+  },
+  fetchArtifact,
+  runDeterministicFunction,
+  runRetrieval,
+  hasConnectivity,
+  config: {
+    retryBudgetS: RETRIEVAL_RETRY_BUDGET_S,
+    connectivityUrl: CONNECTIVITY_CHECK_URL,
+  },
+  publicKey,
+});
 
 async function main() {
   console.log(`[reexecutor-agent] starting as ${publicKey}`);
@@ -306,7 +151,7 @@ async function main() {
   }
 
   if (ONCE) {
-    await pollOnce(reexecutor.id);
+    await worker.pollOnce(reexecutor.id);
     return;
   }
   // A replay can run for minutes; the assignment poll cannot, so liveness
@@ -320,7 +165,7 @@ async function main() {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
-      await pollOnce(reexecutor.id);
+      await worker.pollOnce(reexecutor.id);
     } catch (err) {
       console.error(`${tag} poll failed, will retry:`, (err as Error).message);
     }
