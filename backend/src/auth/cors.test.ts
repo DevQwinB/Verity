@@ -27,7 +27,7 @@ Object.assign(process.env, {
 const { buildApp } = await import("../app.js");
 
 test("OPTIONS /auth preflight returns 204 and CORS allow headers", async () => {
-  const app = buildApp();
+  const app = await buildApp();
   const res = await app.inject({
     method: "OPTIONS",
     url: "/auth",
@@ -44,7 +44,7 @@ test("OPTIONS /auth preflight returns 204 and CORS allow headers", async () => {
 });
 
 test("GET /auth (200) includes access-control-allow-origin: *", async () => {
-  const app = buildApp();
+  const app = await buildApp();
   const res = await app.inject({
     method: "GET",
     url: `/auth?account=${client.publicKey()}`,
@@ -58,7 +58,7 @@ test("GET /auth (200) includes access-control-allow-origin: *", async () => {
 });
 
 test("GET /auth (400) includes access-control-allow-origin: *", async () => {
-  const app = buildApp();
+  const app = await buildApp();
   const res = await app.inject({
     method: "GET",
     url: `/auth?account=invalid_account_key`,
@@ -72,7 +72,7 @@ test("GET /auth (400) includes access-control-allow-origin: *", async () => {
 });
 
 test("POST /auth (400 on invalid body) includes access-control-allow-origin: *", async () => {
-  const app = buildApp();
+  const app = await buildApp();
   const res = await app.inject({
     method: "POST",
     url: "/auth",
@@ -88,7 +88,7 @@ test("POST /auth (400 on invalid body) includes access-control-allow-origin: *",
 });
 
 test("/v1/* routes do not include access-control-allow-origin header", async () => {
-  const app = buildApp();
+  const app = await buildApp();
   const res = await app.inject({
     method: "GET",
     url: "/v1/taxonomy",

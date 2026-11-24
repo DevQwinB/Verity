@@ -12,6 +12,13 @@ declare module "fastify" {
   }
 }
 
+/** Sign-in is where identities are minted, so it gets a much lower budget
+ * than the rest of the API. It applies per client address (and, for a request
+ * that already carries a valid token, per account too). */
+const authRateLimit = {
+  config: { rateLimit: { max: env.AUTH_REQUESTS_PER_MINUTE, timeWindow: "1 minute" } },
+};
+
 export async function authPlugin(app: FastifyInstance) {
   await app.register(cors, {
     origin: "*",
@@ -20,7 +27,7 @@ export async function authPlugin(app: FastifyInstance) {
     credentials: false,
   });
 
-  app.get("/auth", async (req) => {
+  app.get("/auth", authRateLimit, async (req) => {
     const query = z
       .object({
         account: z
@@ -37,7 +44,7 @@ export async function authPlugin(app: FastifyInstance) {
     return { transaction, network_passphrase: env.NETWORK_PASSPHRASE };
   });
 
-  app.post("/auth", async (req, reply) => {
+  app.post("/auth", authRateLimit, async (req, reply) => {
     const body = z.object({ transaction: z.string().min(1) }).parse(req.body);
     try {
       const { account } = verifyChallenge(body.transaction);
@@ -47,6 +54,10 @@ export async function authPlugin(app: FastifyInstance) {
       reply.code(400);
       return { error: err instanceof Error ? err.message : "invalid challenge" };
     }
+  });
+
+  app.get("/v1/session", { preHandler: requireAuth }, async (req) => {
+    return { account: req.stellarAccount };
   });
 }
 
