@@ -12,6 +12,7 @@ import {
   hasConnectivity,
   isInconclusiveStatus,
   isPrivateAddress,
+  RETRIEVAL_USER_AGENT,
   resolvePointer,
   resolvePublicTarget,
   RetrievalTransientError,
@@ -252,6 +253,17 @@ describe("isPrivateAddress", () => {
     "::ffff:a9fe:a9fe",
     "64:ff9b::a9fe:a9fe",
     "2002:7f00:1::",
+    // Non-global IANA IPv6 special-purpose blocks
+    "64:ff9b:1::a9fe:a9fe",
+    "64:ff9b:1::808:808",
+    "::ffff:0:7f00:1",
+    "::ffff:0:127.0.0.1",
+    "::ffff:0:808:808",
+    "2001:0:4136:e378::1",
+    "2001:2::1",
+    "2001:10::1",
+    "3fff::1",
+    "5f00::1",
     "not-an-ip",
   ];
 
@@ -273,6 +285,11 @@ describe("isPrivateAddress", () => {
     "169.253.1.1",
     "2001:4860:4860::8888",
     "2606:4700::1111",
+    "2606:4700:4700::1111",
+    "2001:2:1::1",
+    "2001:20::1",
+    "3fff:1000::1",
+    "5f01::1",
     "198.20.0.0",
     "::ffff:808:808",
     "64:ff9b::808:808",
@@ -311,6 +328,8 @@ describe("resolvePublicTarget", () => {
       { raw: "http://0x7f.0.0.1/", host: "127.0.0.1" },
       { raw: "http://2130706433/", host: "127.0.0.1" },
       { raw: "http://10.1.2.3/", host: "10.1.2.3" },
+      { raw: "http://[64:ff9b:1::a9fe:a9fe]/", host: "64:ff9b:1::a9fe:a9fe" },
+      { raw: "http://[::ffff:0:7f00:1]/", host: "::ffff:0:7f00:1" },
     ];
 
     for (const { raw, host } of blocked) {
@@ -754,4 +773,74 @@ test("getPinned gives up on a server that keeps dripping bytes past the overall 
     server.closeAllConnections();
     server.close();
   }
+});
+
+test("getPinned sends the documented User-Agent and Accept headers and no Authorization header", async () => {
+  let receivedHeaders: http.IncomingHttpHeaders | undefined;
+  const server = http.createServer((req, res) => {
+    receivedHeaders = req.headers;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"ok":true}');
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address() as AddressInfo;
+    const url = `http://127.0.0.1:${port}/`;
+    const res = await getPinned(await resolvePublicTarget(url, { allowPrivate: true }));
+    assert.equal(res.status, 200);
+    assert.equal(res.body, '{"ok":true}');
+    assert.ok(receivedHeaders);
+    assert.equal(receivedHeaders["user-agent"], RETRIEVAL_USER_AGENT);
+    assert.equal(receivedHeaders["user-agent"], "Verity-Reexecutor/1 (+https://github.com/DevQwinB/Verity)");
+    assert.equal(receivedHeaders.accept, "application/json, text/plain;q=0.9, */*;q=0.1");
+    assert.equal(receivedHeaders.authorization, undefined);
+    assert.equal(receivedHeaders.cookie, undefined);
+  } finally {
+    await close(server);
+  }
+});
+
+describe("runRetrieval URL credentials rejection", () => {
+  for (const url of [
+    "https://u:p@example.com/",
+    "https://u@example.com/",
+    "https://:p@example.com/",
+    "https://u:p@does-not-exist.invalid/",
+  ]) {
+    it(`rejects ${url} with a plain Error before any network call`, async () => {
+      await assert.rejects(
+        () => runRetrieval({ url }),
+        (err: unknown) => {
+          assert(!(err instanceof RetrievalTransientError), "should be a plain Error, not RetrievalTransientError");
+          assert(err instanceof Error);
+          assert.equal(err.message, "retrieval url must not contain credentials");
+          return true;
+        }
+      );
+    });
+  }
+
+  it("never connects to a server when the URL contains credentials", async () => {
+    let hits = 0;
+    const server = http.createServer((_req, res) => {
+      hits += 1;
+      res.end("ok");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const { port } = server.address() as AddressInfo;
+      await assert.rejects(
+        () => runRetrieval({ url: `http://u:p@127.0.0.1:${port}/` }),
+        (err: unknown) => {
+          assert(!(err instanceof RetrievalTransientError), "should be a plain Error");
+          assert(err instanceof Error);
+          assert.equal(err.message, "retrieval url must not contain credentials");
+          return true;
+        }
+      );
+      assert.equal(hits, 0);
+    } finally {
+      await close(server);
+    }
+  });
 });

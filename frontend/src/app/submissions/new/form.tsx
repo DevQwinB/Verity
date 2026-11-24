@@ -6,10 +6,10 @@ import { useWallet } from "../../../components/wallet-provider";
 import { Card, CardBody, CardHeader } from "../../../components/ui/card";
 import { Button } from "../../../components/ui/button";
 import { uploadArtifact, createSubmission, relaySubmission } from "../../../lib/client-api";
-import { signXdr } from "../../../lib/wallet";
-import { NETWORK_PASSPHRASE } from "../../../lib/config";
+import { assertWalletNetwork, signXdr, WalletError, wrongNetworkMessage } from "../../../lib/wallet";
 import { canonicalJson, parseJsonOrText } from "../../../lib/canonical";
 import { bpsToPercent, formatDuration, stroopsToXlm, xlmToStroops } from "../../../lib/format";
+import { validateRetrievalSpec } from "../../../lib/retrieval-spec";
 import type { GateConfig, TaskType } from "../../../lib/types";
 
 function textToBase64(text: string): string {
@@ -35,51 +35,16 @@ function utf8ByteLength(text: string): number {
 
 const formatKb = (bytes: number) => `${(bytes / 1000).toFixed(1)} KB`;
 
-function checkArtifactSize(name: string, text: string) {
+function checkArtifactSize(name: string, text: string, maxBytes: number = MAX_UPLOAD_ARTIFACT_BYTES) {
   const bytes = utf8ByteLength(text);
-  if (bytes > MAX_UPLOAD_ARTIFACT_BYTES) {
+  if (bytes > maxBytes) {
     throw new Error(
-      `The ${name} is ${formatKb(bytes)}. The largest artifact the dashboard can upload is about ${formatKb(MAX_UPLOAD_ARTIFACT_BYTES)}.`
+      `The ${name} is ${formatKb(bytes)}. The largest artifact the dashboard can upload is about ${formatKb(maxBytes)}.`
     );
   }
 }
 
-type Step = "idle" | "uploading" | "building" | "signing" | "relaying" | "done" | "error";
-
-/** A malformed retrieval spec is expensive: every re-executor fails to replay
- * it, votes "mismatch", and the agent's own bond is slashed (see
- * reexecutor-agent/src/sandbox/retrieval.ts). Catch what the worker would
- * reject here, before anything is uploaded or signed. */
-function validateRetrievalSpec(value: unknown): void {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(
-      'The request spec must be a JSON object, e.g. {"url": "https://...", "pointer": "/field"}.'
-    );
-  }
-  const spec = value as Record<string, unknown>;
-  const url = spec.url;
-  if (typeof url !== "string") {
-    throw new Error('The request spec needs a "url" starting with http:// or https://.');
-  }
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new Error(`"${url}" is not a valid URL. Use a full address like https://example.com/data.json.`);
-  }
-  // new URL() accepts javascript: and ftp: too; the worker only replays http(s).
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error('The "url" must start with http:// or https://.');
-  }
-  if (Object.hasOwn(spec, "pointer") && spec.pointer !== undefined) {
-    const pointer = spec.pointer;
-    if (typeof pointer !== "string" || (pointer !== "" && !pointer.startsWith("/"))) {
-      throw new Error(
-        'The "pointer" must be a JSON Pointer string: "" for the whole document, or starting with "/", e.g. "/network_passphrase".'
-      );
-    }
-  }
-}
+type Step = "idle" | "checking" | "uploading" | "building" | "signing" | "relaying" | "done" | "error";
 
 // The reference is free text that is hashed on-chain and shown in lists, so it is capped for sanity; keep it in line with any backend limit.
 const ESCROW_REF_MAX_LENGTH = 128;
@@ -88,10 +53,15 @@ const ESCROW_REF_MAX_LENGTH = 128;
  * window shown here are the ones EscrowGate will actually apply. */
 export function NewSubmissionForm({ config }: { config: GateConfig }) {
   const router = useRouter();
-  const { account, connecting, login } = useWallet();
+  const { account, connecting, networkOk, problem, login, reportWrongNetwork } = useWallet();
   // One key for this form: retrying after a declined signature reuses the
   // same draft instead of leaving a new unsigned one behind each time.
   const idempotencyKey = useRef<string | null>(null);
+
+  const maxArtifactBytes = Math.min(
+    config.artifact_max_bytes ?? MAX_UPLOAD_ARTIFACT_BYTES,
+    MAX_UPLOAD_ARTIFACT_BYTES
+  );
 
   const [escrowRef, setEscrowRef] = useState("");
   const [taskType, setTaskType] = useState<TaskType>("deterministic");
@@ -156,14 +126,14 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
     const output = canonicalJson(parseJsonOrText(outputContent));
     // Checked here, before anything is uploaded, so an oversize artifact is
     // named instead of failing the upload with a bare "Request body is too large".
-    checkArtifactSize("input", input);
-    checkArtifactSize("claimed output", output);
-    if (taskType === "deterministic") checkArtifactSize("function", functionContent);
+    checkArtifactSize("input", input, maxArtifactBytes);
+    checkArtifactSize("claimed output", output, maxArtifactBytes);
+    if (taskType === "deterministic") checkArtifactSize("function", functionContent, maxArtifactBytes);
     return { input, output };
   }
 
   async function handleSubmit() {
-    if (!account) return;
+    if (!account || !networkOk) return;
     setError(null);
     try {
       if (!escrowRefTrimmed) {
@@ -171,6 +141,8 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
       }
       const amounts = prepareAmounts();
       const artifacts = prepareArtifacts();
+      setStep("checking");
+      await assertWalletNetwork(config.network_passphrase);
       setStep("uploading");
       const input = await uploadArtifact(textToBase64(artifacts.input), "application/json");
       const output = await uploadArtifact(textToBase64(artifacts.output), "application/json");
@@ -180,7 +152,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
           : null;
 
       setStep("building");
-      const { submission, unsigned_transaction_xdr, network_passphrase } = await createSubmission({
+      const { submission, unsigned_transaction_xdr } = await createSubmission({
         escrow_ref: escrowRefTrimmed,
         task_type: taskType,
         input_hash: input.content_hash,
@@ -201,7 +173,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
 
       setStep("signing");
       const signed = await signXdr(unsigned_transaction_xdr, {
-        networkPassphrase: network_passphrase || NETWORK_PASSPHRASE,
+        networkPassphrase: config.network_passphrase,
         address: account,
       });
 
@@ -210,12 +182,23 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
       setStep("done");
       router.push(`/submissions/${submission.id}`);
     } catch (err) {
+      if (err instanceof WalletError && err.code === "wrong-network") {
+        reportWrongNetwork(err.message);
+        setStep("idle");
+        return;
+      }
       setError(err instanceof Error ? err.message : "Submission failed.");
       setStep("error");
     }
   }
 
   const busy = step !== "idle" && step !== "error";
+  const wrongNetworkNotice = !networkOk
+    ? problem?.code === "wrong-network"
+      ? problem.message
+      : wrongNetworkMessage()
+    : null;
+  const displayError = wrongNetworkNotice ?? error;
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -312,8 +295,8 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
             label={taskType === "retrieval" ? "Request spec (JSON)" : "Input (JSON)"}
             helper={
               taskType === "retrieval"
-                ? "The public URL you fetched, plus an optional JSON pointer to the value you extracted. A sampled re-executor re-fetches it."
-                : "Passed to your function as `input`."
+                ? `The public URL you fetched, plus an optional JSON pointer to the value you extracted (up to ${formatKb(maxArtifactBytes)}). A sampled re-executor re-fetches it.`
+                : `Passed to your function as \`input\` (up to ${formatKb(maxArtifactBytes)}).`
             }
           >
             {(control) => (
@@ -335,7 +318,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
           {taskType === "deterministic" && (
             <Field
               label="Function body (JavaScript)"
-              helper="The body of a pure function of `input` that returns the result. Re-executors run this exact artifact in a WebAssembly sandbox with no network, files or clock: `Date` and `Math.random` do not exist there, and compute and memory are capped. A function that throws or exceeds the limits counts as a mismatch."
+              helper={`The body of a pure function of \`input\` that returns the result (up to ${formatKb(maxArtifactBytes)}). Re-executors run this exact artifact in a WebAssembly sandbox with no network, files or clock: \`Date\` and \`Math.random\` do not exist there, and compute and memory are capped. A function that throws or exceeds the limits counts as a mismatch.`}
             >
               {(control) => (
                 <textarea
@@ -352,7 +335,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
           )}
           <Field
             label="Claimed output"
-            helper="JSON or plain text. Normalised to canonical JSON before hashing, so key order and whitespace do not matter."
+            helper={`JSON or plain text (up to ${formatKb(maxArtifactBytes)}). Normalised to canonical JSON before hashing, so key order and whitespace do not matter.`}
           >
             {(control) => (
               <textarea
@@ -369,25 +352,27 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
         </CardBody>
       </Card>
 
-      {error && (
+      {displayError && (
         <p role="alert" className="text-sm text-status-slashed">
-          {error}
+          {displayError}
         </p>
       )}
 
       {account ? (
-        <Button onClick={handleSubmit} disabled={busy || !escrowRefTrimmed || !inputContent || !outputContent}>
-          {step === "uploading"
-            ? "Uploading artifacts..."
-            : step === "building"
-              ? "Building transaction..."
-              : step === "signing"
-                ? "Awaiting signature in Freighter..."
-                : step === "relaying"
-                  ? "Submitting to testnet..."
-                  : step === "done"
-                    ? "Confirmed. Opening the submission..."
-                    : "Submit for verification"}
+        <Button onClick={handleSubmit} disabled={busy || !networkOk || !escrowRefTrimmed || !inputContent || !outputContent}>
+          {step === "checking"
+            ? "Checking Freighter..."
+            : step === "uploading"
+              ? "Uploading artifacts..."
+              : step === "building"
+                ? "Building transaction..."
+                : step === "signing"
+                  ? "Awaiting signature in Freighter..."
+                  : step === "relaying"
+                    ? "Submitting to testnet..."
+                    : step === "done"
+                      ? "Confirmed. Opening the submission..."
+                      : "Submit for verification"}
         </Button>
       ) : (
         <Button onClick={login} disabled={connecting}>

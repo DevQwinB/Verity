@@ -5,14 +5,14 @@
   "license": "Apache-2.0",
   "packageManager": "pnpm@10.22.0",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.6"
   },
   "scripts": {
     "dev": "bash scripts/dev.sh",
     "smoke": "bash scripts/smoke.sh",
     "db:migrate": "pnpm --filter @verity/db migrate",
     "test:contracts": "cd contracts && cargo test",
-    "build": "pnpm -r build",
+    "build": "pnpm -r --if-present run build",
     "typecheck": "pnpm -r --if-present run typecheck",
     "db:reset": "pnpm --filter @verity/db reset",
     "lint": "pnpm --filter @verity/frontend lint"

@@ -32,7 +32,7 @@ public issues; see [SECURITY.md](SECURITY.md).
 
 | Tool | Version | Needed for |
 |---|---|---|
-| Node.js | 20+ (CI uses 22) | backend, agent, dashboard |
+| Node.js | 22.6+ (CI and `.nvmrc` use 22) | backend, agent, dashboard |
 | pnpm | 10 | workspace |
 | [stellar-cli](https://developers.stellar.org/docs/tools/cli) | current | deploying, bindings, identities |
 | Rust | pinned by `contracts/rust-toolchain.toml` | contract work only |
@@ -132,7 +132,7 @@ For contract changes also run `cargo fmt` and `cargo clippy` inside
   `contracts/escrow-gate/src/test/proptest_model.rs` is a property-based model
   of the consensus outcome. A contract change needs a test, and a change to
   verdict, bond or slashing logic needs to keep the invariants listed in
-  [PRD §8](prd-01-zkml-agent-truth.md) holding. Run `cargo test` in
+  [PRD §8](docs/PRD.md) holding. Run `cargo test` in
   `contracts/` (or `pnpm test:contracts`).
 - **End to end.** `pnpm smoke` (with `pnpm dev` running in another terminal)
   drives honest and dishonest work, challenges, and a wrong-voting
