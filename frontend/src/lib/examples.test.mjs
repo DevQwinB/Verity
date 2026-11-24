@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { canonicalJson, parseJsonOrText } from "./canonical.ts";
 import { EXAMPLES, EXAMPLE_LIST, generateExampleEscrowRef } from "./examples.ts";
-import { validateRetrievalSpec } from "./retrieval.ts";
+import { validateRetrievalSpec } from "./retrieval-spec.ts";
 
 function runDeterministicInNode(functionBody, inputJson) {
   const input = JSON.parse(inputJson);
