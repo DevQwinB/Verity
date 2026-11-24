@@ -7,7 +7,7 @@ import { Button } from "./ui/button";
 import { buildStakeWithdrawal, relayReexecutorStake } from "../lib/client-api";
 import { signXdr } from "../lib/wallet";
 import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../lib/config";
-import { stroopsToXlm, xlmToStroops } from "../lib/format";
+import { parseXlmAmount, stroopsToXlm } from "../lib/format";
 
 /** Lets a re-executor take stake back out. Renders nothing unless the
  * connected wallet is this re-executor's own account. */
@@ -29,16 +29,19 @@ export function WithdrawStake({
   const [error, setError] = useState<string | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
 
+  const amountParsed = parseXlmAmount(amountXlm);
+  const amountError = amountXlm.trim() !== "" && !amountParsed.ok ? amountParsed.reason : null;
+
   if (wallet.account !== account || BigInt(stakeStroops) === BigInt(0)) return null;
 
   async function handleWithdraw() {
     setError(null);
     setTxHash(null);
-    const amount = xlmToStroops(amountXlm);
-    if (amount === null) {
-      setError("Enter the amount as a positive XLM figure, for example 100.");
+    if (!amountParsed.ok) {
+      setError(amountParsed.reason);
       return;
     }
+    const amount = amountParsed.stroops;
     if (amount > BigInt(stakeStroops)) {
       setError(`You have ${stroopsToXlm(stakeStroops)} XLM staked.`);
       return;
@@ -78,8 +81,15 @@ export function WithdrawStake({
             value={amountXlm}
             onChange={(e) => setAmountXlm(e.target.value)}
             placeholder={stroopsToXlm(stakeStroops)}
+            aria-describedby={amountError ? "withdraw-amount-error" : undefined}
+            aria-invalid={amountError ? true : undefined}
             className="w-40 rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
           />
+          {amountError && (
+            <p id="withdraw-amount-error" role="alert" className="text-xs text-status-slashed">
+              {amountError}
+            </p>
+          )}
         </div>
         <Button variant="secondary" onClick={handleWithdraw} disabled={busy !== null}>
           {busy === "building"

@@ -9,7 +9,7 @@ import { uploadArtifact, createSubmission, relaySubmission } from "../../../lib/
 import { signXdr } from "../../../lib/wallet";
 import { NETWORK_PASSPHRASE } from "../../../lib/config";
 import { canonicalJson, parseJsonOrText } from "../../../lib/canonical";
-import { bpsToPercent, formatDuration, stroopsToXlm, xlmToStroops } from "../../../lib/format";
+import { bpsToPercent, formatDuration, parseXlmAmount, stroopsToXlm } from "../../../lib/format";
 import type { GateConfig, TaskType } from "../../../lib/types";
 
 function textToBase64(text: string): string {
@@ -104,8 +104,10 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
   const [error, setError] = useState<string | null>(null);
 
   const escrowRefTrimmed = escrowRef.trim();
-  const escrowValue = xlmToStroops(escrowValueXlm);
-  const bondValue = xlmToStroops(bondXlm);
+  const escrowParsed = parseXlmAmount(escrowValueXlm);
+  const bondParsed = parseXlmAmount(bondXlm);
+  const escrowValue = escrowParsed.ok ? escrowParsed.stroops : null;
+  const bondValue = bondParsed.ok ? bondParsed.stroops : null;
   const minBond =
     escrowValue === null ? null : (escrowValue * BigInt(config.agent_bond_min_bps)) / BigInt(10_000);
   const windowS =
@@ -116,19 +118,19 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
   /** Amounts are checked here, in words, before anything is uploaded or a
    * wallet prompt appears. */
   function prepareAmounts(): { escrowValue: string; bond: string } {
-    if (escrowValue === null) {
-      throw new Error("Enter the escrow value as a positive XLM amount, for example 100.");
+    if (!escrowParsed.ok) {
+      throw new Error(escrowParsed.reason);
     }
-    const bond = xlmToStroops(bondXlm);
-    if (bond === null) {
-      throw new Error("Enter the bond as a positive XLM amount, for example 5.");
+    if (!bondParsed.ok) {
+      throw new Error(bondParsed.reason);
     }
+    const bond = bondParsed.stroops;
     if (minBond !== null && bond < minBond) {
       throw new Error(
         `The bond must be at least ${stroopsToXlm(minBond.toString())} XLM: ${bpsToPercent(config.agent_bond_min_bps)} of the escrow value.`
       );
     }
-    return { escrowValue: escrowValue.toString(), bond: bond.toString() };
+    return { escrowValue: escrowParsed.stroops.toString(), bond: bond.toString() };
   }
 
   /** Re-executors parse the input as JSON and hash their output in
@@ -268,6 +270,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
             <Field
               label="Escrow value (XLM)"
               helper={`What the work is worth to the marketplace. Sets the bond floor and the challenge window: ${formatDuration(windowS)} at this value.`}
+              error={escrowValueXlm.trim() !== "" && !escrowParsed.ok ? escrowParsed.reason : undefined}
             >
               {(control) => (
                 <input
@@ -275,7 +278,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
                   inputMode="decimal"
                   value={escrowValueXlm}
                   onChange={(e) => setEscrowValueXlm(e.target.value)}
-                  aria-invalid={escrowValueXlm !== "" && escrowValue === null}
+                  aria-invalid={escrowValueXlm.trim() !== "" && !escrowParsed.ok}
                   className={`${inputClass} font-mono`}
                 />
               )}
@@ -287,6 +290,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
                   ? `At least ${bpsToPercent(config.agent_bond_min_bps)} of the escrow value. Forfeited if the work is found wrong.`
                   : `At least ${stroopsToXlm(minBond.toString())} XLM (${bpsToPercent(config.agent_bond_min_bps)} of the escrow value). Returned if verified, forfeited if the work is found wrong.`
               }
+              error={bondXlm.trim() !== "" && !bondParsed.ok ? bondParsed.reason : undefined}
             >
               {(control) => (
                 <input
@@ -294,7 +298,7 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
                   inputMode="decimal"
                   value={bondXlm}
                   onChange={(e) => setBondXlm(e.target.value)}
-                  aria-invalid={bondXlm !== "" && bondValue === null}
+                  aria-invalid={bondXlm.trim() !== "" && !bondParsed.ok}
                   className={`${inputClass} font-mono`}
                 />
               )}
@@ -410,14 +414,22 @@ interface FieldControlProps {
 function Field({
   label,
   helper,
+  error,
   children,
 }: {
   label: string;
   helper?: string;
+  error?: string;
   children: (control: FieldControlProps) => React.ReactNode;
 }) {
   const controlId = useId();
   const helperId = useId();
+  const errorId = useId();
+
+  const describedBy = [helper ? helperId : null, error ? errorId : null]
+    .filter(Boolean)
+    .join(" ");
+
   return (
     <div className="block space-y-2">
       <label htmlFor={controlId} className="block text-sm text-text-secondary">
@@ -425,11 +437,16 @@ function Field({
       </label>
       {children({
         id: controlId,
-        "aria-describedby": helper ? helperId : undefined,
+        "aria-describedby": describedBy || undefined,
       })}
       {helper && (
         <span id={helperId} className="block max-w-[65ch] text-xs text-text-tertiary">
           {helper}
+        </span>
+      )}
+      {error && (
+        <span id={errorId} role="alert" className="block max-w-[65ch] text-xs text-status-slashed">
+          {error}
         </span>
       )}
     </div>

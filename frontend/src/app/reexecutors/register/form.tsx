@@ -8,7 +8,7 @@ import { Button, buttonClasses } from "../../../components/ui/button";
 import { registerReexecutor, relayReexecutorStake } from "../../../lib/client-api";
 import { signXdr } from "../../../lib/wallet";
 import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../../../lib/config";
-import { stroopsToXlm, xlmToStroops } from "../../../lib/format";
+import { parseXlmAmount, stroopsToXlm } from "../../../lib/format";
 import type { GateConfig } from "../../../lib/types";
 
 type Status = "idle" | "building" | "signing" | "relaying" | "done" | "error";
@@ -25,20 +25,22 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
 
   const floor = BigInt(config.min_stake_floor);
   const floorXlm = stroopsToXlm(config.min_stake_floor);
-  const stake = xlmToStroops(stakeXlm);
+  const stakeParsed = parseXlmAmount(stakeXlm);
+  const stake = stakeParsed.ok ? stakeParsed.stroops : null;
+  const stakeError = stakeXlm.trim() !== "" && !stakeParsed.ok ? stakeParsed.reason : null;
   const belowFloor = stake !== null && stake < floor;
 
   async function handleRegister() {
     if (!account) return;
     setError(null);
-    if (stake === null) {
-      setError("Enter the stake as a positive XLM amount, for example 1000.");
+    if (!stakeParsed.ok) {
+      setError(stakeParsed.reason);
       setStatus("error");
       return;
     }
     try {
       setStatus("building");
-      const { reexecutor, unsigned_transaction_xdr } = await registerReexecutor(stake.toString());
+      const { reexecutor, unsigned_transaction_xdr } = await registerReexecutor(stakeParsed.stroops.toString());
 
       setStatus("signing");
       const signed = await signXdr(unsigned_transaction_xdr, {
@@ -48,7 +50,7 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
 
       setStatus("relaying");
       const { tx_hash } = await relayReexecutorStake(reexecutor.id, signed);
-      setResult({ id: reexecutor.id, txHash: tx_hash, stake });
+      setResult({ id: reexecutor.id, txHash: tx_hash, stake: stakeParsed.stroops });
       setStatus("done");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Registration failed.");
@@ -144,9 +146,15 @@ export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
                   inputMode="decimal"
                   value={stakeXlm}
                   onChange={(e) => setStakeXlm(e.target.value)}
-                  aria-describedby="stake-help"
+                  aria-describedby={stakeError ? "stake-help stake-error" : "stake-help"}
+                  aria-invalid={stakeError ? true : undefined}
                   className="w-full max-w-xs rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
                 />
+                {stakeError && (
+                  <p id="stake-error" role="alert" className="text-xs text-status-slashed">
+                    {stakeError}
+                  </p>
+                )}
                 <p id="stake-help" className={belowFloor ? "text-xs text-status-pending" : "text-xs text-text-tertiary"}>
                   {belowFloor
                     ? `Below the ${floorXlm} XLM floor: this would be staked, but the account would not be assigned work.`
