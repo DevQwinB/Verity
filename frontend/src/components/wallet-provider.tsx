@@ -63,6 +63,14 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   const [networkPassphrase, setNetworkPassphrase] = useState(NETWORK_PASSPHRASE);
   const [problem, setProblem] = useState<WalletProblem | null>(null);
 
+  useEffect(() => {
+    getConfig()
+      .then((cfg) => {
+        if (cfg.network_passphrase) setNetworkPassphrase(cfg.network_passphrase);
+      })
+      .catch(() => {});
+  }, []);
+
   const applySession = useCallback((session: SessionInfo) => {
     setAccount(session.account);
     setExpiresAt(session.account ? session.expires_at : null);
@@ -72,6 +80,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   /** Drop the session locally. Pass a problem to explain it to the user. */
   const endSession = useCallback((nextProblem: WalletProblem | null) => {
     setAccount(null);
+    setNetworkOk(true);
     setExpiresAt(null);
     setStatus("signed-out");
     if (nextProblem) setProblem(nextProblem);
@@ -97,24 +106,11 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       cancelled = true;
     };
   }, [applySession]);
-      .then((s) => setAccount(s.account))
-      .catch(() => setAccount(null));
-    getConfig()
-      .then((cfg) => {
-        if (cfg.network_passphrase) setNetworkPassphrase(cfg.network_passphrase);
-      })
-      .catch(() => {});
-  }, []);
 
   // The session lives an hour. When the server stops recognising it, show
   // that here rather than leaving a connected-looking account that cannot act.
   useEffect(() => {
     const onExpired = () => endSession(SESSION_EXPIRED_PROBLEM);
-    const onExpired = () => {
-      setAccount(null);
-      setNetworkOk(true);
-      setProblem({ message: "Your session has expired. Connect your wallet again to continue.", code: null });
-    };
     window.addEventListener(SESSION_EXPIRED_EVENT, onExpired);
     return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
   }, [endSession]);
@@ -169,9 +165,6 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         // message below stays the one the user sees.
         apiLogout().catch(() => {});
         endSession({
-        setAccount(null);
-        setNetworkOk(true);
-        setProblem({
           message: "Freighter switched to a different account. Connect again to continue as that account.",
           code: null,
         });
@@ -188,8 +181,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       }
     });
     return () => watcher.stop();
-  }, [account, endSession]);
-  }, [account, networkPassphrase]);
+  }, [account, networkPassphrase, endSession]);
 
   const login = useCallback(async () => {
     setConnecting(true);
@@ -202,6 +194,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         address,
       });
       const { account: authedAccount } = await exchangeChallenge(signed);
+      setNetworkOk(true);
       // /api/auth answers with the account only; /api/session also carries the
       // cookie's exp, which the expiry timer needs now rather than after the
       // next reload.
@@ -213,8 +206,6 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         setExpiresAt(null);
         setStatus("signed-in");
       }
-      setNetworkOk(true);
-      setAccount(authedAccount);
     } catch (err) {
       setProblem({
         message: err instanceof Error ? err.message : "Wallet connection failed.",
@@ -223,8 +214,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setConnecting(false);
     }
-  }, [applySession]);
-  }, [networkPassphrase]);
+  }, [applySession, networkPassphrase]);
 
   const logout = useCallback(async () => {
     setProblem(null);
@@ -242,9 +232,6 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     }
     endSession(null);
   }, [endSession]);
-    setNetworkOk(true);
-    setAccount(null);
-  }, []);
 
   const dismissProblem = useCallback(() => {
     setProblem((current) => (current?.code === "wrong-network" && !networkOk ? current : null));
@@ -257,8 +244,8 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <WalletContext.Provider
-      value={{ status, account, connecting, problem, login, logout, dismissProblem }}
       value={{
+        status,
         account,
         connecting,
         networkOk,

@@ -16,8 +16,7 @@ type Status = "idle" | "checking" | "building" | "signing" | "relaying" | "done"
 /** `config` is the contract's live rule set: the stake floor, the slash
  * rate, and whether voting needs the admin's approval. */
 export function RegisterReexecutorForm({ config }: { config: GateConfig }) {
-  const { status: sessionStatus, account, connecting, login } = useWallet();
-  const { account, connecting, networkOk, problem, login, reportWrongNetwork } = useWallet();
+  const { status: sessionStatus, account, connecting, networkOk, problem, login, reportWrongNetwork } = useWallet();
   // Twice the floor by default: a single slash then leaves the account active.
   const [stakeXlm, setStakeXlm] = useState(stroopsToXlm((BigInt(config.min_stake_floor) * BigInt(2)).toString()));
   const [status, setStatus] = useState<Status>("idle");
@@ -191,15 +190,6 @@ pnpm --filter @verity/reexecutor-agent start`;
                   Checking session...
                 </Button>
               ) : account ? (
-                <Button onClick={handleRegister} disabled={status !== "idle" && status !== "error"}>
-                  {status === "building"
-                    ? "Building transaction..."
-                    : status === "signing"
-                      ? "Awaiting signature in Freighter..."
-                      : status === "relaying"
-                        ? "Submitting to testnet..."
-                        : "Stake and register"}
-              {account ? (
                 <Button onClick={handleRegister} disabled={(status !== "idle" && status !== "error") || !networkOk}>
                   {status === "checking"
                     ? "Checking Freighter..."

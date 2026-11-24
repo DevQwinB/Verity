@@ -30,10 +30,6 @@ export async function sessionInfo(): Promise<{
   expires_at: number | null;
 }> {
   const empty = { account: null, expires_at: null };
-/** The signed-in account, read from the session cookie without verifying
- * it — good enough to address a request or for display, never to authorise one (the backend
- * verifies the token itself on every call). */
-export async function unverifiedSessionAccount(): Promise<string | null> {
   const token = (await cookies()).get(SESSION_COOKIE)?.value;
   if (!token) return empty;
   try {
@@ -49,10 +45,13 @@ export async function unverifiedSessionAccount(): Promise<string | null> {
   }
 }
 
-/** The signed-in account alone, for server-side code that only needs to know
- * who is asking. */
-export async function sessionAccount(): Promise<string | null> {
+/** The signed-in account alone, read from the session cookie without
+ * verifying it — good enough to address a request or for display, never to
+ * authorise one (the backend verifies the token itself on every call). */
+export async function unverifiedSessionAccount(): Promise<string | null> {
   return (await sessionInfo()).account;
+}
+
 /** Kept for backwards compatibility with display-only callers; see unverifiedSessionAccount. */
 export const sessionAccount = unverifiedSessionAccount;
 

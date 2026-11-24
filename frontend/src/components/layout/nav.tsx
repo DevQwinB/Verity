@@ -21,8 +21,7 @@ const LINKS = [
 
 export function Nav() {
   const pathname = usePathname();
-  const { status, account, connecting, problem, login, logout, dismissProblem } = useWallet();
-  const { account, connecting, networkOk, problem, login, logout, dismissProblem } = useWallet();
+  const { status, account, connecting, networkOk, problem, login, logout, dismissProblem } = useWallet();
   const [menuOpen, setMenuOpen] = useState(false);
   const persistentProblem = problem?.code === "wrong-network" && !networkOk;
 
