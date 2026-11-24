@@ -6,7 +6,7 @@ import { sql } from "kysely";
 import { ZodError } from "zod";
 import { env } from "./config/env.js";
 import { db } from "./db.js";
-import { server } from "./chain/rpc.js";
+import { checkNetwork, server } from "./chain/rpc.js";
 import { contractErrorName } from "./chain/actions.js";
 import { HttpError } from "./http-error.js";
 import { authPlugin } from "./auth/plugin.js";
@@ -42,8 +42,11 @@ type Readiness = { code: number; body: unknown };
 async function computeReadiness(): Promise<Readiness> {
   const database = await check(() => sql`select 1`.execute(db));
   let latestLedger: number | null = null;
+  let networkOk = false;
   const rpc = await check(async () => {
-    latestLedger = (await server.getLatestLedger()).sequence;
+    const [latest, net] = await Promise.all([server.getLatestLedger(), server.getNetwork()]);
+    latestLedger = latest.sequence;
+    networkOk = checkNetwork(env.NETWORK_PASSPHRASE, net.passphrase) === null;
   });
   let indexerLag: number | null = null;
   if (database && latestLedger !== null) {
@@ -56,7 +59,7 @@ async function computeReadiness(): Promise<Readiness> {
     if (cursor) indexerLag = Math.max(0, latestLedger - Number(cursor.last_ledger));
   }
   const indexer = indexerLag === null || indexerLag <= MAX_INDEXER_LAG_LEDGERS;
-  const ok = database && rpc && indexer;
+  const ok = database && rpc && networkOk && indexer;
   return {
     code: ok ? 200 : 503,
     body: {
@@ -65,7 +68,7 @@ async function computeReadiness(): Promise<Readiness> {
       network_passphrase: env.NETWORK_PASSPHRASE,
       escrow_gate_contract_id: env.ESCROW_GATE_CONTRACT_ID,
       workers: env.RUN_WORKERS,
-      checks: { database, rpc, indexer, indexer_lag_ledgers: indexerLag },
+      checks: { database, rpc, network: networkOk, indexer, indexer_lag_ledgers: indexerLag },
     },
   };
 }

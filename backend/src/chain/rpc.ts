@@ -4,6 +4,17 @@ import { HttpError } from "../http-error.js";
 
 export const server = new rpc.Server(env.SOROBAN_RPC_URL);
 
+/**
+ * Validates that the Soroban RPC endpoint serves the expected network passphrase.
+ * Returns null if they match, or an error description string if they differ.
+ */
+export function checkNetwork(expectedPassphrase: string, rpcPassphrase: string): string | null {
+  if (expectedPassphrase !== rpcPassphrase) {
+    return `SOROBAN_RPC_URL serves "${rpcPassphrase}" but NETWORK_PASSPHRASE is "${expectedPassphrase}"`;
+  }
+  return null;
+}
+
 export interface GateCall {
   /** Account that pays for and authorises the transaction. */
   source: string;

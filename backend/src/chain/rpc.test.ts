@@ -29,7 +29,7 @@ Object.assign(process.env, {
   HOME_DOMAIN: "localhost",
 });
 
-const { parseGateCall, assertGateCall } = await import("./rpc.js");
+const { parseGateCall, assertGateCall, checkNetwork } = await import("./rpc.js");
 const { HttpError } = await import("../http-error.js");
 
 function expectHttpError(
@@ -58,6 +58,21 @@ function buildTx(
   }
   return builder.build();
 }
+
+describe("checkNetwork", () => {
+  it("returns null when expected and RPC network passphrases match", () => {
+    assert.equal(checkNetwork(Networks.TESTNET, Networks.TESTNET), null);
+    assert.equal(checkNetwork(Networks.PUBLIC, Networks.PUBLIC), null);
+  });
+
+  it("returns error string when network passphrases differ", () => {
+    const err = checkNetwork(Networks.TESTNET, Networks.PUBLIC);
+    assert.equal(
+      err,
+      `SOROBAN_RPC_URL serves "${Networks.PUBLIC}" but NETWORK_PASSPHRASE is "${Networks.TESTNET}"`
+    );
+  });
+});
 
 describe("parseGateCall", () => {
   const source = Keypair.random();
