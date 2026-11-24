@@ -398,7 +398,7 @@ Webhooks notify the marketplace associated with the account that submitted the
 work. `POST /v1/submissions` finds or creates this marketplace for the
 authenticated submitting Stellar account. Alternatively,
 `POST /v1/marketplaces` (bearer token; `{"name":"My marketplace"}`) creates
-or returns that account's marketplace.
+or renames that account's marketplace (1–100 characters, trimmed).
 
 Register a subscription with
 `POST /v1/marketplaces/:id/webhooks`, using a bearer token belonging to that
