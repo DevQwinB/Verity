@@ -27,7 +27,25 @@ const databaseUrl = z
     "must be a PostgreSQL connection URL starting with postgres:// or postgresql://"
   );
 
-const schema = z.object({
+const HOST_WITH_PORT_RE =
+  /^(?=.{1,253}(:\d{1,5})?$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:\d{1,5})?$/i;
+
+function isValidHostWithPort(value: string): boolean {
+  if (!HOST_WITH_PORT_RE.test(value)) return false;
+  const colon = value.indexOf(":");
+  if (colon === -1) return true;
+  const port = Number(value.slice(colon + 1));
+  return port >= 1 && port <= 65535;
+}
+
+const hostWithPort = z
+  .string()
+  .refine(
+    isValidHostWithPort,
+    "must be a host[:port] without scheme or path, e.g. api.verity.example"
+  );
+
+export const envSchema = z.object({
   SOROBAN_RPC_URL: z.string().url(),
   NETWORK_PASSPHRASE: z.string().min(1),
   ESCROW_GATE_CONTRACT_ID: contractId,
@@ -43,8 +61,8 @@ const schema = z.object({
   ATTESTATION_SIGNING_SECRET: secretSeed.optional(),
   JWT_SECRET: z.string().min(32, "must be at least 32 characters (openssl rand -hex 32)"),
   // Host (and port) users reach the auth endpoint on, without a scheme.
-  WEB_AUTH_DOMAIN: z.string().min(1),
-  HOME_DOMAIN: z.string().min(1),
+  WEB_AUTH_DOMAIN: hostWithPort,
+  HOME_DOMAIN: hostWithPort,
   // Scheme the public sees: "https" behind any real reverse proxy.
   PUBLIC_SCHEME: z.enum(["http", "https"]).default("http"),
   PORT: z.coerce.number().int().min(1).max(65535).default(3001),
@@ -64,6 +82,9 @@ const schema = z.object({
   // used for rate limiting comes from X-Forwarded-For.
   TRUST_PROXY: flag("false"),
   RATE_LIMIT_PER_MINUTE: z.coerce.number().int().positive().default(300),
+  /** Sign-in requests per client address per minute. Minting an identity costs
+   * a GET and a POST /auth, so this stays far below the general budget. */
+  AUTH_REQUESTS_PER_MINUTE: z.coerce.number().int().positive().default(20),
 
   // A re-executor counts as online if its worker polled for work this recently.
   REEXECUTOR_LIVENESS_S: z.coerce.number().int().positive().default(60),
@@ -76,9 +97,23 @@ const schema = z.object({
   // Unsigned submission drafts older than this are deleted. Must outlast the
   // validity of the transaction built for them.
   DRAFT_TTL_S: z.coerce.number().int().positive().default(3600),
+  // Validity and confirmation timeout in seconds for keeper transactions
+  // (finalize, resolve_challenge, release_attestation_lock).
+  KEEPER_TX_TIMEOUT_S: z.coerce.number().int().min(10).default(30),
 });
 
-const parsed = schema.safeParse(process.env);
+export const preprocessedSchema = z.preprocess((val) => {
+  if (typeof val !== "object" || val === null) return val;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(val)) {
+    if (v !== "") {
+      out[k] = v;
+    }
+  }
+  return out;
+}, envSchema);
+
+const parsed = preprocessedSchema.safeParse(process.env);
 if (!parsed.success) {
   console.error("Invalid environment configuration:");
   for (const issue of parsed.error.issues) {
@@ -89,3 +124,10 @@ if (!parsed.success) {
 }
 
 export const env = parsed.data;
+
+/**
+ * The SEP-10 endpoint advertised in the SEP-1 file. Session tokens name it as
+ * their issuer, so a token minted by a deployment with a different endpoint is
+ * rejected even if both deployments happen to share JWT_SECRET.
+ */
+export const webAuthEndpoint = `${env.PUBLIC_SCHEME}://${env.WEB_AUTH_DOMAIN}/auth`;
