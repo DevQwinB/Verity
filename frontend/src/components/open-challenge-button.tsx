@@ -7,7 +7,7 @@ import { Button } from "./ui/button";
 import { openChallenge, relayChallenge } from "../lib/client-api";
 import { signXdr } from "../lib/wallet";
 import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../lib/config";
-import { stroopsToXlm, xlmToStroops } from "../lib/format";
+import { parseXlmAmount, stroopsToXlm } from "../lib/format";
 
 const POLL_EVERY_MS = 3000;
 const GIVE_UP_AFTER_MS = 60_000;
@@ -36,6 +36,9 @@ export function OpenChallengeButton({
   const [stalled, setStalled] = useState(false);
   const [windowOpen, setWindowOpen] = useState(() => Date.now() < new Date(deadlineIso).getTime());
 
+  const bondParsed = parseXlmAmount(bondXlm);
+  const bondError = bondXlm.trim() !== "" && !bondParsed.ok ? bondParsed.reason : null;
+
   useEffect(() => {
     const id = setInterval(() => setWindowOpen(Date.now() < new Date(deadlineIso).getTime()), 1000);
     return () => clearInterval(id);
@@ -62,11 +65,11 @@ export function OpenChallengeButton({
   async function handleChallenge() {
     if (!account) return;
     setError(null);
-    const bond = xlmToStroops(bondXlm);
-    if (bond === null) {
-      setError("Enter the bond as a positive XLM amount, for example 5 or 5.5.");
+    if (!bondParsed.ok) {
+      setError(bondParsed.reason);
       return;
     }
+    const bond = bondParsed.stroops;
     if (minBondStroops && bond < BigInt(minBondStroops)) {
       setError(`The bond must be at least ${stroopsToXlm(minBondStroops)} XLM for this submission.`);
       return;
@@ -144,9 +147,15 @@ export function OpenChallengeButton({
             inputMode="decimal"
             value={bondXlm}
             onChange={(e) => setBondXlm(e.target.value)}
-            aria-describedby="challenge-bond-help"
+            aria-describedby={bondError ? "challenge-bond-help challenge-bond-error" : "challenge-bond-help"}
+            aria-invalid={bondError ? true : undefined}
             className="w-36 rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
           />
+          {bondError && (
+            <p id="challenge-bond-error" role="alert" className="text-xs text-status-slashed">
+              {bondError}
+            </p>
+          )}
         </div>
         <Button variant="danger" onClick={handleChallenge} disabled={busy !== null}>
           {busy === "building"

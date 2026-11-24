@@ -2,9 +2,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   bpsToPercent,
+  describeContractError,
   formatCountdown,
   formatDuration,
   formatRelativeTime,
+  parseXlmAmount,
   stroopsToXlm,
   truncateMiddle,
   windowDeadlineIso,
@@ -17,6 +19,100 @@ const MIN = 60 * SEC;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
 const at = (offsetMs) => new Date(NOW + offsetMs).toISOString();
+
+describe("parseXlmAmount", () => {
+  it("rejects empty string", () => {
+    assert.deepEqual(parseXlmAmount(""), { ok: false, reason: "Enter an amount." });
+    assert.deepEqual(parseXlmAmount("   "), { ok: false, reason: "Enter an amount." });
+  });
+
+  it("rejects comma decimals or thousands separators", () => {
+    assert.deepEqual(parseXlmAmount("1,5"), {
+      ok: false,
+      reason: "Use a dot for decimals and no thousands separators.",
+    });
+    assert.deepEqual(parseXlmAmount("1,000"), {
+      ok: false,
+      reason: "Use a dot for decimals and no thousands separators.",
+    });
+  });
+
+  it("rejects negative numbers", () => {
+    assert.deepEqual(parseXlmAmount("-5"), {
+      ok: false,
+      reason: "The amount must be positive.",
+    });
+  });
+
+  it("rejects more than 7 decimal places", () => {
+    assert.deepEqual(parseXlmAmount("1.12345678"), {
+      ok: false,
+      reason: "Use at most 7 decimal places.",
+    });
+    assert.deepEqual(parseXlmAmount(".12345678"), {
+      ok: false,
+      reason: "Use at most 7 decimal places.",
+    });
+  });
+
+  it("rejects non-numeric inputs", () => {
+    assert.deepEqual(parseXlmAmount("abc"), {
+      ok: false,
+      reason: "Enter a number, like 5 or 0.5.",
+    });
+    assert.deepEqual(parseXlmAmount("1e3"), {
+      ok: false,
+      reason: "Enter a number, like 5 or 0.5.",
+    });
+    assert.deepEqual(parseXlmAmount("+5"), {
+      ok: false,
+      reason: "Enter a number, like 5 or 0.5.",
+    });
+  });
+
+  it("rejects zero amounts", () => {
+    assert.deepEqual(parseXlmAmount("0"), {
+      ok: false,
+      reason: "The amount must be more than zero.",
+    });
+    assert.deepEqual(parseXlmAmount("0.0"), {
+      ok: false,
+      reason: "The amount must be more than zero.",
+    });
+  });
+
+  it("accepts valid positive amounts with up to 7 decimals", () => {
+    assert.deepEqual(parseXlmAmount("5"), { ok: true, stroops: 50000000n });
+    assert.deepEqual(parseXlmAmount("0.5"), { ok: true, stroops: 5000000n });
+    assert.deepEqual(parseXlmAmount(".5"), { ok: true, stroops: 5000000n });
+    assert.deepEqual(parseXlmAmount("1."), { ok: true, stroops: 10000000n });
+    assert.deepEqual(parseXlmAmount("0.0000001"), { ok: true, stroops: 1n });
+  });
+});
+
+describe("describeContractError", () => {
+  it("describes known contract errors", () => {
+    assert.equal(
+      describeContractError("BondTooLow"),
+      "The bond amount is below the required minimum for this escrow value."
+    );
+    assert.equal(
+      describeContractError("ChallengeWindowClosed"),
+      "The challenge window for this submission has closed, so it can no longer be challenged."
+    );
+  });
+
+  it("returns null for unknown error names", () => {
+    assert.equal(describeContractError("UnknownErrorName"), null);
+    assert.equal(describeContractError(""), null);
+  });
+
+  it("does not crash or resolve prototype properties (__proto__, toString)", () => {
+    assert.equal(describeContractError("__proto__"), null);
+    assert.equal(describeContractError("toString"), null);
+    assert.equal(describeContractError("hasOwnProperty"), null);
+  });
+});
 
 describe("xlmToStroops", () => {
   const cases = [
