@@ -62,3 +62,45 @@ export async function backendGetOrNull<T>(path: string): Promise<T | null> {
   if (!res.ok) throw new BackendError(path, res.status, await res.text());
   return res.json() as Promise<T>;
 }
+
+const immutableCache = new Map<string, Promise<any>>();
+
+async function getImmutable(path: string): Promise<Response> {
+  const forwarded = await forwardedFor();
+  try {
+    return await fetch(`${BACKEND_URL}${path}`, {
+      cache: "force-cache",
+      headers: forwarded,
+      signal: AbortSignal.timeout(BACKEND_READ_TIMEOUT_MS),
+    });
+  } catch (err) {
+    unstable_rethrow(err);
+    throw new BackendError(path, null, err instanceof Error ? err.message : String(err));
+  }
+}
+
+/**
+ * Server-only fetch against the real backend for immutable resources
+ * (e.g. content-addressed artifacts by sha256 hash or unchanging proof status).
+ * Uses Next.js persistent cache (`cache: "force-cache"`) and an in-memory cache
+ * so resources are requested at most once per server instance.
+ */
+export async function backendGetImmutable<T>(path: string): Promise<T | null> {
+  const cached = immutableCache.get(path);
+  if (cached) return cached as Promise<T | null>;
+
+  const p = (async () => {
+    try {
+      const res = await getImmutable(path);
+      if (res.status === 404 || res.status === 400) return null;
+      if (!res.ok) throw new BackendError(path, res.status, await res.text());
+      return (await res.json()) as T;
+    } catch (err) {
+      immutableCache.delete(path);
+      throw err;
+    }
+  })();
+
+  immutableCache.set(path, p);
+  return p;
+}
