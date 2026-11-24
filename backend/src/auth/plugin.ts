@@ -3,7 +3,7 @@ import { StrKey } from "@stellar/stellar-sdk";
 import { z } from "zod";
 import { env } from "../config/env.js";
 import { HttpError } from "../http-error.js";
-import { buildChallenge, issueJwt, verifyChallenge, verifyJwt } from "./sep10.js";
+import { buildChallenge, issueJwt, verifyChallenge, verifyJwt, type AccountLookup } from "./sep10.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -11,7 +11,12 @@ declare module "fastify" {
   }
 }
 
-export async function authPlugin(app: FastifyInstance) {
+export interface AuthPluginOptions {
+  accountLookup?: AccountLookup;
+}
+
+export async function authPlugin(app: FastifyInstance, opts?: AuthPluginOptions) {
+  const accountLookup = opts?.accountLookup;
   app.get("/auth", async (req) => {
     const query = z
       .object({
@@ -32,10 +37,14 @@ export async function authPlugin(app: FastifyInstance) {
   app.post("/auth", async (req, reply) => {
     const body = z.object({ transaction: z.string().min(1) }).parse(req.body);
     try {
-      const { account } = verifyChallenge(body.transaction);
+      const { account } = await verifyChallenge(body.transaction, accountLookup);
       const token = issueJwt(account);
       return { token };
     } catch (err) {
+      if (err instanceof HttpError) {
+        reply.code(err.statusCode);
+        return { error: err.message };
+      }
       reply.code(400);
       return { error: err instanceof Error ? err.message : "invalid challenge" };
     }
