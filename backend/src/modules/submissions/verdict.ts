@@ -4,13 +4,20 @@ import { readSubmission } from "../../chain/actions.js";
 import { fromChainResolutionMethod } from "../../chain/mappers.js";
 import { dispatchWebhook } from "../webhooks/dispatcher.js";
 
-const TERMINAL: SubmissionStatus[] = ["verified", "slashed", "expired_unverified"];
+const TERMINAL = ["verified", "slashed", "expired_unverified"] as const satisfies readonly SubmissionStatus[];
+type TerminalStatus = (typeof TERMINAL)[number];
+
+export interface VerdictDeps {
+  db?: typeof db;
+  readSubmission?: typeof readSubmission;
+  dispatchWebhook?: typeof dispatchWebhook;
+}
 
 export interface VerdictWebhookPayload {
   submission_id: string;
   chain_submission_id: string | null;
   escrow_ref: string;
-  status: "verified" | "slashed";
+  status: TerminalStatus;
   resolution_method: SubmissionResolutionMethod | null;
   tx_hash: string | null;
 }
@@ -22,7 +29,7 @@ export function buildVerdictWebhookPayload(
     escrow_ref: string;
     resolution_method: SubmissionResolutionMethod | null;
   },
-  status: "verified" | "slashed",
+  status: TerminalStatus,
   txHash?: string | null
 ): VerdictWebhookPayload {
   return {
@@ -46,21 +53,27 @@ export function buildVerdictWebhookPayload(
  * The resolution_method is read before transitioning so that the terminal
  * status and resolution_method are written in the same atomic update, and
  * the webhook payload includes resolution_method. If the chain read fails,
- * it throws before transitioning so the caller's retry path handles it. */
-export async function recordTerminalVerdict(submissionRowId: string, status: string, txHash?: string | null) {
-  if (!TERMINAL.includes(status as SubmissionStatus)) return;
-  const terminal = status as SubmissionStatus;
+ * it throws before transitioning so the caller's retry path handles it (and
+ * the webhook still fires on that retry). */
+export async function recordTerminalVerdict(
+  submissionRowId: string,
+  status: string,
+  txHash?: string | null,
+  closedAt?: Date,
+  deps: VerdictDeps = {}
+) {
+  if (!TERMINAL.includes(status as TerminalStatus)) return;
+  const terminal = status as TerminalStatus;
+  const database = deps.db ?? db;
+  const readOnChain = deps.readSubmission ?? readSubmission;
+  const dispatch = deps.dispatchWebhook ?? dispatchWebhook;
 
-  const sub = await db
-    .selectFrom("submission")
-    .selectAll()
-    .where("id", "=", submissionRowId)
-    .executeTakeFirst();
+  const sub = await database.selectFrom("submission").selectAll().where("id", "=", submissionRowId).executeTakeFirst();
   if (!sub) return;
 
   let resolutionMethod = sub.resolution_method;
   if (!resolutionMethod && sub.chain_submission_id) {
-    const record = await readSubmission(sub.chain_submission_id);
+    const record = await readOnChain(sub.chain_submission_id);
     if (record) {
       resolutionMethod = fromChainResolutionMethod(record.resolution_method);
     }
@@ -68,7 +81,7 @@ export async function recordTerminalVerdict(submissionRowId: string, status: str
 
   const finalizeTxHash = sub.finalize_tx_hash ?? txHash ?? null;
 
-  const transitioned = await db
+  const transitioned = await database
     .updateTable("submission")
     .set({
       status: terminal,
@@ -81,8 +94,10 @@ export async function recordTerminalVerdict(submissionRowId: string, status: str
     .returningAll()
     .executeTakeFirst();
 
+  // Filled in whenever they are still missing, so a call that knows the
+  // finalize transaction can complete a row first written by one that did not.
   if (!transitioned && (!sub.resolution_method || (!sub.finalize_tx_hash && finalizeTxHash))) {
-    await db
+    await database
       .updateTable("submission")
       .set({
         resolution_method: sub.resolution_method ?? resolutionMethod,
@@ -92,23 +107,18 @@ export async function recordTerminalVerdict(submissionRowId: string, status: str
       .execute();
   }
 
-  const currentSub = transitioned ?? {
-    ...sub,
-    resolution_method: sub.resolution_method ?? resolutionMethod,
-    finalize_tx_hash: sub.finalize_tx_hash ?? finalizeTxHash,
-  };
-
-  if (transitioned && (terminal === "verified" || terminal === "slashed")) {
-    const payload = buildVerdictWebhookPayload(currentSub, terminal, txHash);
-    await dispatchWebhook(currentSub.marketplace_id, `submission.${terminal}`, payload)
-      .catch((err) => console.error("[verdict] webhook dispatch failed:", err));
+  if (transitioned) {
+    const payload = buildVerdictWebhookPayload(transitioned, terminal, txHash);
+    await dispatch(transitioned.marketplace_id, `submission.${terminal}`, payload).catch((err) =>
+      console.error("[verdict] webhook dispatch failed:", err)
+    );
   }
 
   if (terminal === "expired_unverified") {
     // A challenge that lapsed without a resolution is closed out off-chain too.
-    await db
+    await database
       .updateTable("challenge")
-      .set({ resolved_at: new Date() })
+      .set({ resolved_at: closedAt ?? new Date() })
       .where("submission_id", "=", sub.id)
       .where("resolved_at", "is", null)
       .execute();
