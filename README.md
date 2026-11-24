@@ -565,12 +565,14 @@ The response contains `payload`, `canonical`, `signature`,
 - `signer` is the attestation signing key's Stellar G-address, also recorded as
   `payload.attestor.stellar_account`. It is the keeper unless the operator set
   `ATTESTATION_SIGNING_SECRET`, in which case it is that separate key. Pin it to
-  the key your deployment operator publishes (the `keeper_public_key` in your
-  trusted `deployments/<name>.json` when no separate key is set). If the
-  signing key rotates, **independently** verify the replacement public key with
-  your deployment operator and explicitly pin it with
-  `TRUSTED_KEEPER_PUBLIC_KEY` for new attestations. Keep the old pin for
-  historical records: the deployment JSON may retain the original key.
+  the key your deployment operator publishes (the `attestation_public_key` in your
+  trusted `deployments/<name>.json`, which falls back to `keeper_public_key` when
+  no separate key is set). Verifiers can cross-check this against `attestation_signing_key`
+  from `GET /v1/config` or `VERITY_ATTESTATION_SIGNING_KEY` in `/.well-known/stellar.toml`
+  over HTTPS. If the signing key rotates, **independently** verify the replacement public key
+  with your deployment operator and explicitly pin it with
+  `TRUSTED_ATTESTATION_PUBLIC_KEY` (or `TRUSTED_KEEPER_PUBLIC_KEY`) for new attestations.
+  Keep the old pin for historical records: the deployment JSON may retain the original key.
   Never derive a trusted key from this unverified response.
 - `delivered_to` is `null`: the record is signed and served by the API,
   with nothing pushed to Stellar 8004 or any other registry.
@@ -587,10 +589,10 @@ Verdicts are `verified`, `slashed` or `expired_unverified`.
 From the repository root after `pnpm install`, run this Node.js example.
 Set `SUBMISSION_ID` to a real settled UUID. `API` defaults to the local
 backend; `DEPLOYMENT` selects the trusted deployment file (default `testnet`).
-If your keeper rotated, first verify its **new** G-address through a
-separately authenticated operator/deployment channel, then run the example
-with `TRUSTED_KEEPER_PUBLIC_KEY=G...` to explicitly trust it. Do not set the
-override to `att.signer` or copy the response value before verifying its
+If your signing key rotated, first verify its **new** G-address through a
+separately authenticated operator/deployment channel (or cross-check `GET /v1/config`),
+then run the example with `TRUSTED_ATTESTATION_PUBLIC_KEY=G...` to explicitly trust it.
+Do not set the override to `att.signer` or copy the response value before verifying its
 provenance. An old attestation must still be checked against its old key.
 Select the **trusted deployment configuration for the specific submission**,
 not one supplied by an untrusted API. A valid signature alone does not
@@ -613,9 +615,12 @@ const response = await fetch(`${API}/v1/submissions/${encodeURIComponent(id)}/at
 if (!response.ok) throw new Error(`Attestation HTTP ${response.status}: ${await response.text()}`);
 const att = await response.json();
 if (att.signature_algorithm !== "ed25519") throw new Error("Unexpected algorithm");
-const trustedSigner = process.env.TRUSTED_KEEPER_PUBLIC_KEY ?? deployment.keeper_public_key;
+const trustedSigner = process.env.TRUSTED_ATTESTATION_PUBLIC_KEY ??
+  process.env.TRUSTED_KEEPER_PUBLIC_KEY ??
+  deployment.attestation_public_key ??
+  deployment.keeper_public_key;
 if (!trustedSigner || att.signer !== trustedSigner)
-  throw new Error("Unexpected keeper signer");
+  throw new Error("Unexpected attestation signer");
 const key = Keypair.fromPublicKey(att.signer);
 const signature = Buffer.from(att.signature, "base64");
 // Mirror backend/src/chain/canonical.ts; compare before trusting att.payload.

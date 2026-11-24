@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { env } from "./config/env.js";
 import { sep10SigningKey } from "./auth/sep10.js";
+import { attestationSigningKey } from "./modules/attestations/export.js";
 
 /**
  * SEP-1 file advertising the SEP-10 endpoint and its signing key. Served by
@@ -16,6 +17,7 @@ export async function wellKnownPlugin(app: FastifyInstance) {
       `NETWORK_PASSPHRASE="${env.NETWORK_PASSPHRASE}"`,
       `WEB_AUTH_ENDPOINT="${env.PUBLIC_SCHEME}://${env.WEB_AUTH_DOMAIN}/auth"`,
       `SIGNING_KEY="${sep10SigningKey}"`,
+      `VERITY_ATTESTATION_SIGNING_KEY="${attestationSigningKey}"`,
     ].join("\n");
   });
 }

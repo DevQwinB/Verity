@@ -12,6 +12,8 @@ const attestationKeypair: Keypair = env.ATTESTATION_SIGNING_SECRET
   ? Keypair.fromSecret(env.ATTESTATION_SIGNING_SECRET)
   : keeperKeypair;
 
+export const attestationSigningKey = attestationKeypair.publicKey();
+
 /** Where an attestation has been delivered. Stellar 8004's ingestion schema
  * is not published (PRD §16 open question 3), so nothing is pushed anywhere:
  * the attestation is signed, stored, and served by this API. "none" says

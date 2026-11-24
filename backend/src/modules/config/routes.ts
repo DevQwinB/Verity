@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { env } from "../../config/env.js";
 import { getGateConfig } from "../../chain/config.js";
+import { attestationSigningKey } from "../attestations/export.js";
 
 /** The rules this deployment's EscrowGate enforces, read from the contract.
  * The dashboard uses them to say what a bond or stake must be before it
@@ -25,6 +26,7 @@ export async function configRoutes(app: FastifyInstance) {
       reexecutor_slash_bps: cfg.reexecutor_slash_bps,
       reexecutor_allowlist: cfg.reexecutor_allowlist,
       reexecutor_liveness_s: env.REEXECUTOR_LIVENESS_S,
+      attestation_signing_key: attestationSigningKey,
     };
   });
 }
