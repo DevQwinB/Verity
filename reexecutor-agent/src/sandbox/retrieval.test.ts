@@ -2,7 +2,23 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { describe, it, test } from "node:test";
-import { RetrievalTransientError, getPinned, hasConnectivity, isInconclusiveStatus, isPrivateAddress, resolvePointer, resolvePublicTarget, runRetrieval } from "./retrieval.js";
+import { Networks } from "@stellar/stellar-sdk";
+import { NO_OUTPUT_HASH } from "../vote.js";
+import {
+  assertOutboundConnectivity,
+  decideRetrievalTargetUnreachable,
+  defaultInternetCheckUrl,
+  getPinned,
+  hasConnectivity,
+  isInconclusiveStatus,
+  isPrivateAddress,
+  RETRIEVAL_USER_AGENT,
+  resolvePointer,
+  resolvePublicTarget,
+  RetrievalTransientError,
+  runRetrieval,
+  warnIfProbePrivateAndNoInternet,
+} from "./retrieval.js";
 
 describe("isInconclusiveStatus", () => {
   const testCases: Array<{ status: number; expected: boolean }> = [
@@ -237,6 +253,17 @@ describe("isPrivateAddress", () => {
     "::ffff:a9fe:a9fe",
     "64:ff9b::a9fe:a9fe",
     "2002:7f00:1::",
+    // Non-global IANA IPv6 special-purpose blocks
+    "64:ff9b:1::a9fe:a9fe",
+    "64:ff9b:1::808:808",
+    "::ffff:0:7f00:1",
+    "::ffff:0:127.0.0.1",
+    "::ffff:0:808:808",
+    "2001:0:4136:e378::1",
+    "2001:2::1",
+    "2001:10::1",
+    "3fff::1",
+    "5f00::1",
     "not-an-ip",
   ];
 
@@ -258,6 +285,11 @@ describe("isPrivateAddress", () => {
     "169.253.1.1",
     "2001:4860:4860::8888",
     "2606:4700::1111",
+    "2606:4700:4700::1111",
+    "2001:2:1::1",
+    "2001:20::1",
+    "3fff:1000::1",
+    "5f01::1",
     "198.20.0.0",
     "::ffff:808:808",
     "64:ff9b::808:808",
@@ -296,6 +328,8 @@ describe("resolvePublicTarget", () => {
       { raw: "http://0x7f.0.0.1/", host: "127.0.0.1" },
       { raw: "http://2130706433/", host: "127.0.0.1" },
       { raw: "http://10.1.2.3/", host: "10.1.2.3" },
+      { raw: "http://[64:ff9b:1::a9fe:a9fe]/", host: "64:ff9b:1::a9fe:a9fe" },
+      { raw: "http://[::ffff:0:7f00:1]/", host: "::ffff:0:7f00:1" },
     ];
 
     for (const { raw, host } of blocked) {
@@ -497,7 +531,7 @@ function close(server: http.Server): Promise<void> {
 test("hasConnectivity reaches an operator-configured loopback URL", async () => {
   const { server, url } = await listen();
   try {
-    assert.equal(await hasConnectivity(url), true);
+    assert.deepEqual(await hasConnectivity(url), { reachable: true, public: false });
   } finally {
     await close(server);
   }
@@ -506,7 +540,205 @@ test("hasConnectivity reaches an operator-configured loopback URL", async () => 
 test("hasConnectivity is false when nothing answers", async () => {
   const { server, url } = await listen();
   await close(server);
-  assert.equal(await hasConnectivity(url), false);
+  assert.deepEqual(await hasConnectivity(url), { reachable: false, public: false });
+});
+
+describe("defaultInternetCheckUrl", () => {
+  it("defaults to Horizon testnet when passphrase is unset or testnet", () => {
+    assert.equal(defaultInternetCheckUrl(), "https://horizon-testnet.stellar.org");
+    assert.equal(defaultInternetCheckUrl("Test SDF Network ; September 2015"), "https://horizon-testnet.stellar.org");
+  });
+
+  it("selects Horizon mainnet when passphrase is mainnet", () => {
+    assert.equal(defaultInternetCheckUrl(Networks.PUBLIC), "https://horizon.stellar.org");
+  });
+});
+
+describe("assertOutboundConnectivity and decideRetrievalTargetUnreachable", () => {
+  it("does not vote when primary probe fails", async () => {
+    const probe = async () => ({ reachable: false, public: false });
+    await assert.rejects(
+      () =>
+        decideRetrievalTargetUnreachable({
+          message: "ENOTFOUND",
+          budget: 120,
+          connectivityUrl: "http://127.0.0.1:8000/",
+          internetUrl: "https://horizon-testnet.stellar.org",
+          probe,
+        }),
+      (err: Error) =>
+        err.message === "retrieval inconclusive (ENOTFOUND) and this host has no outbound connectivity; not voting"
+    );
+  });
+
+  it("does not vote when only a private probe succeeds and secondary probe fails", async () => {
+    const probe = async (url: string) => {
+      if (url === "http://127.0.0.1:8000/") {
+        return { reachable: true, public: false };
+      }
+      return { reachable: false, public: false };
+    };
+
+    await assert.rejects(
+      () =>
+        decideRetrievalTargetUnreachable({
+          message: "ETIMEDOUT",
+          budget: 120,
+          connectivityUrl: "http://127.0.0.1:8000/",
+          internetUrl: "https://horizon-testnet.stellar.org",
+          probe,
+        }),
+      (err: Error) =>
+        err.message === "retrieval inconclusive (ETIMEDOUT) and this host has no public internet access; not voting"
+    );
+  });
+
+  it("does not vote when secondary probe resolves to a non-public address", async () => {
+    const probe = async (url: string) => {
+      if (url === "http://127.0.0.1:8000/") {
+        return { reachable: true, public: false };
+      }
+      return { reachable: true, public: false };
+    };
+
+    await assert.rejects(
+      () =>
+        decideRetrievalTargetUnreachable({
+          message: "ECONNREFUSED",
+          budget: 120,
+          connectivityUrl: "http://127.0.0.1:8000/",
+          internetUrl: "http://192.168.1.1/",
+          probe,
+        }),
+      (err: Error) =>
+        err.message === "retrieval inconclusive (ECONNREFUSED) and this host has no public internet access; not voting"
+    );
+  });
+
+  it("votes mismatch when default public RPC URL succeeds without probing secondary", async () => {
+    let secondaryProbed = false;
+    const probe = async (url: string) => {
+      if (url === "https://soroban-testnet.stellar.org") {
+        return { reachable: true, public: true };
+      }
+      secondaryProbed = true;
+      return { reachable: false, public: false };
+    };
+
+    const result = await decideRetrievalTargetUnreachable({
+      message: "connect ETIMEDOUT 1.2.3.4:443",
+      budget: 120,
+      connectivityUrl: "https://soroban-testnet.stellar.org",
+      internetUrl: "https://horizon-testnet.stellar.org",
+      probe,
+    });
+
+    assert.equal(secondaryProbed, false);
+    assert.equal(result.outputHash, NO_OUTPUT_HASH);
+    assert.equal(
+      result.engine,
+      "retrieval failed: target unreachable for 120s while this host was online (connect ETIMEDOUT 1.2.3.4:443)"
+    );
+  });
+
+  it("votes mismatch when private primary probe and public secondary probe both succeed", async () => {
+    const probe = async (url: string) => {
+      if (url === "http://127.0.0.1:8000/") {
+        return { reachable: true, public: false };
+      }
+      if (url === "https://horizon-testnet.stellar.org") {
+        return { reachable: true, public: true };
+      }
+      return { reachable: false, public: false };
+    };
+
+    const result = await decideRetrievalTargetUnreachable({
+      message: "connect ETIMEDOUT 1.2.3.4:443",
+      budget: 120,
+      connectivityUrl: "http://127.0.0.1:8000/",
+      internetUrl: "https://horizon-testnet.stellar.org",
+      probe,
+    });
+
+    assert.equal(result.outputHash, NO_OUTPUT_HASH);
+    assert.equal(
+      result.engine,
+      "retrieval failed: target unreachable for 120s while this host was online (connect ETIMEDOUT 1.2.3.4:443)"
+    );
+  });
+});
+
+describe("warnIfProbePrivateAndNoInternet", () => {
+  it("logs a warning when configured probe is private and no public probe is reachable", async () => {
+    const warnings: string[] = [];
+    const probe = async (url: string) => {
+      if (url === "http://127.0.0.1:8000/") {
+        return { reachable: true, public: false };
+      }
+      return { reachable: false, public: false };
+    };
+
+    await warnIfProbePrivateAndNoInternet(
+      "http://127.0.0.1:8000/",
+      "https://horizon-testnet.stellar.org",
+      probe,
+      { warn: (msg) => warnings.push(msg) }
+    );
+
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /resolves to a private address/);
+    assert.match(warnings[0], /no public probe is reachable/);
+  });
+
+  it("logs a warning when configured probe is private and secondary probe is also private", async () => {
+    const warnings: string[] = [];
+    const probe = async (url: string) => {
+      return { reachable: true, public: false };
+    };
+
+    await warnIfProbePrivateAndNoInternet(
+      "http://127.0.0.1:8000/",
+      "http://192.168.1.1/",
+      probe,
+      { warn: (msg) => warnings.push(msg) }
+    );
+
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /no public probe is reachable/);
+  });
+
+  it("does not warn when configured probe is private but public probe is reachable", async () => {
+    const warnings: string[] = [];
+    const probe = async (url: string) => {
+      if (url === "http://127.0.0.1:8000/") {
+        return { reachable: true, public: false };
+      }
+      return { reachable: true, public: true };
+    };
+
+    await warnIfProbePrivateAndNoInternet(
+      "http://127.0.0.1:8000/",
+      "https://horizon-testnet.stellar.org",
+      probe,
+      { warn: (msg) => warnings.push(msg) }
+    );
+
+    assert.equal(warnings.length, 0);
+  });
+
+  it("does not warn when configured probe is public", async () => {
+    const warnings: string[] = [];
+    const probe = async () => ({ reachable: true, public: true });
+
+    await warnIfProbePrivateAndNoInternet(
+      "https://8.8.8.8/",
+      "https://horizon-testnet.stellar.org",
+      probe,
+      { warn: (msg) => warnings.push(msg) }
+    );
+
+    assert.equal(warnings.length, 0);
+  });
 });
 
 test("runRetrieval still refuses a loopback target", async () => {
@@ -541,4 +773,74 @@ test("getPinned gives up on a server that keeps dripping bytes past the overall 
     server.closeAllConnections();
     server.close();
   }
+});
+
+test("getPinned sends the documented User-Agent and Accept headers and no Authorization header", async () => {
+  let receivedHeaders: http.IncomingHttpHeaders | undefined;
+  const server = http.createServer((req, res) => {
+    receivedHeaders = req.headers;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"ok":true}');
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address() as AddressInfo;
+    const url = `http://127.0.0.1:${port}/`;
+    const res = await getPinned(await resolvePublicTarget(url, { allowPrivate: true }));
+    assert.equal(res.status, 200);
+    assert.equal(res.body, '{"ok":true}');
+    assert.ok(receivedHeaders);
+    assert.equal(receivedHeaders["user-agent"], RETRIEVAL_USER_AGENT);
+    assert.equal(receivedHeaders["user-agent"], "Verity-Reexecutor/1 (+https://github.com/DevQwinB/Verity)");
+    assert.equal(receivedHeaders.accept, "application/json, text/plain;q=0.9, */*;q=0.1");
+    assert.equal(receivedHeaders.authorization, undefined);
+    assert.equal(receivedHeaders.cookie, undefined);
+  } finally {
+    await close(server);
+  }
+});
+
+describe("runRetrieval URL credentials rejection", () => {
+  for (const url of [
+    "https://u:p@example.com/",
+    "https://u@example.com/",
+    "https://:p@example.com/",
+    "https://u:p@does-not-exist.invalid/",
+  ]) {
+    it(`rejects ${url} with a plain Error before any network call`, async () => {
+      await assert.rejects(
+        () => runRetrieval({ url }),
+        (err: unknown) => {
+          assert(!(err instanceof RetrievalTransientError), "should be a plain Error, not RetrievalTransientError");
+          assert(err instanceof Error);
+          assert.equal(err.message, "retrieval url must not contain credentials");
+          return true;
+        }
+      );
+    });
+  }
+
+  it("never connects to a server when the URL contains credentials", async () => {
+    let hits = 0;
+    const server = http.createServer((_req, res) => {
+      hits += 1;
+      res.end("ok");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const { port } = server.address() as AddressInfo;
+      await assert.rejects(
+        () => runRetrieval({ url: `http://u:p@127.0.0.1:${port}/` }),
+        (err: unknown) => {
+          assert(!(err instanceof RetrievalTransientError), "should be a plain Error");
+          assert(err instanceof Error);
+          assert.equal(err.message, "retrieval url must not contain credentials");
+          return true;
+        }
+      );
+      assert.equal(hits, 0);
+    } finally {
+      await close(server);
+    }
+  });
 });

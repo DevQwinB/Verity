@@ -10,7 +10,7 @@ and replay-checked*. It is not cryptographic proof of model correctness.
 `EscrowGate` accepts no ZK proofs: its challenge resolution rejects the ZK
 method outright, so no code path can report a ZK-verified result. The
 `ZKVerifierRegistry` contract is deployed empty as the anchor for Phase 2. See
-[`prd-01-zkml-agent-truth.md`](prd-01-zkml-agent-truth.md) for the full scope.
+[`docs/PRD.md`](docs/PRD.md) for the full scope.
 
 ## How a submission is verified
 
@@ -46,7 +46,10 @@ Every verdict records how it was reached, and the dashboard shows it:
 Anyone can open a bonded challenge inside the window. If the challenge is
 upheld, the challenger gets their bond back plus 20% of the agent's, and the
 rest of the agent's bond goes to the admin/treasury account. If it is rejected,
-the challenger's bond goes to the agent.
+the challenger's bond goes to the agent. The agent cannot challenge its own
+submission: the contract refuses the address that submitted. It cannot tell
+when a different address belongs to the same agent, so that is not prevented
+on-chain.
 
 A re-executor whose vote a bonded consensus proves wrong loses a fixed share
 of its stake (10% as deployed). The amount is set on-chain and applied when
@@ -74,7 +77,7 @@ and `backend/src/chain/canonical.ts`.
 
 ## Run it
 
-Requirements: Node 20+, pnpm 10, [stellar-cli](https://developers.stellar.org/docs/tools/cli).
+Requirements: Node 22.6+, pnpm 10, [stellar-cli](https://developers.stellar.org/docs/tools/cli).
 Docker is not needed. Rust is needed to deploy contracts (the deploy script
 builds them) and to change or test them, but not to run against a deployment
 that already exists.
@@ -121,9 +124,9 @@ longer the recorded account (a replaced keeper is only reported: it holds no
 authority on-chain). Named deployments use `verity-<name>-…` aliases.
 
 Secrets stay in your stellar-cli keystore. `pnpm dev` reads them at start-up
-and passes them to each process through its environment. The only secrets it
-writes to disk are in `backend/.env` (gitignored), and only if that file does
-not exist; it also creates the local database under `.pgdata/`.
+and passes them to each process through its environment. The only secret it
+writes to disk is the session `JWT_SECRET` in `backend/.env` (gitignored), and
+only if that file does not exist yet; it also creates the local database under `.pgdata/`.
 
 ### Prove it works end to end
 
@@ -206,13 +209,19 @@ Deterministic tasks run in a sandboxed JavaScript runtime:
 5. **Execution limits.**
    - Memory: 64 MiB (`64 * 1024 * 1024` bytes).
    - Stack: 128 KiB (`128 * 1024` bytes).
-   - Computation: 1000 interrupt checks (ticks). This provides a computation budget
-     of a few seconds of busy loops; loops that exceed this fail with `computation budget exceeded`.
+   - Computation: 25,000,000 WebAssembly fuel units enforced by the fuel-instrumented
+     QuickJS WASM build (1 unit per WASM function entry and loop back-edge, plus 1 unit
+     per 16 bytes for bulk memory operations). This meters JavaScript bytecode, native
+     builtins (such as `Array.prototype.indexOf`, `join`, regexes, and typed-array
+     fills), JSON parsing/serialization, and error inspection identically on every
+     re-executor. Functions that exceed the fuel budget fail with
+     `computation budget exceeded`, which counts as a mismatch.
    - Output size: serialized output can be at most 1,000,000 bytes.
-   - Wall-clock timeout: 20 s host kill switch. This is a host-level safety timeout
-     rather than an engine limit; if triggered, the re-executor considers its host
-     overloaded, casts no vote, and retries later (`ReplayInfrastructureError`). It does
-     not count as a mismatch against the submission.
+   - Wall-clock timeout: 20 s host safety-net kill switch. The fuel budget above is sized
+     to finish well inside this window even on slow hosts; the wall-clock timeout only
+     trips if a host itself is genuinely broken or severely overloaded. If triggered,
+     the re-executor casts no vote and retries later (`ReplayInfrastructureError`). It
+     does not count as a mismatch against the submission.
 6. **Failure handling.** If the function throws an exception or exceeds an engine limit
    (memory, stack, computation budget, or output size), the re-executor produces a
    32-zero-byte output hash, which never matches a legitimate claimed output hash and
@@ -257,17 +266,20 @@ Deterministic tasks run in a sandboxed JavaScript runtime:
 12. **Spec format.** The input artifact must be JSON conforming to `{"url": "...", "pointer"?: "/..."}`.
     Invalid JSON or a missing string `url` counts as a mismatch.
 13. **HTTP request rules.** The re-executor issues a single `GET` request with
-    `accept: application/json, text/plain;q=0.9, */*;q=0.1` and no credentials, auth headers,
-    or cookies. The endpoint must be publicly accessible without authentication.
-    Only `http:` and `https:` schemes are supported. The URL must resolve to a public IP
-    address: loopback, private, and link-local IP addresses are rejected, and the request
-    connects directly to the validated IP.
+    `accept: application/json, text/plain;q=0.9, */*;q=0.1` and
+    `user-agent: Verity-Reexecutor/1 (+https://github.com/DevQwinB/Verity)`, and no
+    credentials, auth headers, or cookies. URLs containing embedded credentials
+    (`user:pass@`) are rejected as a mismatch before any request is sent. The endpoint must
+    be publicly accessible without authentication. Only `http:` and `https:` schemes are
+    supported. The URL must resolve to a public IP address: loopback, private, and
+    link-local IP addresses are rejected, and the request connects directly to the
+    validated IP.
 14. **Redirects and response codes.** Redirects are not followed; HTTP 3xx status codes
     are treated as a mismatch. Definitive 4xx statuses (for example 404 or 410) and other
     non-2xx responses are also mismatches. Statuses 401, 403, 408, 429, 451 and anything
     from 500 up, DNS failures, timeouts, and network errors are treated as transient: the worker retries for up to `min(RETRIEVAL_RETRY_BUDGET_S, challenge window / 2)`
     seconds (default `RETRIEVAL_RETRY_BUDGET_S` is 120 s), verifies its own network
-    connectivity, and only votes mismatch if its own connectivity is intact. Each HTTP request
+    connectivity (via `CONNECTIVITY_CHECK_URL`, defaulting to `SOROBAN_RPC_URL`), and requires proof of public internet access (via `INTERNET_CHECK_URL`, defaulting to Horizon) if the connectivity probe resolves to a private address, only voting mismatch if public internet access is proven. Each HTTP request
     times out after 10 s of silence or 30 s overall, and response bodies are capped at 1,000,000 bytes.
 15. **JSON pointers.** If the response body is JSON, an optional RFC 6901 pointer (e.g. `/data/0/price`)
     selects the targeted value (`~1` escapes `/`, `~0` escapes `~`). The pointer must start
@@ -334,6 +346,7 @@ call it was built for.
 | `POST /v1/marketplaces/:id/webhooks` | Bearer | 400 for an unknown event name; 403 for another account's marketplace |
 | `GET /v1/marketplaces/:id/webhooks` | Bearer | your subscriptions, without `secret`; 403 for another account's marketplace |
 | `PATCH /v1/marketplaces/:id/webhooks/:webhookId` | Bearer | `{"active": boolean}`; 403 for another account's marketplace, 404 for an unknown webhook |
+| `DELETE /v1/marketplaces/:id/webhooks/:webhookId` | Bearer | removes subscription and its delivery history, freeing a slot; 204 on success, 403 for another account's marketplace, 404 for an unknown webhook |
 
 ### Authentication and token lifetime
 
@@ -371,24 +384,44 @@ the relayer produces for a network rejection carries `error` alone.
 
 ### Rate limiting
 
-`RATE_LIMIT_PER_MINUTE` requests per minute (default 300), keyed by the
-authenticated account when a valid bearer token is sent and by client
-address otherwise; `/health*` is exempt.
+Two limits apply to every request, and a request must stay under both:
+
+- `RATE_LIMIT_PER_MINUTE` requests per minute (default 300) per **client
+  address**. Every account a client signs in as draws from that same address
+  budget, so minting identities does not multiply it.
+- `RATE_LIMIT_PER_MINUTE` requests per minute per **authenticated account**,
+  on top of the address budget. Unauthenticated requests, and requests with
+  an invalid token, skip this one.
+
+Sign-in has its own, much lower per-address budget:
+`AUTH_REQUESTS_PER_MINUTE` (default 20) covers `GET /auth` and `POST /auth`
+together. `POST /v1/artifacts` additionally allows only
+`ARTIFACT_UPLOADS_PER_MINUTE` uploads per minute per account **and** per
+client address. `/health*` is exempt.
+
+The client address comes from `X-Forwarded-For` only when `TRUST_PROXY=true`.
+The dashboard's server proxies every visitor, so behind it the backend must
+trust the proxy; otherwise all visitors share one budget.
 
 ### Idempotency of `POST /v1/submissions`
 
-`idempotency_key` is required. Retries are safe — a wallet prompt can be
-dismissed or a tab closed between build and relay:
+`idempotency_key` is required and scoped to the authenticated account. Retries
+are safe — a wallet prompt can be dismissed or a tab closed between build and
+relay:
 
 | Case | Response |
 |---|---|
-| key already used by a *different* account | 409 `{ "error": "idempotency_key is already in use" }` |
+| key used by a *different* account | keys are scoped to the authenticated account; another account may reuse the same key independently (201 with its own draft) |
 | same account, submission already on-chain | 200 `{ submission, unsigned_transaction_xdr: null, network_passphrase }` — nothing to sign |
-| same account, draft never signed | draft updated, fresh transaction built; 200 `{ submission, unsigned_transaction_xdr, network_passphrase }` |
-| new key | 201 with the same three fields |
+| same account, relayed transaction already landed | 200 `{ submission, unsigned_transaction_xdr: null, network_passphrase }` — nothing to sign; the indexer attaches `chain_submission_id` |
+| same account, draft relayed and possibly still landing (within the 5.5-minute validity window) | 409 `{ "error": "An earlier attempt for this idempotency_key was already sent to the network and may still confirm. Retry in a few minutes; it will resolve to that submission if it lands." }` — retry after a few minutes |
+| same account, draft never relayed, or earlier relay failed or expired | draft updated, fresh transaction built; 200 `{ submission, unsigned_transaction_xdr, network_passphrase }` |
+| new key for this account | 201 with the same three fields |
 
 Unsigned drafts older than `DRAFT_TTL_S` (default 3600 s) are purged by the
-scheduler.
+scheduler. In the rare race where a concurrent request for the same account
+collides with a draft that is purged between insert and re-read, the endpoint
+returns 409 `{ "error": "idempotency_key is already in use" }`.
 
 See [Webhooks](#webhooks) for registration, payloads and signature verification.
 
@@ -419,18 +452,21 @@ with HTTP 400 and duplicates are stored once. The marketplace ID is a UUID;
 only its own account may register a webhook (otherwise HTTP 403). A
 successful registration returns the subscription row with HTTP 201. A
 marketplace can hold at most 10 subscriptions (HTTP 409 beyond that);
-deactivating one does not free its slot. The URL must resolve to a public
-address: private, loopback, link-local, multicast and reserved ranges (and IPv6
-forms that wrap them) are refused with HTTP 400, both at registration and again
-at every delivery, which connects to the address it just checked.
+delete an existing subscription to free a slot (deactivating one does not).
+The URL must resolve to a public address: private, loopback, link-local,
+multicast and reserved ranges (and IPv6 forms that wrap them) are refused
+with HTTP 400, both at registration and again at every delivery, which
+connects to the address it just checked.
 
 `GET /v1/marketplaces/:id/webhooks` lists the marketplace's subscriptions
 (`id`, `url`, `events`, `active`, `created_at`; the `secret` is never
 returned). `PATCH /v1/marketplaces/:id/webhooks/:webhookId` with
 `{"active": false}` stops deliveries to a subscription and `{"active": true}`
 resumes them; it returns the updated subscription, or HTTP 404 if that
-webhook does not exist on this marketplace. Both require the marketplace's own
-account (otherwise HTTP 403).
+webhook does not exist on this marketplace. `DELETE /v1/marketplaces/:id/webhooks/:webhookId`
+permanently removes a subscription, cascades and deletes its delivery history,
+and frees its slot (returning HTTP 204, or HTTP 404 if not found). All require
+the marketplace's own account (otherwise HTTP 403).
 
 | Event | When emitted | `data` |
 | --- | --- | --- |
@@ -673,9 +709,12 @@ full tally.
   captured at no cost. Deployments here run with `reexecutor_allowlist` on:
   the admin approves which staked accounts may vote.
 - **Sandbox limits.** Replay limits and constraints are detailed in
-  [Writing replayable work](#writing-replayable-work). Exceeding an engine
-  limit or throwing is a mismatch. A function that stalls a re-executor's host
-  without exceeding an engine limit gets no vote from it.
+  [Writing replayable work](#writing-replayable-work). Computation is metered
+  deterministically at the WebAssembly level (covering both JS bytecode and
+  native builtins), so exceeding an engine limit or throwing produces a
+  mismatch vote on every re-executor. The 20 s wall-clock kill switch remains
+  only as a safety net for a genuinely broken or overloaded host (which casts
+  no vote and retries).
 - **Assignment** is deterministic and auditable but uniform, not
   stake-weighted. It only picks re-executors whose worker is online, and asks
   another when one goes quiet.
