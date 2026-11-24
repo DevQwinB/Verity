@@ -29,7 +29,7 @@ export function WithdrawStake({
   const [error, setError] = useState<string | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
 
-  if (wallet.account !== account || BigInt(stakeStroops) === BigInt(0)) return null;
+  if (wallet.account !== account || (BigInt(stakeStroops) === BigInt(0) && !txHash)) return null;
 
   async function handleWithdraw() {
     setError(null);
@@ -67,30 +67,43 @@ export function WithdrawStake({
         any time; going below it stops new assignments, and the contract refuses that while any of
         your votes is on a submission that has not been finalized.
       </p>
-      <div className="flex flex-wrap items-end gap-3">
-        <div className="space-y-1.5">
-          <label htmlFor="withdraw-amount" className="block text-sm text-text-secondary">
-            Amount (XLM)
-          </label>
-          <input
-            id="withdraw-amount"
-            inputMode="decimal"
-            value={amountXlm}
-            onChange={(e) => setAmountXlm(e.target.value)}
-            placeholder={stroopsToXlm(stakeStroops)}
-            className="w-40 rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
-          />
+      {BigInt(stakeStroops) > BigInt(0) && (
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="space-y-1.5">
+            <label htmlFor="withdraw-amount" className="block text-sm text-text-secondary">
+              Amount (XLM)
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                id="withdraw-amount"
+                inputMode="decimal"
+                value={amountXlm}
+                onChange={(e) => setAmountXlm(e.target.value)}
+                placeholder={stroopsToXlm(stakeStroops)}
+                className="w-40 rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
+              />
+              <Button
+                variant="ghost"
+                type="button"
+                className="px-2 py-1 text-xs"
+                onClick={() => setAmountXlm(stroopsToXlm(stakeStroops))}
+                disabled={busy !== null}
+              >
+                Max
+              </Button>
+            </div>
+          </div>
+          <Button variant="secondary" onClick={handleWithdraw} disabled={busy !== null}>
+            {busy === "building"
+              ? "Building transaction..."
+              : busy === "signing"
+                ? "Awaiting signature in Freighter..."
+                : busy === "relaying"
+                  ? "Submitting to testnet..."
+                  : "Withdraw stake"}
+          </Button>
         </div>
-        <Button variant="secondary" onClick={handleWithdraw} disabled={busy !== null}>
-          {busy === "building"
-            ? "Building transaction..."
-            : busy === "signing"
-              ? "Awaiting signature in Freighter..."
-              : busy === "relaying"
-                ? "Submitting to testnet..."
-                : "Withdraw stake"}
-        </Button>
-      </div>
+      )}
       {error && (
         <p role="alert" className="text-sm text-status-slashed">
           {error}
