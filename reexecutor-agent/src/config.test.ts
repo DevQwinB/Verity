@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { Account, Keypair, Networks, Operation, TransactionBuilder } from "@stellar/stellar-sdk";
+import { Keypair, Networks, WebAuth } from "@stellar/stellar-sdk";
 import { findConfigMismatches } from "./config.js";
 
 const execFileAsync = promisify(execFile);
@@ -78,16 +78,20 @@ async function withStubBackend(
       res.end(JSON.stringify(config));
       return;
     }
+    // The worker discovers and pins this server before it signs anything (SEP-10),
+    // so the stub publishes its signing key and issues spec-conformant challenges.
+    const host = req.headers.host ?? "127.0.0.1";
+    if (req.method === "GET" && url.pathname === "/.well-known/stellar.toml") {
+      res.setHeader("content-type", "text/plain");
+      res.end(`SIGNING_KEY="${serverKey.publicKey()}"
+WEB_AUTH_ENDPOINT="http://${host}/auth"
+`);
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/auth") {
       const account = url.searchParams.get("account") ?? "";
-      const tx = new TransactionBuilder(new Account(serverKey.publicKey(), "-1"), {
-        fee: "100",
-        networkPassphrase: config.network_passphrase,
-      })
-        .addOperation(Operation.manageData({ name: "localhost auth", value: "nonce", source: account }))
-        .setTimeout(300)
-        .build();
-      res.end(JSON.stringify({ transaction: tx.toXDR(), network_passphrase: config.network_passphrase }));
+      const transaction = WebAuth.buildChallengeTx(serverKey, account, host, 300, config.network_passphrase, host);
+      res.end(JSON.stringify({ transaction, network_passphrase: config.network_passphrase }));
       return;
     }
     if (req.method === "POST" && url.pathname === "/auth") {
@@ -140,7 +144,8 @@ test("worker exits 1 and prints both contract IDs when backend tracks a differen
       assert.equal(result.code, 1);
       assert.ok(result.stderr.includes(CONTRACT_A), `expected worker ID in stderr: ${result.stderr}`);
       assert.ok(result.stderr.includes(CONTRACT_B), `expected backend ID in stderr: ${result.stderr}`);
-      assert.deepEqual(requests, ["GET /v1/config"]);
+      // SEP-10 discovery is a read; nothing is signed before the config check refuses.
+      assert.deepEqual(requests, ["GET /.well-known/stellar.toml", "GET /v1/config"]);
     }
   );
 });
@@ -159,7 +164,8 @@ test("worker exits 1 and prints both passphrases when backend tracks a different
       assert.equal(result.code, 1);
       assert.ok(result.stderr.includes(Networks.TESTNET), `expected worker passphrase in stderr: ${result.stderr}`);
       assert.ok(result.stderr.includes(Networks.PUBLIC), `expected backend passphrase in stderr: ${result.stderr}`);
-      assert.deepEqual(requests, ["GET /v1/config"]);
+      // SEP-10 discovery is a read; nothing is signed before the config check refuses.
+      assert.deepEqual(requests, ["GET /.well-known/stellar.toml", "GET /v1/config"]);
     }
   );
 });
@@ -177,6 +183,7 @@ test("worker starts and polls normally when backend config matches", async () =>
       });
       assert.equal(result.code, 0, `expected exit 0, got stderr: ${result.stderr}`);
       assert.deepEqual(requests, [
+        "GET /.well-known/stellar.toml",
         "GET /v1/config",
         "GET /auth",
         "POST /auth",
