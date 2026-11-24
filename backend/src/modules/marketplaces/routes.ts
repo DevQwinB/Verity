@@ -15,6 +15,10 @@ export const MAX_WEBHOOKS_PER_MARKETPLACE = 10;
 
 const webhookColumns = ["id", "url", "events", "active", "created_at"] as const;
 
+export const marketplaceBodySchema = z.object({
+  name: z.string().trim().min(1).max(100),
+});
+
 /** True when the caller owns the marketplace; otherwise sets the 403 reply. */
 async function ownsMarketplace(marketplaceId: string, account: string | undefined, reply: FastifyReply) {
   const marketplace = await db
@@ -31,11 +35,28 @@ async function ownsMarketplace(marketplaceId: string, account: string | undefine
 
 const notOwnerError = { error: "only the marketplace's own account can manage its webhooks" };
 
-async function upsertMarketplace(account: string, name: string) {
-  const inserted = await db
+export async function setMarketplaceName(account: string, name: string, dbClient: any = db) {
+  const existing = await dbClient
+    .selectFrom("marketplace")
+    .select("id")
+    .where("stellar_account", "=", account)
+    .executeTakeFirst();
+
+  const row = await dbClient
     .insertInto("marketplace")
     .values({ stellar_account: account, name })
-    .onConflict((oc) => oc.column("stellar_account").doNothing())
+    .onConflict((oc: any) => oc.column("stellar_account").doUpdateSet({ name }))
+    .returningAll()
+    .executeTakeFirstOrThrow();
+
+  return { row, created: !existing };
+}
+
+export async function upsertMarketplace(account: string, name: string, dbClient: any = db) {
+  const inserted = await dbClient
+    .insertInto("marketplace")
+    .values({ stellar_account: account, name })
+    .onConflict((oc: any) => oc.column("stellar_account").doNothing())
     .returningAll()
     .executeTakeFirst();
 
@@ -43,7 +64,7 @@ async function upsertMarketplace(account: string, name: string) {
     return { row: inserted, created: true };
   }
 
-  const existing = await db
+  const existing = await dbClient
     .selectFrom("marketplace")
     .selectAll()
     .where("stellar_account", "=", account)
@@ -52,14 +73,12 @@ async function upsertMarketplace(account: string, name: string) {
   return { row: existing, created: false };
 }
 
-export async function marketplacesRoutes(app: FastifyInstance) {
+export async function marketplacesRoutes(app: FastifyInstance, dbClient: any = db) {
   app.post("/v1/marketplaces", { preHandler: requireAuth }, async (req, reply) => {
-    const body = z.object({ name: z.string().min(1) }).parse(req.body);
+    const body = marketplaceBodySchema.parse(req.body);
     const account = req.stellarAccount!;
-    const { row, created } = await upsertMarketplace(account, body.name);
-    if (created) {
-      reply.code(201);
-    }
+    const { row, created } = await setMarketplaceName(account, body.name, dbClient);
+    reply.code(created ? 201 : 200);
     return row;
   });
 
@@ -130,7 +149,7 @@ export async function marketplacesRoutes(app: FastifyInstance) {
   });
 }
 
-export async function findOrCreateMarketplaceForAccount(account: string) {
-  const { row } = await upsertMarketplace(account, account);
+export async function findOrCreateMarketplaceForAccount(account: string, dbClient: any = db) {
+  const { row } = await upsertMarketplace(account, account, dbClient);
   return row;
 }
