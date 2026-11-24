@@ -1,6 +1,9 @@
 #![cfg(test)]
 
-use crate::events::{ReexecutorRegistered, ReexecutorStakeWithdrawn};
+use crate::events::{
+    ChallengeOpened, ChallengeResolved, Finalized, ReexecutorApprovalChanged, ReexecutorRegistered,
+    ReexecutorStakeWithdrawn, ReplayAttested, Slashed, SubmissionCreated,
+};
 use crate::{EscrowGate, EscrowGateClient};
 use soroban_sdk::{
     events::Event as _,
