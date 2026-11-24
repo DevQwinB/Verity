@@ -5,9 +5,9 @@ import { useRouter } from "next/navigation";
 import { useWallet } from "./wallet-provider";
 import { Button } from "./ui/button";
 import { openChallenge, relayChallenge } from "../lib/client-api";
-import { signXdr } from "../lib/wallet";
-import { NETWORK_PASSPHRASE, TESTNET_EXPLORER_TX } from "../lib/config";
-import { stroopsToXlm, xlmToStroops } from "../lib/format";
+import { assertWalletNetwork, signXdr, WalletError, wrongNetworkMessage } from "../lib/wallet";
+import { TESTNET_EXPLORER_TX } from "../lib/config";
+import { challengeWindowState, stroopsToXlm, xlmToStroops } from "../lib/format";
 
 const POLL_EVERY_MS = 3000;
 const GIVE_UP_AFTER_MS = 60_000;
@@ -21,24 +21,53 @@ export function OpenChallengeButton({
   submissionId,
   deadlineIso,
   minBondStroops,
+  networkPassphrase,
 }: {
   submissionId: string;
-  deadlineIso: string;
+  /** ISO timestamp when the challenge window closes; null while still being read from the contract. */
+  deadlineIso: string | null;
   /** The contract's floor for this submission; null if not mirrored yet. */
   minBondStroops: string | null;
+  networkPassphrase: string;
 }) {
   const router = useRouter();
-  const { account, connecting, login } = useWallet();
-  const [bondXlm, setBondXlm] = useState(minBondStroops ? stroopsToXlm(minBondStroops) : "");
-  const [busy, setBusy] = useState<null | "building" | "signing" | "relaying">(null);
+  const { account, connecting, networkOk, problem, login, reportWrongNetwork } = useWallet();
+  // Keep null until the visitor edits the field so a later refresh filling in
+  // minBondStroops populates the default without overwriting user input.
+  const [editedBondXlm, setEditedBondXlm] = useState<string | null>(null);
+  const bondXlm = editedBondXlm ?? (minBondStroops ? stroopsToXlm(minBondStroops) : "");
+  const [busy, setBusy] = useState<null | "checking" | "building" | "signing" | "relaying">(null);
   const [error, setError] = useState<string | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
   const [stalled, setStalled] = useState(false);
-  const [windowOpen, setWindowOpen] = useState(() => Date.now() < new Date(deadlineIso).getTime());
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const windowState = challengeWindowState(deadlineIso, nowMs);
+
+  const wrongNetworkNotice = !networkOk
+    ? problem?.code === "wrong-network"
+      ? problem.message
+      : wrongNetworkMessage()
+    : null;
+  const displayError = wrongNetworkNotice ?? error;
 
   useEffect(() => {
-    const id = setInterval(() => setWindowOpen(Date.now() < new Date(deadlineIso).getTime()), 1000);
-    return () => clearInterval(id);
+    if (deadlineIso === null) return;
+    const deadlineMs = Date.parse(deadlineIso);
+    let intervalId: ReturnType<typeof setInterval> | undefined;
+    const tick = () => {
+      const now = Date.now();
+      setNowMs(now);
+      if (Number.isNaN(deadlineMs) || now >= deadlineMs) {
+        if (intervalId !== undefined) clearInterval(intervalId);
+      }
+    };
+    const syncId = setTimeout(tick, 0);
+    intervalId = setInterval(tick, 1000);
+    return () => {
+      clearTimeout(syncId);
+      if (intervalId !== undefined) clearInterval(intervalId);
+    };
   }, [deadlineIso]);
 
   // The challenge row is written by the chain indexer a few seconds after
@@ -60,7 +89,7 @@ export function OpenChallengeButton({
   }, [txHash, router]);
 
   async function handleChallenge() {
-    if (!account) return;
+    if (!account || !networkOk) return;
     setError(null);
     const bond = xlmToStroops(bondXlm);
     if (bond === null) {
@@ -72,11 +101,13 @@ export function OpenChallengeButton({
       return;
     }
     try {
+      setBusy("checking");
+      await assertWalletNetwork(networkPassphrase);
       setBusy("building");
       const { unsigned_transaction_xdr } = await openChallenge(submissionId, bond.toString());
       setBusy("signing");
       const signed = await signXdr(unsigned_transaction_xdr, {
-        networkPassphrase: NETWORK_PASSPHRASE,
+        networkPassphrase,
         address: account,
       });
       setBusy("relaying");
@@ -84,6 +115,10 @@ export function OpenChallengeButton({
       setStalled(false);
       setTxHash(tx_hash);
     } catch (err) {
+      if (err instanceof WalletError && err.code === "wrong-network") {
+        reportWrongNetwork(err.message);
+        return;
+      }
       setError(err instanceof Error ? err.message : "The challenge could not be opened.");
     } finally {
       setBusy(null);
@@ -110,7 +145,16 @@ export function OpenChallengeButton({
     );
   }
 
-  if (!windowOpen) {
+  if (windowState === "unknown") {
+    return (
+      <p className="text-sm text-text-tertiary" role="status">
+        The challenge window is still being read from the contract. This page refreshes
+        automatically and will show the challenge form once it is recorded.
+      </p>
+    );
+  }
+
+  if (windowState === "closed") {
     return (
       <p className="text-sm text-text-tertiary">
         The challenge window has closed. This submission is waiting to be finalized and can no
@@ -143,19 +187,21 @@ export function OpenChallengeButton({
             id="challenge-bond"
             inputMode="decimal"
             value={bondXlm}
-            onChange={(e) => setBondXlm(e.target.value)}
+            onChange={(e) => setEditedBondXlm(e.target.value)}
             aria-describedby="challenge-bond-help"
             className="w-36 rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
           />
         </div>
-        <Button variant="danger" onClick={handleChallenge} disabled={busy !== null}>
-          {busy === "building"
-            ? "Building transaction..."
-            : busy === "signing"
-              ? "Awaiting signature in Freighter..."
-              : busy === "relaying"
-                ? "Submitting to testnet..."
-                : "Open challenge"}
+        <Button variant="danger" onClick={handleChallenge} disabled={busy !== null || !networkOk}>
+          {busy === "checking"
+            ? "Checking Freighter..."
+            : busy === "building"
+              ? "Building transaction..."
+              : busy === "signing"
+                ? "Awaiting signature in Freighter..."
+                : busy === "relaying"
+                  ? "Submitting to testnet..."
+                  : "Open challenge"}
         </Button>
       </div>
       <p id="challenge-bond-help" className="text-xs text-text-tertiary">
@@ -163,9 +209,9 @@ export function OpenChallengeButton({
           ? `Minimum ${stroopsToXlm(minBondStroops)} XLM for this submission, set by the contract.`
           : "The contract sets a minimum in proportion to the escrow value."}
       </p>
-      {error && (
+      {displayError && (
         <p role="alert" className="text-sm text-status-slashed">
-          {error}
+          {displayError}
         </p>
       )}
     </div>

@@ -85,6 +85,30 @@ export function windowDeadlineIso(submittedAtIso: string, windowSeconds: number)
   return new Date(new Date(submittedAtIso).getTime() + windowSeconds * 1000).toISOString();
 }
 
+/** Returns the challenge window deadline when `windowSeconds` has been recorded (> 0),
+ * or `null` while it is still 0 (not yet read back from the contract). */
+export function recordedWindowDeadlineIso(
+  submittedAtIso: string,
+  windowSeconds: number
+): string | null {
+  return windowSeconds > 0 ? windowDeadlineIso(submittedAtIso, windowSeconds) : null;
+}
+
+export type ChallengeWindowState = "unknown" | "open" | "closed";
+
+/** Classifies a challenge window deadline against `nowMs`.
+ * Returns `"unknown"` while the window has not been read from the contract (`null`),
+ * `"open"` strictly before the deadline, and `"closed"` at or after it. */
+export function challengeWindowState(
+  deadlineIso: string | null,
+  nowMs: number = Date.now()
+): ChallengeWindowState {
+  if (deadlineIso === null) return "unknown";
+  const deadlineMs = Date.parse(deadlineIso);
+  if (Number.isNaN(deadlineMs)) return "closed";
+  return nowMs < deadlineMs ? "open" : "closed";
+}
+
 export type XlmAmountResult =
   | { ok: true; stroops: bigint }
   | { ok: false; reason: string };
@@ -156,6 +180,7 @@ const CONTRACT_ERROR_DESCRIPTIONS: Record<string, string> = {
   InvalidOutputHash: "The claimed output hash cannot be all zeros; that value is reserved for \"no output\".",
   VoteContradictsHash: "The vote disagrees with the output hash it reports.",
   AgentCannotAttest: "The agent that made a submission cannot vote on it.",
+  AgentCannotChallenge: "The agent that made a submission cannot challenge it.",
   ReexecutorNotActive:
     "This account is not an active re-executor or its stake is below the minimum threshold.",
 };

@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import test, { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair, StrKey } from "@stellar/stellar-sdk";
 import type { ChallengeRecord, SubmissionRecord } from "escrow-gate";
@@ -22,6 +22,7 @@ const {
   shouldCheckOnChainChallenge,
   submissionRepairPatch,
   reconcileChallengeDecision,
+  isReadyToSettle,
 } = await import("./scheduler.js");
 
 describe("shouldCheckOnChainChallenge", () => {
@@ -303,5 +304,65 @@ describe("reconcileChallengeDecision", () => {
       now,
     });
     assert.deepEqual(decision, { action: "none" });
+  });
+});
+
+describe("isReadyToSettle", () => {
+  it("rejects non-terminal statuses", () => {
+    for (const status of ["pending", "disputed", "draft", "created"]) {
+      assert.equal(
+        isReadyToSettle({
+          status,
+          resolution_method: "reexecution_consensus",
+          has_attestation: true,
+        }),
+        false,
+        `status ${status} should not be ready to settle`
+      );
+    }
+  });
+
+  it("rejects when resolution_method is null or missing", () => {
+    for (const status of ["verified", "slashed", "expired_unverified"]) {
+      assert.equal(
+        isReadyToSettle({
+          status,
+          resolution_method: null,
+          has_attestation: true,
+        }),
+        false,
+        `status ${status} with null resolution_method should not be ready to settle`
+      );
+    }
+  });
+
+  it("rejects when attestation has not been exported yet", () => {
+    for (const status of ["verified", "slashed", "expired_unverified"]) {
+      assert.equal(
+        isReadyToSettle({
+          status,
+          resolution_method: "reexecution_consensus",
+          has_attestation: false,
+        }),
+        false,
+        `status ${status} without attestation should not be ready to settle`
+      );
+    }
+  });
+
+  it("accepts terminal status with known resolution_method and exported attestation", () => {
+    for (const status of ["verified", "slashed", "expired_unverified"]) {
+      for (const method of ["reexecution_consensus", "window_elapsed", "zk_proof"]) {
+        assert.equal(
+          isReadyToSettle({
+            status,
+            resolution_method: method,
+            has_attestation: true,
+          }),
+          true,
+          `status ${status} with method ${method} and attestation should be ready to settle`
+        );
+      }
+    }
   });
 });
