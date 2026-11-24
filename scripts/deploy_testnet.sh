@@ -165,6 +165,7 @@ if [ "$DEPLOYMENT" = testnet ]; then
 fi
 
 KEEPER_ADDR=$(stellar keys address "$KEEPER")
+ATTESTATION_ADDR="${VERITY_ATTESTATION_PUBLIC_KEY:-$KEEPER_ADDR}"
 
 cat > "$DEPLOY_JSON.tmp" <<EOF
 {
@@ -177,6 +178,7 @@ cat > "$DEPLOY_JSON.tmp" <<EOF
   "native_xlm_sac_address": "$NATIVE_SAC",
   "deployer_public_key": "$DEPLOYER_ADDR",
   "keeper_public_key": "$KEEPER_ADDR",
+  "attestation_public_key": "$ATTESTATION_ADDR",
 ${CHALLENGER_JSON}  "bootstrap_reexecutors": $BOOTSTRAP_JSON,
   "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
