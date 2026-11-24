@@ -339,10 +339,14 @@ call it was built for.
 
 `GET /auth?account=G…` returns a SEP-10 challenge transaction (valid for
 300 seconds) plus `network_passphrase`; sign it and `POST /auth` with
-`{ transaction }` to get `{ token }`. Send `Authorization: Bearer <token>`
-on the routes marked above. The JWT lasts **1 hour** and carries the account
-as `sub`; a missing header is 401 `{ "error": "missing bearer token" }` and a
-bad or expired token 401 `{ "error": "invalid or expired token" }`.
+`{ transaction }` to get `{ token }`. For existing on-chain accounts,
+signatures must satisfy the account's medium threshold using on-chain signers
+(a revoked master key with weight 0 is rejected with HTTP 400); non-existent
+accounts fall back to verifying the claimed account's master key. Send
+`Authorization: Bearer <token>` on the routes marked above. The JWT lasts
+**1 hour** and carries the account as `sub`; a missing header is 401
+`{ "error": "missing bearer token" }` and a bad or expired token 401
+`{ "error": "invalid or expired token" }`.
 `GET /.well-known/stellar.toml` advertises the auth endpoint and signing key.
 
 Only `GET /auth` and `POST /v1/submissions` return `network_passphrase`.
