@@ -17,6 +17,12 @@ pub enum DataKey {
     Reexecutor(Address),
     Slashed(u64, Address),
     AttestationReleased(u64, Address),
+    /// Everything set aside so far for the winning voters of a submission.
+    /// It only grows; what each voter has drawn is in RewardPaid.
+    RewardPool(u64),
+    /// The stake a vote was tallied with, fixed when it was cast.
+    VoteWeight(u64, Address),
+    RewardPaid(u64, Address),
 }
 
 // Persistent entries are extended generously on every touch so a submission
@@ -140,5 +146,44 @@ pub fn is_slashed(e: &Env, submission_id: u64, party: &Address) -> bool {
 pub fn mark_slashed(e: &Env, submission_id: u64, party: &Address) {
     let key = DataKey::Slashed(submission_id, party.clone());
     e.storage().persistent().set(&key, &true);
+    extend(e, &key);
+}
+
+pub fn get_reward_pool(e: &Env, submission_id: u64) -> i128 {
+    e.storage()
+        .persistent()
+        .get(&DataKey::RewardPool(submission_id))
+        .unwrap_or(0)
+}
+
+pub fn set_reward_pool(e: &Env, submission_id: u64, total: i128) {
+    let key = DataKey::RewardPool(submission_id);
+    e.storage().persistent().set(&key, &total);
+    extend(e, &key);
+}
+
+pub fn get_vote_weight(e: &Env, submission_id: u64, reexecutor: &Address) -> i128 {
+    e.storage()
+        .persistent()
+        .get(&DataKey::VoteWeight(submission_id, reexecutor.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_vote_weight(e: &Env, submission_id: u64, reexecutor: &Address, weight: i128) {
+    let key = DataKey::VoteWeight(submission_id, reexecutor.clone());
+    e.storage().persistent().set(&key, &weight);
+    extend(e, &key);
+}
+
+pub fn get_reward_paid(e: &Env, submission_id: u64, reexecutor: &Address) -> i128 {
+    e.storage()
+        .persistent()
+        .get(&DataKey::RewardPaid(submission_id, reexecutor.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_reward_paid(e: &Env, submission_id: u64, reexecutor: &Address, paid: i128) {
+    let key = DataKey::RewardPaid(submission_id, reexecutor.clone());
+    e.storage().persistent().set(&key, &paid);
     extend(e, &key);
 }

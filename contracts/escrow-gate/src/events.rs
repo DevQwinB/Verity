@@ -82,3 +82,15 @@ pub struct Slashed {
     pub reexecutor: Address,
     pub amount: i128,
 }
+
+/// A re-executor that voted with the consensus was paid its share of the
+/// submission's reward pool. `amount` is what this payment moved; a voter
+/// can be paid more than once when the pool grows after its first payment.
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoterRewarded {
+    #[topic]
+    pub submission_id: u64,
+    pub reexecutor: Address,
+    pub amount: i128,
+}

@@ -27,6 +27,7 @@ fn default_config() -> ConfigRecord {
         window_tier_large_s: 86_400,
         slash_split_challenger_bps: 2000,
         reexecutor_slash_bps: 1000,
+        voter_reward_bps: 0,
         reexecutor_allowlist: false,
     }
 }
