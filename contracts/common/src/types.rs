@@ -59,7 +59,7 @@ pub enum Resolution {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigRecord {
     pub min_stake_floor: i128,
     pub quorum_min_reexecutors: u32,
