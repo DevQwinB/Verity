@@ -23,6 +23,7 @@ import {
 } from "./sep10.js";
 import { NO_OUTPUT_HASH, voteMatches } from "./vote.js";
 import { startHeartbeat, type Heartbeat } from "./heartbeat.js";
+import { verifiedArtifact } from "./artifact.js";
 
 const DEFAULT_VOTING_BLOCK_MS = 60_000;
 const DEFAULT_RESYNC_COOLDOWN_MS = 60_000;
@@ -234,7 +235,7 @@ export function createWorker(options: WorkerOptions): ReexecutorWorker {
   async function fetchArtifact(ref: string): Promise<Buffer> {
     const contentHash = ref.split(/[\\/]/).pop()!;
     const { content_base64 } = await api<{ content_base64: string }>(`/v1/artifacts/${contentHash}`);
-    return Buffer.from(content_base64, "base64");
+    return verifiedArtifact(ref, content_base64);
   }
 
   /**
