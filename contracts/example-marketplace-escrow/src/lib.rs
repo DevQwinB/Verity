@@ -6,6 +6,10 @@
 //! Verity's own stack; shipped as integration documentation an external
 //! integrator can copy the pattern from (Rust) or reimplement against the
 //! exported EscrowGate contract spec (any language via stellar-sdk bindings).
+//!
+//! The contract is initialized atomically at deployment via `__constructor`,
+//! fixing the Verity `EscrowGate` address so setup cannot be front-run. Each
+//! escrow names the token it pays in.
 
 mod events;
 
@@ -15,8 +19,7 @@ use verity_common::{Error, SubmissionRecord, Verdict};
 
 #[contracttype]
 #[derive(Clone)]
-enum DataKey {
-    Admin,
+pub(crate) enum DataKey {
     Gate,
     Escrow(u64),
     NextId,
@@ -70,16 +73,12 @@ fn escrow_ref_for(e: &Env, escrow_id: u64) -> BytesN<32> {
 
 #[contractimpl]
 impl ExampleMarketplaceEscrow {
-    /// The marketplace is told which EscrowGate it trusts, and nothing about
-    /// tokens: each escrow names its own, and bonds are the gate's business.
-    pub fn initialize(e: Env, admin: Address, gate: Address) -> Result<(), Error> {
-        if e.storage().instance().has(&DataKey::Admin) {
-            return Err(Error::AlreadyInitialized);
-        }
-        admin.require_auth();
-        e.storage().instance().set(&DataKey::Admin, &admin);
+    /// Runs once, atomically with deployment, so nobody can front-run the contract
+    /// setup by claiming a fake gate. The marketplace is told which EscrowGate it
+    /// trusts, and nothing about tokens: each escrow names its own, and bonds are
+    /// the gate's business.
+    pub fn __constructor(e: Env, gate: Address) {
         e.storage().instance().set(&DataKey::Gate, &gate);
-        Ok(())
     }
 
     /// The bounty poster escrows `amount` of `token` for a specific payee
@@ -113,11 +112,6 @@ impl ExampleMarketplaceEscrow {
         // an escrow that expects one could never be released.
         if escrow_value <= 0 {
             return Err(Error::InvalidEscrowValue);
-        }
-        // Before initialize() there is no gate, and whoever called it first
-        // would choose the one that decides this escrow.
-        if !e.storage().instance().has(&DataKey::Gate) {
-            return Err(Error::NotInitialized);
         }
         soroban_sdk::token::TokenClient::new(&e, &token).transfer(
             &poster,

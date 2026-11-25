@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use crate::events::{EscrowCreated, EscrowReleased};
-use crate::{ExampleMarketplaceEscrow, ExampleMarketplaceEscrowClient};
+use crate::{DataKey, ExampleMarketplaceEscrow, ExampleMarketplaceEscrowClient};
 use escrow_gate::{EscrowGate, EscrowGateClient};
 use soroban_sdk::{
     events::Event as _,
@@ -52,9 +52,8 @@ fn setup() -> TestSetup {
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
 
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(),));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id);
 
     TestSetup {
         e,
@@ -106,9 +105,8 @@ fn release_pays_agent_only_after_gate_verifies() {
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
 
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(),));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id);
 
     let poster = Address::generate(&e);
     let agent = Address::generate(&e);
@@ -165,9 +163,8 @@ fn release_refunds_poster_when_gate_slashes() {
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
 
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(),));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id);
 
     let poster = Address::generate(&e);
     let agent = Address::generate(&e);
@@ -237,12 +234,12 @@ fn release_refunds_poster_on_expired_unverified() {
 }
 
 #[test]
-fn initialize_twice_returns_already_initialized() {
+fn constructor_arguments_are_stored() {
     let setup = setup();
-    let other_admin = Address::generate(&setup.e);
-    let other_gate = Address::generate(&setup.e);
-    let res = setup.mkt.try_initialize(&other_admin, &other_gate);
-    assert_eq!(res, Err(Ok(Error::AlreadyInitialized)));
+    setup.e.as_contract(&setup.mkt_id, || {
+        let stored_gate: Address = setup.e.storage().instance().get(&DataKey::Gate).unwrap();
+        assert_eq!(stored_gate, setup.gate.address);
+    });
 }
 
 #[test]
@@ -290,9 +287,8 @@ fn release_rejects_submission_from_other_agent() {
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
 
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(),));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id);
 
     let poster = Address::generate(&e);
     let payee = Address::generate(&e);
@@ -341,9 +337,8 @@ fn release_rejects_mismatched_escrow_value() {
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
 
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(),));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id);
 
     let poster = Address::generate(&e);
     let payee = Address::generate(&e);
@@ -391,9 +386,8 @@ fn release_rejects_mismatched_escrow_ref() {
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
     let gate = EscrowGateClient::new(&e, &gate_id);
 
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(),));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id);
 
     let poster = Address::generate(&e);
     let payee = Address::generate(&e);
@@ -438,9 +432,8 @@ fn release_rejects_unknown_submission() {
     let token_admin = token::StellarAssetClient::new(&e, &sac.address());
 
     let gate_id = e.register(EscrowGate, (admin.clone(), sac.address(), default_config()));
-    let mkt_id = e.register(ExampleMarketplaceEscrow, ());
+    let mkt_id = e.register(ExampleMarketplaceEscrow, (gate_id.clone(),));
     let mkt = ExampleMarketplaceEscrowClient::new(&e, &mkt_id);
-    mkt.initialize(&admin, &gate_id);
 
     let poster = Address::generate(&e);
     let payee = Address::generate(&e);
@@ -1067,24 +1060,6 @@ mod any_token {
                 .create_escrow(&poster, &agent, &usdc.address, &(250 * USDC), &1),
             0
         );
-    }
-
-    #[test]
-    fn create_escrow_is_refused_before_the_marketplace_is_initialized() {
-        let setup = setup();
-        let (usdc, usdc_admin) = usdc(&setup);
-        let fresh_id = setup.e.register(ExampleMarketplaceEscrow, ());
-        let fresh = ExampleMarketplaceEscrowClient::new(&setup.e, &fresh_id);
-        let poster = Address::generate(&setup.e);
-        let agent = Address::generate(&setup.e);
-        usdc_admin.mint(&poster, &(250 * USDC));
-
-        assert_eq!(
-            fresh.try_create_escrow(&poster, &agent, &usdc.address, &(250 * USDC), &(1000 * XLM)),
-            Err(Ok(Error::NotInitialized))
-        );
-        assert_eq!(usdc.balance(&poster), 250 * USDC);
-        assert_eq!(usdc.balance(&fresh_id), 0);
     }
 
     #[contracttype]
