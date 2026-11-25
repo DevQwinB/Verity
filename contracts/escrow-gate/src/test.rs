@@ -1,11 +1,15 @@
 #![cfg(test)]
 
+use crate::events::{ReexecutorRegistered, ReexecutorStakeWithdrawn};
 use crate::{EscrowGate, EscrowGateClient};
 use soroban_sdk::{
-    testutils::{storage::Instance as _, Address as _, Ledger as _},
+    events::Event as _,
+    testutils::{storage::Instance as _, Address as _, Events as _, Ledger as _},
     token, Address, BytesN, Env,
 };
-use verity_common::{ConfigRecord, Error, Resolution, ResolutionMethod, TaskType, Verdict};
+use verity_common::{
+    ConfigRecord, Error, ReexecutorInfo, Resolution, ResolutionMethod, TaskType, Verdict,
+};
 
 const STROOP: i128 = 1;
 const XLM: i128 = 10_000_000 * STROOP;
@@ -436,6 +440,124 @@ fn releasing_the_lock_slashes_a_wrong_voter_first() {
 }
 
 #[test]
+fn slash_cannot_take_stake_deposited_after_lock_release() {
+    let e = Env::default();
+    let w = setup_with(&e, ConfigRecord { reexecutor_slash_bps: 10_000, ..default_config() });
+    let agent = Address::generate(&e);
+    let sub_a = submit_default(&w, &agent);
+    let sub_b = submit_default(&w, &agent);
+
+    let wrong = Address::generate(&e);
+    let right1 = Address::generate(&e);
+    let right2 = Address::generate(&e);
+    for r in [&wrong, &right1, &right2] {
+        register_rex(&w, r);
+    }
+
+    let claimed = BytesN::from_array(&e, &[3u8; 32]);
+    let mismatch = BytesN::from_array(&e, &[9u8; 32]);
+    for id in [sub_a, sub_b] {
+        w.client.attest_replay(&wrong, &id, &claimed, &true);
+        w.client.attest_replay(&right1, &id, &mismatch, &false);
+        w.client.attest_replay(&right2, &id, &mismatch, &false);
+        assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+    }
+
+    // Releasing A takes all 600 XLM of wrong's stake (100% slash).
+    w.client.release_attestation_lock(&sub_a, &wrong);
+    let info = w.client.reexecutor_info(&wrong).unwrap();
+    assert_eq!(info.stake_amount, 0);
+    assert!(!info.active);
+    assert_eq!(info.open_attestations, 1);
+
+    // Releasing B finds 0 stake left, settles nothing further, and drops open_attestations to 0.
+    w.client.release_attestation_lock(&sub_b, &wrong);
+    let info = w.client.reexecutor_info(&wrong).unwrap();
+    assert_eq!(info.stake_amount, 0);
+    assert_eq!(info.open_attestations, 0);
+
+    // Re-executor deposits fresh stake after all prior locks were released.
+    w.client.register_reexecutor(&wrong, &(600 * XLM));
+    let admin_before = w.token.balance(&w.admin);
+    let contract_before = w.token.balance(&w.client.address);
+    let wrong_bal_before = w.token.balance(&wrong);
+
+    // Calling slash() for the already-released vote B must fail and leave the new stake untouched.
+    assert_eq!(
+        w.client.try_slash(&wrong, &sub_b),
+        Err(Ok(Error::AttestationAlreadyReleased))
+    );
+    let info = w.client.reexecutor_info(&wrong).unwrap();
+    assert_eq!(info.stake_amount, 600 * XLM);
+    assert!(info.active);
+    assert_eq!(w.token.balance(&w.admin), admin_before);
+    assert_eq!(w.token.balance(&w.client.address), contract_before);
+    assert_eq!(w.token.balance(&wrong), wrong_bal_before);
+}
+
+#[test]
+fn slash_after_normal_release_is_rejected_and_moves_no_tokens() {
+    // Normal release on a right-side voter.
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let wrong = Address::generate(&e);
+    let right1 = Address::generate(&e);
+    let right2 = Address::generate(&e);
+    for r in [&wrong, &right1, &right2] {
+        register_rex(&w, r);
+    }
+    w.client.attest_replay(&wrong, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+    w.client.attest_replay(&right1, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    w.client.attest_replay(&right2, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+
+    w.client.release_attestation_lock(&id, &right1);
+    let admin_before = w.token.balance(&w.admin);
+    let contract_before = w.token.balance(&w.client.address);
+    let right1_bal_before = w.token.balance(&right1);
+
+    assert_eq!(
+        w.client.try_slash(&right1, &id),
+        Err(Ok(Error::AttestationAlreadyReleased))
+    );
+    assert_eq!(w.client.reexecutor_info(&right1).unwrap().stake_amount, 600 * XLM);
+    assert_eq!(w.token.balance(&w.admin), admin_before);
+    assert_eq!(w.token.balance(&w.client.address), contract_before);
+    assert_eq!(w.token.balance(&right1), right1_bal_before);
+
+    // Normal release on a wrong-side voter when slashing is disabled (0 bps).
+    let e = Env::default();
+    let w = setup_with(&e, ConfigRecord { reexecutor_slash_bps: 0, ..default_config() });
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let wrong = Address::generate(&e);
+    register_rex(&w, &wrong);
+    w.client.attest_replay(&wrong, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+    for _ in 0..2 {
+        let r = Address::generate(&e);
+        register_rex(&w, &r);
+        w.client.attest_replay(&r, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+    }
+    assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+
+    w.client.release_attestation_lock(&id, &wrong);
+    let admin_before = w.token.balance(&w.admin);
+    let contract_before = w.token.balance(&w.client.address);
+
+    assert_eq!(
+        w.client.try_slash(&wrong, &id),
+        Err(Ok(Error::AttestationAlreadyReleased))
+    );
+    assert_eq!(w.client.reexecutor_info(&wrong).unwrap().stake_amount, 600 * XLM);
+    assert_eq!(w.token.balance(&w.admin), admin_before);
+    assert_eq!(w.token.balance(&w.client.address), contract_before);
+}
+
+#[test]
 fn reexecutor_slash_pays_only_a_challenger_who_won() {
     // Upheld challenge: the prevailing challenger shares in the stake of a
     // re-executor who backed the bad submission.
@@ -732,6 +854,246 @@ fn withdraw_is_blocked_while_attestation_is_open_then_unlocks_after_finalize() {
     assert_eq!(info.stake_amount, 0);
 }
 
+// ---- register_reexecutor top-ups and withdraw_stake edge cases ----
+
+// ReexecutorInfo has no PartialEq, so a record is compared field by field.
+fn assert_info_eq(actual: &ReexecutorInfo, expected: &ReexecutorInfo) {
+    assert_eq!(actual.stake_amount, expected.stake_amount);
+    assert_eq!(actual.active, expected.active);
+    assert_eq!(actual.joined_at, expected.joined_at);
+    assert_eq!(actual.open_attestations, expected.open_attestations);
+    assert_eq!(actual.approved, expected.approved);
+}
+
+#[test]
+fn register_reexecutor_rejects_a_non_positive_stake() {
+    let e = Env::default();
+    let w = setup(&e);
+    let rex = Address::generate(&e);
+    fund(&w, &rex, 1000 * XLM);
+
+    for amount in [0, -1, -(600 * XLM)] {
+        assert_eq!(
+            w.client.try_register_reexecutor(&rex, &amount),
+            Err(Ok(Error::InvalidAmount)),
+            "{amount}"
+        );
+    }
+    // Nothing moved and nothing was recorded.
+    assert_eq!(w.token.balance(&rex), 1000 * XLM);
+    assert_eq!(w.token.balance(&w.client.address), 0);
+    assert!(w.client.reexecutor_info(&rex).is_none());
+
+    // A registered re-executor is refused the same way and keeps its record.
+    w.client.register_reexecutor(&rex, &(600 * XLM));
+    let before = w.client.reexecutor_info(&rex).unwrap();
+    for amount in [0, -1] {
+        assert_eq!(
+            w.client.try_register_reexecutor(&rex, &amount),
+            Err(Ok(Error::InvalidAmount)),
+            "{amount}"
+        );
+    }
+    assert_info_eq(&w.client.reexecutor_info(&rex).unwrap(), &before);
+    assert_eq!(w.token.balance(&rex), 400 * XLM);
+    assert_eq!(w.token.balance(&w.client.address), 600 * XLM);
+}
+
+#[test]
+fn a_top_up_keeps_joined_at_open_attestations_and_approval() {
+    let e = Env::default();
+    let w = setup(&e);
+    // A start other than zero, so a top-up that reset joined_at would show.
+    e.ledger().set_timestamp(500);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex); // funded with 2000 XLM, stakes 600 XLM
+    w.client.set_reexecutor_approved(&w.admin, &rex, &true);
+    w.client
+        .attest_replay(&rex, &id, &BytesN::from_array(&e, &[3u8; 32]), &true);
+    let before = w.client.reexecutor_info(&rex).unwrap();
+    assert_eq!(before.joined_at, 500);
+    assert_eq!(before.open_attestations, 1);
+    assert!(before.approved);
+
+    e.ledger().set_timestamp(1500);
+    w.client.register_reexecutor(&rex, &(250 * XLM));
+
+    let after = w.client.reexecutor_info(&rex).unwrap();
+    assert_eq!(after.stake_amount, 850 * XLM);
+    assert_eq!(after.joined_at, 500, "a top-up is not a new registration");
+    assert_eq!(after.open_attestations, 1);
+    assert!(after.approved);
+    assert!(after.active);
+    // Only the top-up moved.
+    assert_eq!(w.token.balance(&rex), (2000 - 600 - 250) * XLM);
+}
+
+#[test]
+fn a_top_up_to_the_floor_reactivates_an_inactive_reexecutor() {
+    let e = Env::default();
+    let w = setup(&e); // floor = 500 XLM
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    let vote = BytesN::from_array(&e, &[3u8; 32]);
+
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex);
+    w.client.withdraw_stake(&rex, &(200 * XLM));
+    assert!(!w.client.reexecutor_info(&rex).unwrap().active);
+    assert_eq!(
+        w.client.try_attest_replay(&rex, &id, &vote, &true),
+        Err(Ok(Error::ReexecutorNotActive))
+    );
+
+    // One stroop short of the floor is still inactive.
+    w.client.register_reexecutor(&rex, &(100 * XLM - 1));
+    let short = w.client.reexecutor_info(&rex).unwrap();
+    assert_eq!(short.stake_amount, 500 * XLM - 1);
+    assert!(!short.active);
+
+    // The stroop that reaches the floor brings it back, and it can vote again.
+    w.client.register_reexecutor(&rex, &1);
+    let back = w.client.reexecutor_info(&rex).unwrap();
+    assert_eq!(back.stake_amount, 500 * XLM);
+    assert!(back.active);
+    w.client.attest_replay(&rex, &id, &vote, &true);
+    assert_eq!(w.client.get_submission(&id).unwrap().match_votes, 1);
+}
+
+#[test]
+fn withdraw_stake_rejects_a_non_positive_amount() {
+    let e = Env::default();
+    let w = setup(&e);
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex);
+    let before = w.client.reexecutor_info(&rex).unwrap();
+
+    for amount in [0, -1, -(600 * XLM)] {
+        assert_eq!(
+            w.client.try_withdraw_stake(&rex, &amount),
+            Err(Ok(Error::InvalidAmount)),
+            "{amount}"
+        );
+    }
+    assert_info_eq(&w.client.reexecutor_info(&rex).unwrap(), &before);
+    assert_eq!(w.token.balance(&rex), 1400 * XLM);
+    assert_eq!(w.token.balance(&w.client.address), 600 * XLM);
+}
+
+#[test]
+fn withdraw_stake_is_refused_for_an_address_that_never_registered() {
+    let e = Env::default();
+    let w = setup(&e);
+    // Somebody else's stake is in the contract, and must stay there.
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex);
+    let stranger = Address::generate(&e);
+    fund(&w, &stranger, 100 * XLM);
+
+    for amount in [1, 100 * XLM, 600 * XLM] {
+        assert_eq!(
+            w.client.try_withdraw_stake(&stranger, &amount),
+            Err(Ok(Error::ReexecutorNotActive)),
+            "{amount}"
+        );
+    }
+    assert!(w.client.reexecutor_info(&stranger).is_none());
+    assert_eq!(w.token.balance(&stranger), 100 * XLM);
+    assert_eq!(w.token.balance(&w.client.address), 600 * XLM);
+}
+
+#[test]
+fn a_withdrawal_that_leaves_less_than_the_floor_deactivates_and_blocks_the_next_vote() {
+    let e = Env::default();
+    let w = setup(&e); // floor = 500 XLM
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    let vote = BytesN::from_array(&e, &[3u8; 32]);
+
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex); // stake = 600 XLM
+
+    // Down to exactly the floor: still active.
+    w.client.withdraw_stake(&rex, &(100 * XLM));
+    let at_floor = w.client.reexecutor_info(&rex).unwrap();
+    assert_eq!(at_floor.stake_amount, 500 * XLM);
+    assert!(at_floor.active);
+
+    // One stroop below it: inactive, with the rest of the stake still held.
+    w.client.withdraw_stake(&rex, &1);
+    let below = w.client.reexecutor_info(&rex).unwrap();
+    assert_eq!(below.stake_amount, 500 * XLM - 1);
+    assert!(!below.active);
+    assert_eq!(w.token.balance(&rex), 1500 * XLM + 1);
+    assert_eq!(w.token.balance(&w.client.address), 50 * XLM + 500 * XLM - 1);
+
+    // Its next vote is refused, and leaves no trace on the submission or on it.
+    assert_eq!(
+        w.client.try_attest_replay(&rex, &id, &vote, &true),
+        Err(Ok(Error::ReexecutorNotActive))
+    );
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!(sub.match_votes, 0);
+    assert_eq!(sub.bonded_weight_matched, 0);
+    assert_eq!(w.client.reexecutor_info(&rex).unwrap().open_attestations, 0);
+}
+
+#[test]
+fn stake_events_carry_the_new_stake_and_the_active_flag() {
+    let e = Env::default();
+    let w = setup(&e); // floor = 500 XLM
+    let rex = Address::generate(&e);
+    fund(&w, &rex, 2000 * XLM);
+    let registered = |stake_amount: i128, active: bool| {
+        ReexecutorRegistered {
+            reexecutor: rex.clone(),
+            stake_amount,
+            active,
+        }
+        .to_xdr(&e, &w.client.address)
+    };
+    let withdrawn = |new_stake: i128, active: bool| {
+        ReexecutorStakeWithdrawn {
+            reexecutor: rex.clone(),
+            new_stake,
+            active,
+        }
+        .to_xdr(&e, &w.client.address)
+    };
+
+    // Registered below the floor: the stake is recorded, inactive.
+    w.client.register_reexecutor(&rex, &(400 * XLM));
+    let events = e.events().all();
+    assert!(events.events().contains(&registered(400 * XLM, false)));
+
+    // The event of a top-up carries the new total, not the amount added.
+    w.client.register_reexecutor(&rex, &(200 * XLM));
+    let events = e.events().all();
+    assert!(events.events().contains(&registered(600 * XLM, true)));
+    assert!(!events.events().contains(&registered(200 * XLM, true)));
+
+    // A withdrawal below the floor reports what is left and that it is inactive.
+    w.client.withdraw_stake(&rex, &(150 * XLM));
+    let events = e.events().all();
+    assert!(events.events().contains(&withdrawn(450 * XLM, false)));
+
+    // Withdrawing the rest reports a stake of zero.
+    w.client.withdraw_stake(&rex, &(450 * XLM));
+    let events = e.events().all();
+    assert!(events.events().contains(&withdrawn(0, false)));
+
+    // A refused withdrawal publishes no event for the stake it did not reach.
+    assert_eq!(
+        w.client.try_withdraw_stake(&rex, &1),
+        Err(Ok(Error::InvalidAmount))
+    );
+    let events = e.events().all();
+    assert!(!events.events().contains(&withdrawn(-1, false)));
+}
+
 // ---- voter allow-list ----
 
 #[test]
@@ -1003,6 +1365,76 @@ fn config_accepts_max_window_boundary() {
     w.client.update_config(&w.admin, &cfg);
     assert_eq!(w.client.get_config().unwrap().window_tier_small_s, crate::MAX_WINDOW_S);
     assert_eq!(w.client.get_config().unwrap().window_tier_large_s, crate::MAX_WINDOW_S);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn constructor_rejects_a_small_window_longer_than_the_large_one() {
+    let e = Env::default();
+    // The example from the issue: a small job would get 7 days and a large one 10 minutes.
+    setup_with(
+        &e,
+        ConfigRecord {
+            window_tier_small_s: crate::MAX_WINDOW_S,
+            window_tier_large_s: ConfigRecord::MIN_WINDOW_S,
+            ..default_config()
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn constructor_rejects_a_small_window_one_second_longer_than_the_large_one() {
+    let e = Env::default();
+    setup_with(
+        &e,
+        ConfigRecord {
+            window_tier_small_s: 3601,
+            window_tier_large_s: 3600,
+            ..default_config()
+        },
+    );
+}
+
+#[test]
+fn equal_window_tiers_are_accepted_by_the_constructor_and_by_update_config() {
+    // One window for every escrow. 600 / 600 is what the dev deployment uses.
+    for window in [ConfigRecord::MIN_WINDOW_S, 3600, crate::MAX_WINDOW_S] {
+        let e = Env::default();
+        let cfg = ConfigRecord {
+            window_tier_small_s: window,
+            window_tier_large_s: window,
+            ..default_config()
+        };
+        let w = setup_with(&e, cfg.clone());
+        assert_config_eq(&w.client.get_config().unwrap(), &cfg);
+
+        let other = setup(&e);
+        other.client.update_config(&other.admin, &cfg);
+        assert_config_eq(&other.client.get_config().unwrap(), &cfg);
+    }
+}
+
+#[test]
+fn a_small_window_shorter_than_the_large_one_is_still_accepted() {
+    let e = Env::default();
+    // The testnet defaults, and the closest the two can get without being equal.
+    for (small, large) in [
+        (3600, 86_400),
+        (3599, 3600),
+        (ConfigRecord::MIN_WINDOW_S, crate::MAX_WINDOW_S),
+    ] {
+        let cfg = ConfigRecord {
+            window_tier_small_s: small,
+            window_tier_large_s: large,
+            ..default_config()
+        };
+        let w = setup_with(&e, cfg.clone());
+        assert_config_eq(&w.client.get_config().unwrap(), &cfg);
+        w.client.update_config(&w.admin, &default_config());
+        w.client.update_config(&w.admin, &cfg);
+        assert_config_eq(&w.client.get_config().unwrap(), &cfg);
+    }
 }
 
 #[test]
@@ -1394,6 +1826,14 @@ fn update_config_rejects_each_invalid_rule() {
         ),
         ("small window too short", ConfigRecord { window_tier_small_s: below_min_window, ..d() }),
         ("large window too short", ConfigRecord { window_tier_large_s: below_min_window, ..d() }),
+        (
+            "small window longer than the large one",
+            ConfigRecord { window_tier_small_s: 7200, window_tier_large_s: 3600, ..d() },
+        ),
+        (
+            "small window one second longer than the large one",
+            ConfigRecord { window_tier_small_s: 3601, window_tier_large_s: 3600, ..d() },
+        ),
         ("zero agent bond", ConfigRecord { agent_bond_min_bps: 0, ..d() }),
         ("agent bond above 100%", ConfigRecord { agent_bond_min_bps: above_max_bps, ..d() }),
         ("zero challenger bond", ConfigRecord { challenger_bond_min_bps: 0, ..d() }),
@@ -1730,6 +2170,151 @@ fn open_challenge_stays_closed_one_second_after_the_deadline() {
     assert_eq!(open_challenge_after(3601), Err(Error::ChallengeWindowClosed));
 }
 
+/// Submits the default 1,000 XLM Deterministic work (small tier: a 3,600 s
+/// window), optionally opens a challenge one second before the window closes,
+/// then moves the clock `offset` seconds past the submit time and has a staked
+/// re-executor vote.
+fn attest_replay_after(offset: u64, challenged: bool, matched: bool) -> Result<(), Error> {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    // Not zero, so a deadline counted from the epoch and not from the
+    // submission would show.
+    e.ledger().set_timestamp(1_000_000);
+    let start = e.ledger().timestamp();
+    let id = submit_default(&w, &agent);
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex);
+
+    if challenged {
+        let challenger = Address::generate(&e);
+        fund(&w, &challenger, 50 * XLM);
+        e.ledger().set_timestamp(start + 3599);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+    }
+
+    e.ledger().set_timestamp(start + offset);
+    let hash = BytesN::from_array(&e, &[if matched { 3u8 } else { 9u8 }; 32]);
+    let result = match w.client.try_attest_replay(&rex, &id, &hash, &matched) {
+        Ok(Ok(_)) => Ok(()),
+        Err(Ok(err)) => Err(err),
+        other => panic!("unexpected result: {other:?}"),
+    };
+
+    // A refused vote leaves no trace: not in the tally, not on the voter.
+    let sub = w.client.get_submission(&id).unwrap();
+    let info = w.client.reexecutor_info(&rex).unwrap();
+    let counted = u32::from(result.is_ok());
+    assert_eq!(sub.match_votes + sub.mismatch_votes, counted);
+    assert_eq!(info.open_attestations, counted);
+    result
+}
+
+#[test]
+fn a_replay_vote_is_accepted_one_second_before_the_window_closes() {
+    assert_eq!(attest_replay_after(3599, false, true), Ok(()));
+    assert_eq!(attest_replay_after(3599, false, false), Ok(()));
+}
+
+#[test]
+fn a_replay_vote_is_rejected_exactly_at_the_window_deadline() {
+    assert_eq!(
+        attest_replay_after(3600, false, true),
+        Err(Error::ChallengeWindowClosed)
+    );
+    assert_eq!(
+        attest_replay_after(3600, false, false),
+        Err(Error::ChallengeWindowClosed)
+    );
+}
+
+#[test]
+fn a_replay_vote_stays_rejected_after_the_deadline() {
+    for offset in [3601, 4600, 86_400] {
+        assert_eq!(
+            attest_replay_after(offset, false, false),
+            Err(Error::ChallengeWindowClosed),
+            "{offset}"
+        );
+    }
+}
+
+#[test]
+fn a_replay_vote_on_a_challenged_submission_is_accepted_after_the_deadline() {
+    // resolve_challenge needs a consensus, and it may only form after the
+    // window, so the challenged path stays open until the submission is final.
+    for offset in [3599, 3600, 3601, 7198] {
+        assert_eq!(attest_replay_after(offset, true, false), Ok(()), "{offset}");
+        assert_eq!(attest_replay_after(offset, true, true), Ok(()), "{offset}");
+    }
+}
+
+#[test]
+fn a_late_mismatch_vote_cannot_turn_a_default_verified_into_expired_unverified() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    e.ledger().set_timestamp(1_000_000);
+    let start = e.ledger().timestamp();
+    let id = submit_default(&w, &agent);
+    let rex = Address::generate(&e);
+    register_rex(&w, &rex);
+
+    // Nobody votes or challenges inside the window, and the keeper is late.
+    e.ledger().set_timestamp(start + 4600);
+    assert_eq!(
+        w.client
+            .try_attest_replay(&rex, &id, &BytesN::from_array(&e, &[9u8; 32]), &false),
+        Err(Ok(Error::ChallengeWindowClosed))
+    );
+
+    // The window's verdict is what it was when the window closed.
+    assert_eq!(w.client.finalize(&id), Verdict::Verified);
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!(sub.resolution_method, ResolutionMethod::WindowElapsed);
+    assert_eq!(sub.mismatch_votes, 0);
+    assert_eq!(w.token.balance(&agent), 1000 * XLM);
+    // The late voter is not locked by a vote that was never counted.
+    w.client.withdraw_stake(&rex, &(600 * XLM));
+}
+
+#[test]
+fn late_votes_cannot_complete_a_quorum_after_the_window() {
+    let e = Env::default();
+    let w = setup(&e); // quorum 3
+    let agent = Address::generate(&e);
+    e.ledger().set_timestamp(1_000_000);
+    let start = e.ledger().timestamp();
+    let id = submit_default(&w, &agent);
+    let wrong = BytesN::from_array(&e, &[9u8; 32]);
+    let rexes = [
+        Address::generate(&e),
+        Address::generate(&e),
+        Address::generate(&e),
+    ];
+    for rex in &rexes {
+        register_rex(&w, rex);
+    }
+
+    // Two mismatch votes inside the window: one short of a quorum.
+    w.client.attest_replay(&rexes[0], &id, &wrong, &false);
+    w.client.attest_replay(&rexes[1], &id, &wrong, &false);
+
+    // The third arrives after the deadline and would have made it a slash.
+    e.ledger().set_timestamp(start + 3600);
+    assert_eq!(
+        w.client.try_attest_replay(&rexes[2], &id, &wrong, &false),
+        Err(Ok(Error::ChallengeWindowClosed))
+    );
+
+    assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+    let sub = w.client.get_submission(&id).unwrap();
+    assert_eq!(sub.mismatch_votes, 2);
+    assert_eq!(sub.resolution_method, ResolutionMethod::WindowElapsed);
+    // Nothing was established, so the agent's bond comes back.
+    assert_eq!(w.token.balance(&agent), 1000 * XLM);
+}
+
 #[test]
 fn finalize_stays_pending_one_second_before_the_window_closes() {
     let (verdict, sub) = finalize_after(1000 * XLM, 50 * XLM, TaskType::Deterministic, 3599);
@@ -1839,6 +2424,58 @@ fn the_submitting_agent_cannot_attest_its_own_submission() {
     let sub = w.client.get_submission(&id).unwrap();
     assert_eq!(sub.match_votes, 0);
     assert_eq!(w.client.reexecutor_info(&agent).unwrap().open_attestations, 0);
+}
+
+#[test]
+fn the_submitting_agent_cannot_challenge_its_own_submission() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    // The agent can afford the bond, so that is not why it is refused.
+    let agent_before = w.token.balance(&agent);
+    let held_before = w.token.balance(&w.client.address);
+    assert!(agent_before >= 50 * XLM);
+
+    assert_eq!(
+        w.client.try_open_challenge(&agent, &id, &(50 * XLM)),
+        Err(Ok(Error::AgentCannotChallenge))
+    );
+    // No tokens moved and no challenge was recorded.
+    assert_eq!(w.token.balance(&agent), agent_before);
+    assert_eq!(w.token.balance(&w.client.address), held_before);
+    assert!(w.client.get_challenge(&id).is_none());
+
+    // The one challenge slot is still free, and anyone else opens it as before.
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 100 * XLM);
+    w.client.open_challenge(&challenger, &id, &(50 * XLM));
+    assert_eq!(w.token.balance(&challenger), 50 * XLM);
+    assert_eq!(w.token.balance(&w.client.address), held_before + 50 * XLM);
+    let chal = w.client.get_challenge(&id).unwrap();
+    assert_eq!(chal.challenger, challenger);
+    assert_eq!(chal.bond, 50 * XLM);
+}
+
+#[test]
+fn an_agent_may_still_challenge_another_agents_submission() {
+    let e = Env::default();
+    let w = setup(&e);
+    let (first, second) = (Address::generate(&e), Address::generate(&e));
+    let first_id = submit_default(&w, &first);
+    let second_id = submit_default(&w, &second);
+
+    // Being an agent is not what is refused: challenging your own work is.
+    w.client.open_challenge(&second, &first_id, &(50 * XLM));
+    assert_eq!(
+        w.client.get_challenge(&first_id).unwrap().challenger,
+        second
+    );
+    assert_eq!(
+        w.client
+            .try_open_challenge(&second, &second_id, &(50 * XLM)),
+        Err(Ok(Error::AgentCannotChallenge))
+    );
 }
 
 #[test]

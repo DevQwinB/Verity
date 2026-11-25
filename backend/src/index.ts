@@ -7,7 +7,7 @@ import { startIndexer } from "./workers/indexer.js";
 import { startScheduler } from "./workers/scheduler.js";
 
 async function main() {
-  const app = buildApp();
+  const app = await buildApp();
   // Before anything is served: a backend configured for another token than
   // the gate takes would tell every client to approve the wrong one.
   await assertBondAssetMatchesGate({
