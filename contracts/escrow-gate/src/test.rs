@@ -1487,7 +1487,7 @@ fn finalize_publishes_bond_settled_event_slashed_with_challenge() {
     assert_eq!(w.token.balance(&w.admin), 40 * XLM);
 
     // Check events immediately after resolve_challenge (which calls finalize internally)
-    let events = e.events().all();
+    let _events = e.events().all();
     // Note: e.events().all() seems to not capture events for this flow in the test framework.
     // The balance assertions above verify the contract logic is correct.
     // assert!(events.events().contains(&settled(0, 60 * XLM, 40 * XLM)));
