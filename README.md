@@ -578,14 +578,16 @@ An application-level address check is not network isolation: operators should
 also enforce outbound egress filtering on the host for the backend and
 re-executor workers.
 
-**Delivery is best-effort: one attempt, no retry.** A delivery times out
+**Delivery is best-effort with exponential backoff retry.** A delivery times out
 after 5 seconds. HTTP 2xx counts as delivered; other responses, timeouts,
-redirects, and transport failures count as failed. The backend records
-delivery attempts internally but provides no delivery-history API.
-Deliveries run in the background after the verdict is recorded and never
-block verdict handling. Failed HTTP responses and transport errors are
-recorded in `webhook_delivery` and logged by the dispatcher; a delivery still
-in flight when the process exits stays `pending`.
+redirects, and transport failures count as failed and are retried with
+exponential backoff (1 min, 2 min, 4 min, 8 min, 16 min, 32 min, 64 min, 128 min)
+up to 8 total attempts. HTTP 408 and 429 are retried; other 4xx and 3xx are
+terminal. The backend records delivery attempts internally but provides no
+delivery-history API. Deliveries run in the background after the verdict is
+recorded and never block verdict handling. Failed HTTP responses and transport
+errors are recorded in `webhook_delivery` and logged by the dispatcher; a delivery
+still in flight when the process exits stays `pending` and is retried on restart.
 No delivery to a receiver is guaranteed.
 
 

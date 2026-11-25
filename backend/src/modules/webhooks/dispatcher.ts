@@ -1,7 +1,9 @@
 import { createHmac } from "node:crypto";
+import { sql } from "kysely";
 import { db } from "../../db.js";
 import { resolvePublicTarget } from "./url-guard.js";
 import { postPinned } from "./post-pinned.js";
+import { backoffMs, MAX_DELIVERY_ATTEMPTS, shouldRetry } from "./retry-policy.js";
 
 export function getUrlOrigin(rawUrl: string): string {
   try {
@@ -61,33 +63,46 @@ export interface WebhookSubscriptionRecord {
 }
 
 /**
- * Delivers a single webhook event to a subscription.
- * Handles SSRF guard checking with the checked address pinned for the request,
- * an overall per-request timeout, and database status tracking.
+ * Creates a webhook delivery record without sending it.
+ * Returns the delivery ID.
  */
-export async function deliver(
+export async function createDelivery(
   sub: WebhookSubscriptionRecord,
   eventType: string,
   payload: unknown
-): Promise<void> {
+): Promise<string> {
+  const delivery = await db
+    .insertInto("webhook_delivery")
+    .values({ subscription_id: sub.id, event_type: eventType, payload: payload as any })
+    .returningAll()
+    .executeTakeFirstOrThrow();
+  return delivery.id;
+}
+
+/**
+ * Attempts a single delivery of a webhook. The delivery row must already exist.
+ * Returns true if the delivery was accepted (2xx), false if it should be retried,
+ * and throws if the subscription is inactive (so it won't be retried).
+ */
+export async function attemptDelivery(
+  deliveryId: string,
+  sub: WebhookSubscriptionRecord,
+  eventType: string,
+  payload: unknown
+): Promise<boolean> {
+  // Re-check subscription is still active
+  const currentSub = await db
+    .selectFrom("webhook_subscription")
+    .select(["id", "active"])
+    .where("id", "=", sub.id)
+    .executeTakeFirst();
+
+  if (!currentSub || !currentSub.active) {
+    throw new Error("subscription inactive");
+  }
+
   const body = JSON.stringify({ event: eventType, data: payload });
   const origin = getUrlOrigin(sub.url);
-
-  let deliveryId: string | undefined;
-  try {
-    const delivery = await db
-      .insertInto("webhook_delivery")
-      .values({ subscription_id: sub.id, event_type: eventType, payload: payload as any })
-      .returningAll()
-      .executeTakeFirstOrThrow();
-    deliveryId = delivery.id;
-  } catch (insertErr) {
-    console.error(
-      `[webhook] failed to create delivery record for subscription ${sub.id} (${eventType}) to ${origin}:`,
-      insertErr
-    );
-    return;
-  }
 
   // Signed over timestamp, delivery id and body so a captured request cannot be
   // replayed later or under another delivery id.
@@ -116,13 +131,19 @@ export async function deliver(
     const statusCode = res.status;
     const isOk = statusCode >= 200 && statusCode < 300;
 
+    const nextAttempt = isOk ? 0 : (await getAttempts(deliveryId)) + 1;
+    const nextAttemptAt = isOk || !shouldRetry(statusCode) || nextAttempt >= MAX_DELIVERY_ATTEMPTS
+      ? null
+      : new Date(Date.now() + backoffMs(nextAttempt));
+
     await db
       .updateTable("webhook_delivery")
       .set({
         status: isOk ? "delivered" : "failed",
-        attempts: 1,
+        attempts: sql<number>`attempts + 1`,
         last_attempt_at: new Date(),
         response_code: statusCode,
+        next_attempt_at: nextAttemptAt,
       })
       .where("id", "=", deliveryId)
       .execute();
@@ -132,11 +153,23 @@ export async function deliver(
         `[webhook] delivery ${deliveryId} (${eventType}) to ${origin} failed: ${statusCode}`
       );
     }
+    return isOk;
   } catch (err) {
     try {
+      const currentAttempts = await getAttempts(deliveryId);
+      const nextAttempt = currentAttempts + 1;
+      const nextAttemptAt = shouldRetry(null) && nextAttempt < MAX_DELIVERY_ATTEMPTS
+        ? new Date(Date.now() + backoffMs(nextAttempt))
+        : null;
+
       await db
         .updateTable("webhook_delivery")
-        .set({ status: "failed", attempts: 1, last_attempt_at: new Date() })
+        .set({
+          status: "failed",
+          attempts: nextAttempt,
+          last_attempt_at: new Date(),
+          next_attempt_at: nextAttemptAt,
+        })
         .where("id", "=", deliveryId)
         .execute();
     } catch (dbErr) {
@@ -151,7 +184,101 @@ export async function deliver(
     } catch (logErr) {
       console.error(`[webhook] delivery ${deliveryId} (${eventType}) to ${origin} failed: logging error`, logErr);
     }
+    return false;
   }
+}
+
+async function getAttempts(deliveryId: string): Promise<number> {
+  const row = await db
+    .selectFrom("webhook_delivery")
+    .select(["attempts"])
+    .where("id", "=", deliveryId)
+    .executeTakeFirst();
+  return row?.attempts ?? 1;
+}
+
+/**
+ * Delivers a single webhook event to a subscription.
+ * Handles SSRF guard checking with the checked address pinned for the request,
+ * an overall per-request timeout, and database status tracking.
+ * This is the original single-attempt delivery; it now uses the retry infrastructure.
+ */
+export async function deliver(
+  sub: WebhookSubscriptionRecord,
+  eventType: string,
+  payload: unknown
+): Promise<void> {
+  const deliveryId = await createDelivery(sub, eventType, payload);
+  await attemptDelivery(deliveryId, sub, eventType, payload);
+}
+
+/**
+ * Retries pending and failed webhook deliveries that are due.
+ * Picks rows where status in ('pending','failed'), next_attempt_at <= now (or NULL for orphaned pending),
+ * subscription is active, and attempts < MAX_DELIVERY_ATTEMPTS.
+ * Uses FOR UPDATE SKIP LOCKED to avoid overlapping ticks double-sending.
+ */
+export async function retryWebhooksOnce(): Promise<number> {
+  const now = new Date();
+  const due = await db
+    .selectFrom("webhook_delivery")
+    .innerJoin("webhook_subscription", "webhook_subscription.id", "webhook_delivery.subscription_id")
+    .select([
+      "webhook_delivery.id",
+      "webhook_delivery.subscription_id",
+      "webhook_delivery.event_type",
+      "webhook_delivery.payload",
+      "webhook_delivery.attempts",
+      "webhook_subscription.url",
+      "webhook_subscription.secret",
+      "webhook_subscription.active",
+      "webhook_subscription.events",
+      "webhook_subscription.marketplace_id",
+    ])
+    .where("webhook_delivery.status", "in", ["pending", "failed"])
+    .where((eb) =>
+      eb.or([
+        eb("webhook_delivery.status", "=", "pending"),
+        eb("webhook_delivery.status", "=", "failed"),
+      ])
+    )
+    .where((eb) =>
+      eb.or([
+        eb("webhook_delivery.next_attempt_at", "<=", now),
+        eb.and([
+          eb("webhook_delivery.status", "=", "pending"),
+          eb("webhook_delivery.next_attempt_at", "is", null),
+        ]),
+      ])
+    )
+    .where("webhook_subscription.active", "=", true)
+    .where("webhook_delivery.attempts", "<", MAX_DELIVERY_ATTEMPTS)
+    .forUpdate(["webhook_delivery"])
+    .skipLocked()
+    .limit(50)
+    .execute();
+
+  let retried = 0;
+  for (const row of due) {
+    try {
+      const sub: WebhookSubscriptionRecord = {
+        id: row.subscription_id,
+        marketplace_id: row.marketplace_id,
+        url: row.url,
+        secret: row.secret,
+        events: row.events,
+        active: row.active,
+      };
+      await attemptDelivery(row.id, sub, row.event_type, row.payload);
+      retried++;
+    } catch (err) {
+      if ((err as Error).message === "subscription inactive") {
+        continue; // Don't retry inactive subscriptions
+      }
+      console.error(`[webhook] retry failed for delivery ${row.id}:`, err);
+    }
+  }
+  return retried;
 }
 
 export interface DispatchWebhookDeps {
@@ -167,7 +294,7 @@ export interface DispatchWebhookDeps {
  * with a short per-request timeout (5s) and release their connection bodies.
  *
  * If the process exits while deliveries are in flight, their rows stay `pending`
- * (webhooks are delivered once with no retry).
+ * and will be retried by the retry worker.
  */
 export async function dispatchWebhook(
   marketplaceId: string,
