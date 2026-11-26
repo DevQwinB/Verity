@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useWallet } from "./wallet-provider";
 import { Button } from "./ui/button";
-import { openChallenge, relayChallenge } from "../lib/client-api";
+import { openChallenge, relayChallenge, ActionTimeoutError } from "../lib/client-api";
 import { assertWalletNetwork, signXdr, WalletError, wrongNetworkMessage } from "../lib/wallet";
 import { explorerUrl } from "../lib/config";
 import {
@@ -49,6 +49,7 @@ export function OpenChallengeButton({
   const bondInput = editedBondInput ?? (minBondStroops ? formatUnits(minBondStroops, asset.decimals) : "");
   const [busy, setBusy] = useState<null | "checking" | "building" | "signing" | "relaying">(null);
   const [error, setError] = useState<string | null>(null);
+  const [outcomeUnknown, setOutcomeUnknown] = useState(false);
   const [txHash, setTxHash] = useState<string | null>(null);
   const [stalled, setStalled] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -131,6 +132,11 @@ export function OpenChallengeButton({
       if (err instanceof WalletError && err.code === "wrong-network") {
         reportWrongNetwork(err.message);
         return;
+      }
+      if (err instanceof ActionTimeoutError) {
+        setOutcomeUnknown(true);
+      } else {
+        setOutcomeUnknown(false);
       }
       setError(err instanceof Error ? mapTrustlineError(err, asset.symbol) : "The challenge could not be opened.");
     } finally {
@@ -226,9 +232,22 @@ export function OpenChallengeButton({
         <p className="text-xs text-text-tertiary">{trustlineNote(asset.symbol)}</p>
       )}
       {displayError && (
-        <p role="alert" className="text-sm text-status-slashed">
-          {displayError}
-        </p>
+        <div role="alert" className="text-sm text-status-slashed space-y-2">
+          <p>{displayError}</p>
+          {outcomeUnknown && account && (
+            <p className="text-xs">
+              The transaction may still be on-chain. Check your account on stellar.expert:{" "}
+              <a
+                href={explorerUrl("account", account, networkPassphrase)}
+                target="_blank"
+                rel="noreferrer"
+                className="text-accent underline-offset-2 hover:underline"
+              >
+                {account.slice(0, 6)}…{account.slice(-4)}
+              </a>
+            </p>
+          )}
+        </div>
       )}
     </div>
   );
