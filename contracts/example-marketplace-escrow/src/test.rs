@@ -220,10 +220,32 @@ fn constructor_arguments_are_stored() {
     let setup = setup();
     setup.e.as_contract(&setup.mkt_id, || {
         let stored_gate: Address = setup.e.storage().instance().get(&DataKey::Gate).unwrap();
-        let stored_token: Address = setup.e.storage().instance().get(&DataKey::BondAsset).unwrap();
+        let stored_token: Address = setup.e.storage().instance().get(&DataKey::Asset).unwrap();
         assert_eq!(stored_gate, setup.gate.address);
         assert_eq!(stored_token, setup.token.address);
     });
+}
+
+#[test]
+fn get_escrow_returns_record_and_none_for_unknown() {
+    let setup = setup();
+    assert_eq!(setup.mkt.get_escrow(&999u64), None);
+
+    let poster = Address::generate(&setup.e);
+    let agent = Address::generate(&setup.e);
+    let (escrow_id, submission_id) = create_escrow_and_submission(&setup, &poster, &agent);
+
+    let rec = setup.mkt.get_escrow(&escrow_id).unwrap();
+    assert_eq!(rec.poster, poster);
+    assert_eq!(rec.payee, agent);
+    assert_eq!(rec.amount, 1000 * XLM);
+    assert!(!rec.released);
+
+    setup.e.ledger().set_timestamp(setup.e.ledger().timestamp() + 3601);
+    setup.mkt.release(&escrow_id, &submission_id);
+
+    let after = setup.mkt.get_escrow(&escrow_id).unwrap();
+    assert!(after.released);
 }
 
 #[test]

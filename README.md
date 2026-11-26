@@ -66,7 +66,7 @@ and `backend/src/chain/canonical.ts`.
 
 | Path | What |
 |---|---|
-| `contracts/` | Soroban contracts: `escrow-gate`, `zk-verifier-registry`, `example-marketplace-escrow` (reference only, not deployed), shared `common` types |
+| `contracts/` | Soroban contracts: `escrow-gate`, `zk-verifier-registry`, `example-marketplace-escrow` (reference escrow deployed alongside `escrow-gate` for smoke verification), shared `common` types |
 | `backend/` | Fastify API, SEP-10 auth, chain indexer, keeper/scheduler |
 | `reexecutor-agent/` | Worker that replays assignments and attests on-chain with its own key |
 | `frontend/` | Next.js dashboard (Freighter wallet) |
@@ -794,8 +794,17 @@ full tally.
 - **What "verified" covers.** The input and claimed-output hashes are
   committed on-chain; the function is stored by hash but not committed. A
   verdict means "consistent with the artifacts the agent declared".
-- **No escrow is gated yet.** `example-marketplace-escrow` shows the
-  integration but is not deployed; `escrow_value` is declared by the agent.
+- **Reference escrow deployed, no external marketplace integrated yet.**
+  `example-marketplace-escrow` is deployed alongside `EscrowGate` and proven
+  end-to-end on testnet by the `escrow-honest` and `escrow-dishonest` smoke
+  scenarios (real XLM payouts on `Verified` and refunds on `Slashed`), but no
+  real external marketplace is integrated yet; `escrow_value` on standalone
+  submissions is declared by the agent. To bind a submission to an
+  `example-marketplace-escrow` escrow ID `N`, pass `escrow_ref` as the 64-char
+  hex encoding of the 32-byte reference with `N` as a big-endian `u64` in the
+  final 8 bytes (`bytes[24..32]`, `bytes[0..24]` zeroed); the backend passes raw
+  32-byte hex `escrow_ref` values through verbatim while hashing arbitrary
+  strings (such as dashboard escrow references) with SHA-256.
 - **Voter set.** Stake is free on testnet, so an open voter set could be
   captured at no cost. Deployments here run with `reexecutor_allowlist` on:
   the admin approves which staked accounts may vote.

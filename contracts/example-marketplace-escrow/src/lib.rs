@@ -1,14 +1,14 @@
 #![no_std]
 
-//! Reference contract only — demonstrates the drop-in wrapper pattern any real
-//! marketplace's own escrow contract uses to gate its `release()` on Verity's
-//! `EscrowGate.finalize()` before paying an agent. Not deployed as part of
-//! Verity's own stack; shipped as integration documentation an external
-//! integrator can copy the pattern from (Rust) or reimplement against the
-//! exported EscrowGate contract spec (any language via stellar-sdk bindings).
+//! Reference marketplace escrow contract — demonstrates the drop-in wrapper
+//! pattern a marketplace's own escrow contract uses to gate its `release()` on
+//! Verity's `EscrowGate.finalize()` before paying an agent. Deployed alongside
+//! `EscrowGate` on testnet so the smoke suite can prove real escrow payouts
+//! and refunds end-to-end; external integrators can copy the pattern (Rust) or
+//! reimplement against the exported `EscrowGate` contract spec.
 //!
 //! The contract is initialized atomically at deployment via `__constructor`,
-//! fixing the Verity `EscrowGate` and payment token addresses so setup cannot
+//! fixing the Verity `EscrowGate` and payment asset addresses so setup cannot
 //! be front-run.
 
 mod events;
@@ -21,18 +21,18 @@ use verity_common::{Error, SubmissionRecord, Verdict};
 #[derive(Clone)]
 pub(crate) enum DataKey {
     Gate,
-    BondAsset,
+    Asset,
     Escrow(u64),
     NextId,
 }
 
 #[contracttype]
-#[derive(Clone)]
-struct EscrowRecord {
-    payee: Address,
-    poster: Address,
-    amount: i128,
-    released: bool,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowRecord {
+    pub payee: Address,
+    pub poster: Address,
+    pub amount: i128,
+    pub released: bool,
 }
 
 // The thresholds EscrowGate uses (contracts/escrow-gate/src/storage.rs). An
@@ -66,10 +66,15 @@ fn escrow_ref_for(e: &Env, escrow_id: u64) -> BytesN<32> {
 #[contractimpl]
 impl ExampleMarketplaceEscrow {
     /// Runs once, atomically with deployment, so nobody can front-run the contract
-    /// setup by claiming a fake gate or token.
-    pub fn __constructor(e: Env, gate: Address, token: Address) {
+    /// setup by claiming a fake gate or asset.
+    pub fn __constructor(e: Env, gate: Address, asset: Address) {
         e.storage().instance().set(&DataKey::Gate, &gate);
-        e.storage().instance().set(&DataKey::BondAsset, &token);
+        e.storage().instance().set(&DataKey::Asset, &asset);
+    }
+
+    /// Returns the stored escrow record for `id`, or `None` if it does not exist.
+    pub fn get_escrow(e: Env, id: u64) -> Option<EscrowRecord> {
+        e.storage().persistent().get(&DataKey::Escrow(id))
     }
 
     /// The bounty poster escrows funds for a specific payee agent, unrelated
@@ -85,12 +90,12 @@ impl ExampleMarketplaceEscrow {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
-        let bond_asset: Address = e
+        let asset: Address = e
             .storage()
             .instance()
-            .get(&DataKey::BondAsset)
+            .get(&DataKey::Asset)
             .ok_or(Error::NotInitialized)?;
-        let token = soroban_sdk::token::TokenClient::new(&e, &bond_asset);
+        let token = soroban_sdk::token::TokenClient::new(&e, &asset);
         token.transfer(&poster, e.current_contract_address(), &amount);
 
         let id: u64 = e.storage().instance().get(&DataKey::NextId).unwrap_or(0);
@@ -160,12 +165,12 @@ impl ExampleMarketplaceEscrow {
             soroban_sdk::vec![&e, soroban_sdk::IntoVal::into_val(&submission_id, &e)],
         );
 
-        let bond_asset: Address = e
+        let asset: Address = e
             .storage()
             .instance()
-            .get(&DataKey::BondAsset)
+            .get(&DataKey::Asset)
             .ok_or(Error::NotInitialized)?;
-        let token = soroban_sdk::token::TokenClient::new(&e, &bond_asset);
+        let token = soroban_sdk::token::TokenClient::new(&e, &asset);
         let contract_address = e.current_contract_address();
 
         let to = match verdict {

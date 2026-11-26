@@ -46,11 +46,16 @@ BOOTSTRAP_REEXECUTORS=("${ALIAS_PREFIX}rex1" "${ALIAS_PREFIX}rex2" "${ALIAS_PREF
 # before a colon) does not change what these return.
 _deployment_flat() { tr -d '\n\r' < "$DEPLOY_JSON"; }
 
+# Prints the string value of a top-level key, or empty if absent.
+optional_json_field() {
+  _deployment_flat | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed 's/.*"\([^"]*\)"$/\1/' || true
+}
+
 # Prints the string value of a top-level key. A missing key says so and fails;
 # under `set -e` the caller would otherwise stop with no message at all.
 json_field() {
   local value
-  value="$(_deployment_flat | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed 's/.*"\([^"]*\)"$/\1/' || true)"
+  value="$(optional_json_field "$1")"
   if [ -z "$value" ]; then
     echo "FATAL: '$1' not found in $DEPLOY_JSON" >&2
     return 1
