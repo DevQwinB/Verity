@@ -5,10 +5,11 @@ import { useRouter } from "next/navigation";
 import { useWallet } from "./wallet-provider";
 import { Button } from "./ui/button";
 import { LiveStatus } from "./live-status";
-import { buildStakeWithdrawal, relayReexecutorStake } from "../lib/client-api";
+import { buildStakeWithdrawal, relayReexecutorStake, ActionTimeoutError } from "../lib/client-api";
 import { assertWalletNetwork, signXdr, WalletError, wrongNetworkMessage } from "../lib/wallet";
-import { TESTNET_EXPLORER_TX } from "../lib/config";
-import { stroopsToXlm, xlmToStroops } from "../lib/format";
+import { TESTNET_EXPLORER_TX, TESTNET_EXPLORER_ACCOUNT } from "../lib/config";
+import { formatUnits, parseUnits, resolveBondAsset } from "../lib/format";
+import type { BondAsset } from "../lib/types";
 
 /** Lets a re-executor take stake back out. Renders nothing unless the
  * connected wallet is this re-executor's own account. */
@@ -18,18 +19,22 @@ export function WithdrawStake({
   stakeStroops,
   floorStroops,
   networkPassphrase,
+  bondAsset,
 }: {
   reexecutorId: string;
   account: string;
   stakeStroops: string;
   floorStroops: string;
   networkPassphrase: string;
+  bondAsset?: BondAsset | "native";
 }) {
   const router = useRouter();
   const wallet = useWallet();
-  const [amountXlm, setAmountXlm] = useState("");
+  const asset = resolveBondAsset(bondAsset);
+  const [amountInput, setAmountInput] = useState("");
   const [busy, setBusy] = useState<null | "checking" | "building" | "signing" | "relaying">(null);
   const [error, setError] = useState<string | null>(null);
+  const [outcomeUnknown, setOutcomeUnknown] = useState(false);
   const [txHash, setTxHash] = useState<string | null>(null);
 
   if (wallet.account !== account || BigInt(stakeStroops) === BigInt(0)) return null;
@@ -45,13 +50,13 @@ export function WithdrawStake({
     if (!wallet.networkOk) return;
     setError(null);
     setTxHash(null);
-    const amount = xlmToStroops(amountXlm);
+    const amount = parseUnits(amountInput, asset.decimals);
     if (amount === null) {
-      setError("Enter the amount as a positive XLM figure, for example 100.");
+      setError(`Enter the amount as a positive ${asset.symbol} figure, for example 100.`);
       return;
     }
     if (amount > BigInt(stakeStroops)) {
-      setError(`You have ${stroopsToXlm(stakeStroops)} XLM staked.`);
+      setError(`You have ${formatUnits(stakeStroops, asset.decimals, asset.symbol)} staked.`);
       return;
     }
     try {
@@ -64,12 +69,17 @@ export function WithdrawStake({
       setBusy("relaying");
       const { tx_hash } = await relayReexecutorStake(reexecutorId, signed);
       setTxHash(tx_hash);
-      setAmountXlm("");
+      setAmountInput("");
       router.refresh();
     } catch (err) {
       if (err instanceof WalletError && err.code === "wrong-network") {
         wallet.reportWrongNetwork(err.message);
         return;
+      }
+      if (err instanceof ActionTimeoutError) {
+        setOutcomeUnknown(true);
+      } else {
+        setOutcomeUnknown(false);
       }
       setError(err instanceof Error ? err.message : "The withdrawal could not be completed.");
     } finally {
@@ -92,21 +102,21 @@ export function WithdrawStake({
     <div className="space-y-3">
       <LiveStatus message={busy !== null ? stepLabel : ""} />
       <p className="max-w-prose text-sm text-text-secondary">
-        This is your account. Stake above the {stroopsToXlm(floorStroops)} XLM floor can leave at
+        This is your account. Stake above the {formatUnits(floorStroops, asset.decimals, asset.symbol)} floor can leave at
         any time; going below it stops new assignments, and the contract refuses that while any of
         your votes is on a submission that has not been finalized.
       </p>
       <div className="flex flex-wrap items-end gap-3">
         <div className="space-y-1.5">
           <label htmlFor="withdraw-amount" className="block text-sm text-text-secondary">
-            Amount (XLM)
+            Amount ({asset.symbol})
           </label>
           <input
             id="withdraw-amount"
             inputMode="decimal"
-            value={amountXlm}
-            onChange={(e) => setAmountXlm(e.target.value)}
-            placeholder={stroopsToXlm(stakeStroops)}
+            value={amountInput}
+            onChange={(e) => setAmountInput(e.target.value)}
+            placeholder={formatUnits(stakeStroops, asset.decimals)}
             className="w-40 rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
           />
         </div>
@@ -120,9 +130,22 @@ export function WithdrawStake({
         </Button>
       </div>
       {displayError && (
-        <p role="alert" className="text-sm text-status-slashed">
-          {displayError}
-        </p>
+        <div role="alert" className="text-sm text-status-slashed space-y-2">
+          <p>{displayError}</p>
+          {outcomeUnknown && (
+            <p className="text-xs">
+              The transaction may still be on-chain. Check your account on stellar.expert:{" "}
+              <a
+                href={TESTNET_EXPLORER_ACCOUNT(account)}
+                target="_blank"
+                rel="noreferrer"
+                className="text-accent underline-offset-2 hover:underline"
+              >
+                {account.slice(0, 6)}…{account.slice(-4)}
+              </a>
+            </p>
+          )}
+        </div>
       )}
       {txHash && (
         <p role="status" className="text-sm">
