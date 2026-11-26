@@ -214,52 +214,79 @@ export async function deliver(
 
 /**
  * Retries pending and failed webhook deliveries that are due.
- * Picks rows where status in ('pending','failed'), next_attempt_at <= now (or NULL for orphaned pending),
- * subscription is active, and attempts < MAX_DELIVERY_ATTEMPTS.
- * Uses FOR UPDATE SKIP LOCKED to avoid overlapping ticks double-sending.
+ * Picks failed rows where next_attempt_at <= now, and pending rows older than
+ * a lease cutoff (created_at < now - 5 minutes). Claims rows atomically by
+ * setting a short lease (next_attempt_at = now + 60s) inside a transaction
+ * with FOR UPDATE SKIP LOCKED, then attempts delivery outside the transaction.
  */
 export async function retryWebhooksOnce(): Promise<number> {
   const now = new Date();
-  const due = await db
-    .selectFrom("webhook_delivery")
-    .innerJoin("webhook_subscription", "webhook_subscription.id", "webhook_delivery.subscription_id")
-    .select([
-      "webhook_delivery.id",
-      "webhook_delivery.subscription_id",
-      "webhook_delivery.event_type",
-      "webhook_delivery.payload",
-      "webhook_delivery.attempts",
-      "webhook_subscription.url",
-      "webhook_subscription.secret",
-      "webhook_subscription.active",
-      "webhook_subscription.events",
-      "webhook_subscription.marketplace_id",
-    ])
-    .where("webhook_delivery.status", "in", ["pending", "failed"])
-    .where((eb) =>
-      eb.or([
-        eb("webhook_delivery.status", "=", "pending"),
-        eb("webhook_delivery.status", "=", "failed"),
+  const leaseMs = 60_000;
+  const pendingCutoff = new Date(now.getTime() - 5 * 60 * 1000);
+
+  // Claim due rows atomically: update next_attempt_at to a short lease timestamp
+  // for rows that are due for retry, using FOR UPDATE SKIP LOCKED to avoid
+  // overlapping ticks. Only pick:
+  // - failed rows with next_attempt_at <= now
+  // - pending rows created more than 5 minutes ago (orphaned)
+  const claimed = await db.transaction().execute(async (trx) => {
+    const rows = await trx
+      .selectFrom("webhook_delivery")
+      .innerJoin(
+        "webhook_subscription",
+        "webhook_subscription.id",
+        "webhook_delivery.subscription_id"
+      )
+      .select([
+        "webhook_delivery.id",
+        "webhook_delivery.subscription_id",
+        "webhook_delivery.event_type",
+        "webhook_delivery.payload",
+        "webhook_delivery.attempts",
+        "webhook_subscription.url",
+        "webhook_subscription.secret",
+        "webhook_subscription.active",
+        "webhook_subscription.events",
+        "webhook_subscription.marketplace_id",
       ])
-    )
-    .where((eb) =>
-      eb.or([
-        eb("webhook_delivery.next_attempt_at", "<=", now),
-        eb.and([
-          eb("webhook_delivery.status", "=", "pending"),
-          eb("webhook_delivery.next_attempt_at", "is", null),
-        ]),
-      ])
-    )
-    .where("webhook_subscription.active", "=", true)
-    .where("webhook_delivery.attempts", "<", MAX_DELIVERY_ATTEMPTS)
-    .forUpdate(["webhook_delivery"])
-    .skipLocked()
-    .limit(50)
-    .execute();
+      .where("webhook_delivery.status", "in", ["pending", "failed"])
+      .where((eb) =>
+        eb.or([
+          eb.and([
+            eb("webhook_delivery.status", "=", "failed"),
+            eb("webhook_delivery.next_attempt_at", "<=", now),
+          ]),
+          eb.and([
+            eb("webhook_delivery.status", "=", "pending"),
+            eb("webhook_delivery.created_at", "<", pendingCutoff),
+          ]),
+        ])
+      )
+      .where("webhook_subscription.active", "=", true)
+      .where("webhook_delivery.attempts", "<", MAX_DELIVERY_ATTEMPTS)
+      .forUpdate(["webhook_delivery"])
+      .skipLocked()
+      .limit(50)
+      .execute();
+
+    if (rows.length === 0) return [];
+
+    const leaseUntil = new Date(Date.now() + leaseMs);
+    await trx
+      .updateTable("webhook_delivery")
+      .set({ next_attempt_at: leaseUntil })
+      .where(
+        "id",
+        "in",
+        rows.map((r) => r.id)
+      )
+      .execute();
+
+    return rows;
+  });
 
   let retried = 0;
-  for (const row of due) {
+  for (const row of claimed) {
     try {
       const sub: WebhookSubscriptionRecord = {
         id: row.subscription_id,
