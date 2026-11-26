@@ -34,3 +34,4 @@ export function verifiedArtifact(ref: string, contentBase64: string): Buffer {
   }
   return bytes;
 }
+// CI trigger
