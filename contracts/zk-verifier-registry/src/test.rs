@@ -238,3 +238,301 @@ fn register_and_deregister_emit_their_events() {
     let deregistered = VerifierDeregistered { proof_system: sym }.to_xdr(&e, &client.address);
     assert!(e.events().all().events().contains(&deregistered));
 }
+
+// ---- admin transfer ----
+
+mod admin_transfer {
+    use super::*;
+    use crate::events::{AdminChanged, AdminProposed};
+    use soroban_sdk::{
+        testutils::{storage::Instance as _, Ledger as _, MockAuth, MockAuthInvoke},
+        IntoVal as _, Val, Vec,
+    };
+
+    #[test]
+    fn the_registry_reports_its_admin_and_no_proposal_at_first() {
+        let e = Env::default();
+        let (client, admin) = setup(&e);
+        assert_eq!(client.get_admin(), Some(admin));
+        assert_eq!(client.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn propose_admin_is_refused_for_anyone_but_the_admin() {
+        let e = Env::default();
+        let (client, admin) = setup(&e);
+        let stranger = Address::generate(&e);
+        let next = Address::generate(&e);
+
+        assert_eq!(
+            client.try_propose_admin(&stranger, &next),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_eq!(
+            client.try_propose_admin(&stranger, &stranger),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_eq!(client.get_pending_admin(), None);
+        assert_eq!(client.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn a_proposal_alone_gives_the_proposed_address_no_rights() {
+        let e = Env::default();
+        let (client, admin) = setup(&e);
+        let next = Address::generate(&e);
+        client.propose_admin(&admin, &next);
+        assert_eq!(client.get_pending_admin(), Some(next.clone()));
+        assert_eq!(client.get_admin(), Some(admin.clone()));
+
+        let sym = Symbol::new(&e, "groth16");
+        let verifier = Address::generate(&e);
+        assert_eq!(
+            client.try_register_verifier(&next, &sym, &verifier),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert!(!client.is_registered(&sym));
+        // The admin is still the admin.
+        client.register_verifier(&admin, &sym, &verifier);
+        assert!(client.is_registered(&sym));
+    }
+
+    #[test]
+    fn accept_admin_hands_the_role_to_the_proposed_address() {
+        let e = Env::default();
+        let (client, admin) = setup(&e);
+        let next = Address::generate(&e);
+        let sym = Symbol::new(&e, "groth16");
+        let verifier = Address::generate(&e);
+        client.register_verifier(&admin, &sym, &verifier);
+
+        client.propose_admin(&admin, &next);
+        client.accept_admin(&next);
+        assert_eq!(client.get_admin(), Some(next.clone()));
+        assert_eq!(client.get_pending_admin(), None);
+
+        // The old admin can no longer register, deregister or propose.
+        let other = Symbol::new(&e, "plonk");
+        assert_eq!(
+            client.try_register_verifier(&admin, &other, &verifier),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_eq!(
+            client.try_deregister_verifier(&admin, &sym),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert_eq!(
+            client.try_propose_admin(&admin, &admin),
+            Err(Ok(Error::NotAdmin))
+        );
+        assert!(client.is_registered(&sym));
+        assert!(!client.is_registered(&other));
+        assert_eq!(client.get_pending_admin(), None);
+
+        // The new admin can.
+        client.register_verifier(&next, &other, &verifier);
+        assert!(client.is_registered(&other));
+        client.deregister_verifier(&next, &sym);
+        assert!(!client.is_registered(&sym));
+        client.propose_admin(&next, &admin);
+        assert_eq!(client.get_pending_admin(), Some(admin));
+    }
+
+    #[test]
+    fn accept_admin_is_refused_for_anyone_but_the_proposed_address() {
+        let e = Env::default();
+        let (client, admin) = setup(&e);
+        let next = Address::generate(&e);
+        let stranger = Address::generate(&e);
+        client.propose_admin(&admin, &next);
+
+        assert_eq!(
+            client.try_accept_admin(&stranger),
+            Err(Ok(Error::NotPendingAdmin))
+        );
+        assert_eq!(
+            client.try_accept_admin(&admin),
+            Err(Ok(Error::NotPendingAdmin))
+        );
+        assert_eq!(client.get_admin(), Some(admin));
+        assert_eq!(client.get_pending_admin(), Some(next));
+    }
+
+    #[test]
+    fn accept_admin_is_refused_when_nothing_is_proposed() {
+        let e = Env::default();
+        let (client, admin) = setup(&e);
+        let next = Address::generate(&e);
+        assert_eq!(
+            client.try_accept_admin(&next),
+            Err(Ok(Error::NoPendingAdmin))
+        );
+        assert_eq!(
+            client.try_accept_admin(&admin),
+            Err(Ok(Error::NoPendingAdmin))
+        );
+        assert_eq!(client.get_admin(), Some(admin.clone()));
+
+        // Accepting uses the proposal up.
+        client.propose_admin(&admin, &next);
+        client.accept_admin(&next);
+        assert_eq!(
+            client.try_accept_admin(&next),
+            Err(Ok(Error::NoPendingAdmin))
+        );
+        assert_eq!(client.get_admin(), Some(next));
+    }
+
+    #[test]
+    fn a_later_proposal_replaces_an_earlier_one() {
+        let e = Env::default();
+        let (client, admin) = setup(&e);
+        let mistyped = Address::generate(&e);
+        let meant = Address::generate(&e);
+        client.propose_admin(&admin, &mistyped);
+        client.propose_admin(&admin, &meant);
+
+        assert_eq!(client.get_pending_admin(), Some(meant.clone()));
+        assert_eq!(
+            client.try_accept_admin(&mistyped),
+            Err(Ok(Error::NotPendingAdmin))
+        );
+        assert_eq!(client.get_admin(), Some(admin));
+        client.accept_admin(&meant);
+        assert_eq!(client.get_admin(), Some(meant));
+    }
+
+    #[test]
+    fn each_half_needs_the_signature_of_its_own_party() {
+        let e = Env::default();
+        let (client, admin) = setup(&e);
+        let next = Address::generate(&e);
+
+        // The proposed address signs its own proposal in the admin's name: refused.
+        let args: Vec<Val> = (admin.clone(), next.clone()).into_val(&e);
+        let by_next = MockAuth {
+            address: &next,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_admin",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        };
+        assert!(client
+            .mock_auths(&[by_next])
+            .try_propose_admin(&admin, &next)
+            .is_err());
+        assert_eq!(client.get_pending_admin(), None);
+        let by_admin = MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_admin",
+                args,
+                sub_invokes: &[],
+            },
+        };
+        client.mock_auths(&[by_admin]).propose_admin(&admin, &next);
+        assert_eq!(client.get_pending_admin(), Some(next.clone()));
+
+        // The current admin signs the acceptance: refused.
+        let args: Vec<Val> = (next.clone(),).into_val(&e);
+        let by_admin = MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "accept_admin",
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        };
+        assert!(client
+            .mock_auths(&[by_admin])
+            .try_accept_admin(&next)
+            .is_err());
+        assert_eq!(client.get_admin(), Some(admin.clone()));
+        let by_next = MockAuth {
+            address: &next,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "accept_admin",
+                args,
+                sub_invokes: &[],
+            },
+        };
+        client.mock_auths(&[by_next]).accept_admin(&next);
+        assert_eq!(client.get_admin(), Some(next));
+    }
+
+    #[test]
+    fn proposing_and_accepting_emit_their_events_and_a_refusal_emits_none() {
+        let e = Env::default();
+        let (client, admin) = setup(&e);
+        let next = Address::generate(&e);
+
+        assert!(client.try_propose_admin(&next, &next).is_err());
+        assert!(e.events().all().events().is_empty());
+        assert!(client.try_accept_admin(&next).is_err());
+        assert!(e.events().all().events().is_empty());
+
+        client.propose_admin(&admin, &next);
+        let proposed = AdminProposed {
+            proposed_admin: next.clone(),
+            admin: admin.clone(),
+        }
+        .to_xdr(&e, &client.address);
+        assert!(e.events().all().events().contains(&proposed));
+
+        client.accept_admin(&next);
+        let changed = AdminChanged {
+            new_admin: next,
+            old_admin: admin,
+        }
+        .to_xdr(&e, &client.address);
+        assert!(e.events().all().events().contains(&changed));
+    }
+
+    #[test]
+    fn both_halves_report_not_initialized_without_a_stored_admin() {
+        let e = Env::default();
+        let (client, admin) = setup(&e);
+        let next = Address::generate(&e);
+        client.propose_admin(&admin, &next);
+        e.as_contract(&client.address, || {
+            e.storage().instance().remove(&crate::DataKey::Admin)
+        });
+
+        assert_eq!(
+            client.try_propose_admin(&admin, &next),
+            Err(Ok(Error::NotInitialized))
+        );
+        assert_eq!(
+            client.try_accept_admin(&next),
+            Err(Ok(Error::NotInitialized))
+        );
+        assert_eq!(client.get_admin(), None);
+    }
+
+    #[test]
+    fn both_halves_extend_the_instance_ttl() {
+        for half in ["propose_admin", "accept_admin"] {
+            let e = Env::default();
+            let (client, admin) = setup(&e);
+            let next = Address::generate(&e);
+            // A proposal brings the TTL to BUMP_TO (500_000 ledgers).
+            client.propose_admin(&admin, &next);
+            let ttl = || e.as_contract(&client.address, || e.storage().instance().get_ttl());
+            assert_eq!(ttl(), 500_000);
+            e.ledger().with_mut(|l| l.sequence_number += 450_000);
+            assert_eq!(ttl(), 50_000);
+
+            if half == "propose_admin" {
+                client.propose_admin(&admin, &next);
+            } else {
+                client.accept_admin(&next);
+            }
+            assert_eq!(ttl(), 500_000, "{half}");
+        }
+    }
+}

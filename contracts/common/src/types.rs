@@ -71,7 +71,7 @@ pub struct ConfigRecord {
     pub window_tier_small_s: u64,
     pub window_tier_large_s: u64,
     /// Share of a slashed amount that goes to the prevailing challenger; the
-    /// remainder goes to the admin/treasury account. Fixed in practice —
+    /// remainder goes to the treasury. Fixed in practice —
     /// treated as effectively immutable governance, not a per-dispute lever.
     pub slash_split_challenger_bps: u32,
     /// Share of a wrong-side re-executor's stake forfeited when a bonded

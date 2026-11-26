@@ -82,3 +82,27 @@ pub struct Slashed {
     pub reexecutor: Address,
     pub amount: i128,
 }
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminProposed {
+    #[topic]
+    pub proposed_admin: Address,
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminChanged {
+    #[topic]
+    pub new_admin: Address,
+    pub old_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreasuryChanged {
+    #[topic]
+    pub new_treasury: Address,
+    pub old_treasury: Address,
+}

@@ -5,6 +5,12 @@ use verity_common::{ChallengeRecord, ConfigRecord, ReexecutorInfo, SubmissionRec
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
+    /// The address `propose_admin` named, until it accepts or another
+    /// proposal replaces it.
+    PendingAdmin,
+    /// Where forfeited bonds and slashed stake are paid. The constructor
+    /// sets it to the admin; only `set_treasury` changes it.
+    Treasury,
     BondAsset,
     Config,
     NextSubmissionId,
@@ -30,7 +36,7 @@ fn extend(e: &Env, key: &DataKey) {
         .extend_ttl(key, BUMP_THRESHOLD, BUMP_TO);
 }
 
-/// The instance entry holds the admin, config and id counter, and its TTL
+/// The instance entry holds the admin, treasury, config and id counter, and its TTL
 /// also covers the contract code. Called from every state-changing
 /// entrypoint so a deployment in use never has them archived.
 pub fn bump_instance(e: &Env) {
@@ -43,6 +49,26 @@ pub fn get_admin(e: &Env) -> Option<Address> {
 
 pub fn set_admin(e: &Env, admin: &Address) {
     e.storage().instance().set(&DataKey::Admin, admin);
+}
+
+pub fn get_pending_admin(e: &Env) -> Option<Address> {
+    e.storage().instance().get(&DataKey::PendingAdmin)
+}
+
+pub fn set_pending_admin(e: &Env, pending: &Address) {
+    e.storage().instance().set(&DataKey::PendingAdmin, pending);
+}
+
+pub fn clear_pending_admin(e: &Env) {
+    e.storage().instance().remove(&DataKey::PendingAdmin);
+}
+
+pub fn get_treasury(e: &Env) -> Option<Address> {
+    e.storage().instance().get(&DataKey::Treasury)
+}
+
+pub fn set_treasury(e: &Env, treasury: &Address) {
+    e.storage().instance().set(&DataKey::Treasury, treasury);
 }
 
 pub fn get_bond_asset(e: &Env) -> Option<Address> {
