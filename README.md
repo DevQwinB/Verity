@@ -272,8 +272,10 @@ Deterministic tasks run in a sandboxed JavaScript runtime:
     credentials, auth headers, or cookies. URLs containing embedded credentials
     (`user:pass@`) are rejected as a mismatch before any request is sent. The endpoint must
     be publicly accessible without authentication. Only `http:` and `https:` schemes are
-    supported. The URL must resolve to a public IP address: loopback, private, and
-    link-local IP addresses are rejected, and the request connects directly to the
+    supported. The URL must resolve to a public IP address under the same non-public range
+    guard used for [Webhooks](#webhooks) (`reexecutor-agent/src/sandbox/address.ts`):
+    private, loopback, link-local, multicast, documentation and reserved ranges — plus IPv6
+    forms that wrap IPv4 addresses — are rejected, and the request connects directly to the
     validated IP.
 14. **Redirects and response codes.** Redirects are not followed; HTTP 3xx status codes
     are treated as a mismatch. Definitive 4xx statuses (for example 404 or 410) and other
@@ -358,6 +360,8 @@ on the routes marked above. The JWT lasts **1 hour** and carries the account
 as `sub`; a missing header is 401 `{ "error": "missing bearer token" }` and a
 bad or expired token 401 `{ "error": "invalid or expired token" }`.
 `GET /.well-known/stellar.toml` advertises the auth endpoint and signing key.
+`GET /auth`, `POST /auth`, and `OPTIONS /auth` send `Access-Control-Allow-Origin: *`
+so browser wallets can complete SEP-10 directly from third-party origins.
 
 Only `GET /auth` and `POST /v1/submissions` return `network_passphrase`.
 The other build endpoints do not: `POST /v1/submissions/:id/challenge`
@@ -456,9 +460,9 @@ successful registration returns the subscription row with HTTP 201. A
 marketplace can hold at most 10 subscriptions (HTTP 409 beyond that);
 delete an existing subscription to free a slot (deactivating one does not).
 The URL must resolve to a public address: private, loopback, link-local,
-multicast and reserved ranges (and IPv6 forms that wrap them) are refused
-with HTTP 400, both at registration and again at every delivery, which
-connects to the address it just checked.
+multicast, documentation and reserved ranges (and IPv6 forms that wrap IPv4
+addresses) are refused with HTTP 400, both at registration and again at every
+delivery, which connects to the address it just checked.
 
 `GET /v1/marketplaces/:id/webhooks` lists the marketplace's subscriptions
 (`id`, `url`, `events`, `active`, `created_at`; the `secret` is never
@@ -472,17 +476,12 @@ the marketplace's own account (otherwise HTTP 403).
 
 | Event | When emitted | `data` |
 | --- | --- | --- |
-| `submission.verified` | First transition into the `verified` terminal status | `submission_id`, `status: "verified"`, `tx_hash` |
-| `submission.slashed` | First transition into the `slashed` terminal status | `submission_id`, `status: "slashed"`, `tx_hash` |
-| `submission.expired_unverified` | First transition into the `expired_unverified` terminal status | `submission_id`, `status: "expired_unverified"`, `tx_hash` |
+| `submission.verified` | First transition into the `verified` terminal status | `submission_id`, `chain_submission_id`, `escrow_ref`, `status: "verified"`, `resolution_method`, `tx_hash` |
+| `submission.slashed` | First transition into the `slashed` terminal status | `submission_id`, `chain_submission_id`, `escrow_ref`, `status: "slashed"`, `resolution_method`, `tx_hash` |
+| `submission.expired_unverified` | First transition into the `expired_unverified` terminal status | `submission_id`, `chain_submission_id`, `escrow_ref`, `status: "expired_unverified"`, `resolution_method`, `tx_hash` |
 | `submission.disputed` | When a new on-chain challenge is first recorded | `submission_id`, `status: "disputed"`, `tx_hash` |
 
-The `submission_id` is Verity's submission **UUID**, not its numeric on-chain
-submission ID. `tx_hash` is the relevant finalize/resolve or challenge
-transaction hash and can be `null` if a terminal verdict is first observed
-by reconciliation. A `submission.verified` event can result from a window expiring
-without consensus; inspect the submission's `resolution_method` via
-`GET /v1/submissions/:id` to distinguish how the verdict was reached.
+The `submission_id` is Verity's submission **UUID**, `chain_submission_id` is its numeric on-chain submission ID (or `null`), and `escrow_ref` is the caller's escrow reference. `tx_hash` is the relevant finalize/resolve or challenge transaction hash and can be `null` if a terminal verdict is first observed by reconciliation. The verdict's `resolution_method` (`reexecution_consensus`, `window_elapsed`, `zk_proof`) is stored and included directly in the payload, so a `submission.verified` that came from a window expiring without consensus can be told apart without another request.
 
 Each delivery is an HTTP `POST` with `content-type: application/json` and
 three headers (`x-verity-delivery`, `x-verity-timestamp`, `x-verity-signature`), containing the UTF-8 JSON serialization
@@ -494,7 +493,10 @@ only a **shape example**; the identifiers below are placeholders:
   "event": "submission.verified",
   "data": {
     "submission_id": "<verity-submission-uuid>",
+    "chain_submission_id": "7",
+    "escrow_ref": "order-1234",
     "status": "verified",
+    "resolution_method": "reexecution_consensus",
     "tx_hash": null
   }
 }
@@ -558,11 +560,23 @@ createServer(async (req, res) => {
 **URL rule: public addresses only.** Use a publicly reachable `http:` or
 `https:` receiver URL whose host resolves. At registration, an unresolvable
 host or an address rejected by `assertPublicHttpUrl` returns HTTP 400.
-The guard rejects private, loopback and link-local addresses it recognizes.
-Its checks do not cover every non-public IP range, so passing validation is
-not a comprehensive network isolation guarantee.
-The address check runs both at registration and immediately before delivery.
+As stated above, the guard (`backend/src/modules/webhooks/url-guard.ts`,
+shared in lockstep with `reexecutor-agent/src/sandbox/address.ts` for
+retrieval tasks) rejects all non-public IPv4 ranges (`0.0.0.0/8`,
+`10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`,
+`172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`,
+`192.168.0.0/16`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`,
+`224.0.0.0/4`, `240.0.0.0/4`), non-public IPv6 ranges (`::/128`, `::1/128`,
+`100::/64`, `2001:db8::/32`, `fc00::/7`, `fe80::/10`, `fec0::/10`,
+`ff00::/8`), deprecated IPv4-compatible IPv6 addresses (`::/96`), and
+IPv4-mapped (`::ffff:0:0/96`), NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`)
+addresses whose embedded IPv4 address is non-public.
+The address check runs both at registration and immediately before delivery,
+and the delivery connects directly to the checked address.
 Redirects are not followed: any redirect fails the delivery.
+An application-level address check is not network isolation: operators should
+also enforce outbound egress filtering on the host for the backend and
+re-executor workers.
 
 **Delivery is best-effort: one attempt, no retry.** A delivery times out
 after 5 seconds. HTTP 2xx counts as delivered; other responses, timeouts,
