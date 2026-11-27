@@ -8,6 +8,7 @@ import { Card, CardBody, CardHeader } from "../../../components/ui/card";
 import { Badge } from "../../../components/ui/badge";
 import { VerdictBadge } from "../../../components/verdict-badge";
 import { AutoRefresh } from "../../../components/auto-refresh";
+import { submissionFingerprint } from "../../../lib/submission-status";
 import { truncateMiddle, formatDuration, formatRelativeTime, recordedWindowDeadlineIso, formatUnits, resolveBondAsset } from "../../../lib/format";
 import { TESTNET_EXPLORER_ACCOUNT, TESTNET_EXPLORER_TX } from "../../../lib/config";
 import { ChallengeWindowCountdown } from "../../../components/challenge-window-countdown";
