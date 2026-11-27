@@ -68,3 +68,4 @@ test("extractArtifactHash throws before any request when ref segment is not 64 l
     );
   }
 });
+// CI trigger
