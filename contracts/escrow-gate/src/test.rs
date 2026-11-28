@@ -1,9 +1,9 @@
 #![cfg(test)]
 
 use crate::events::{
-    AttestationLockReleased, ChallengeOpened, ChallengeResolved, Finalized,
-    ReexecutorApprovalChanged, ReexecutorRegistered, ReexecutorStakeWithdrawn, ReplayAttested,
-    Slashed, SubmissionCreated,
+    AttestationLockReleased, BondSettled, ChallengeOpened, ChallengeResolved, ConfigUpdated,
+    Finalized, ReexecutorApprovalChanged, ReexecutorRegistered, ReexecutorStakeWithdrawn,
+    ReplayAttested, Slashed, SubmissionCreated,
 };
 use crate::{EscrowGate, EscrowGateClient};
 use soroban_sdk::{
@@ -1382,12 +1382,43 @@ fn stake_events_carry_the_new_stake_and_the_active_flag() {
 
 // ---- new event tests ----
 
-// Note: Event emission tests for ConfigUpdated, BondSettled, and Slashed are
-// currently failing due to a test framework limitation where e.events().all()
-// returns empty for certain contract functions (finalize, update_config,
-// constructor). The release_attestation_lock event test passes.
-// The contract logic is verified via balance/state assertions below.
-// TODO: Fix event capture in test framework.
+#[test]
+fn constructor_publishes_config_updated_event() {
+    let e = Env::default();
+    let w = setup(&e);
+
+    // Capture events immediately after constructor
+    let events = e.events().all();
+    let config_updated =
+        |config: ConfigRecord| ConfigUpdated { config }.to_xdr(&e, &w.client.address);
+    assert!(events.events().contains(&config_updated(default_config())));
+}
+
+#[test]
+fn update_config_publishes_config_updated_event() {
+    let e = Env::default();
+    let w = setup(&e);
+    let cfg = ConfigRecord {
+        min_stake_floor: 800 * XLM,
+        quorum_min_reexecutors: 5,
+        quorum_supermajority_bps: 7500,
+        agent_bond_min_bps: 1000,
+        challenger_bond_min_bps: 250,
+        window_tier_small_ceiling: 50_000 * XLM,
+        window_tier_small_s: 7200,
+        window_tier_large_s: 172_800,
+        slash_split_challenger_bps: 5000,
+        reexecutor_slash_bps: 2500,
+        reexecutor_allowlist: true,
+    };
+    w.client.update_config(&w.admin, &cfg);
+
+    // Capture events immediately after update_config
+    let events = e.events().all();
+    let config_updated =
+        |config: ConfigRecord| ConfigUpdated { config }.to_xdr(&e, &w.client.address);
+    assert!(events.events().contains(&config_updated(cfg)));
+}
 
 #[test]
 fn release_attestation_lock_publishes_attestation_lock_released_event() {
@@ -1410,12 +1441,8 @@ fn release_attestation_lock_publishes_attestation_lock_released_event() {
     // Release the lock - this should emit AttestationLockReleased
     w.client.release_attestation_lock(&id, &rex);
 
-    // Check events immediately after the call that emits them
+    // Capture events immediately after the call that emits them
     let events = e.events().all();
-    eprintln!(
-        "Events after release_attestation_lock: {:?}",
-        events.events()
-    );
     let released = |open: u32| {
         AttestationLockReleased {
             submission_id: id,
@@ -1449,6 +1476,20 @@ fn finalize_publishes_bond_settled_event_verified() {
     e.ledger().set_timestamp(e.ledger().timestamp() + 3601);
     let verdict = w.client.finalize(&id);
 
+    // Capture events immediately after finalize (before any other contract calls)
+    let events = e.events().all();
+    let settled = |to_agent, to_challenger, to_treasury| {
+        BondSettled {
+            submission_id: id,
+            to_agent,
+            to_challenger,
+            to_treasury,
+        }
+        .to_xdr(&e, &w.client.address)
+    };
+    // Agent gets bond back (50 XLM) since no challenger
+    assert!(events.events().contains(&settled(50 * XLM, 0, 0)));
+
     // Verified verdict should return agent's bond
     assert_eq!(verdict, Verdict::Verified);
     assert_eq!(w.token.balance(&agent), 1000 * XLM);
@@ -1481,16 +1522,23 @@ fn finalize_publishes_bond_settled_event_slashed_with_challenge() {
         .resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus);
     assert_eq!(verdict, Verdict::Slashed);
 
+    // Capture events immediately after resolve_challenge (which calls finalize internally)
+    let events = e.events().all();
+    let settled = |to_agent, to_challenger, to_treasury| {
+        BondSettled {
+            submission_id: id,
+            to_agent,
+            to_challenger,
+            to_treasury,
+        }
+        .to_xdr(&e, &w.client.address)
+    };
+    assert!(events.events().contains(&settled(0, 60 * XLM, 40 * XLM)));
+
     // Agent's bond (50) + challenger gets their bond back (50) + 20% of agent's (10) = 60
     // Treasury gets 80% of agent's bond (40)
     assert_eq!(w.token.balance(&challenger), 1000 * XLM + 10 * XLM);
     assert_eq!(w.token.balance(&w.admin), 40 * XLM);
-
-    // Check events immediately after resolve_challenge (which calls finalize internally)
-    let _events = e.events().all();
-    // Note: e.events().all() seems to not capture events for this flow in the test framework.
-    // The balance assertions above verify the contract logic is correct.
-    // assert!(events.events().contains(&settled(0, 60 * XLM, 40 * XLM)));
 }
 
 // ---- voter allow-list ----
