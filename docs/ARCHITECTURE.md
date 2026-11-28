@@ -245,7 +245,7 @@ These are stated in the README; they shape what is safe to change.
 - One backend instance runs the indexer and keeper. Do not add a second with
   workers on.
 - Artifacts live on the backend's local disk.
-- Webhooks are delivered once with no retry.
+- Webhooks are delivered with exponential backoff retry (up to 8 attempts, 1 min to 128 min). HTTP 408 and 429 are retried; other 4xx and 3xx are terminal.
 - Assignment is uniform, not stake-weighted, and only picks online workers.
 - Only `deterministic` and `retrieval` tasks are accepted. `submit()` rejects
   `unverifiable` with `InvalidTaskType`: Phase 1 has no verification path for

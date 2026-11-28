@@ -18,7 +18,7 @@ import { challengeResolutionMethod, fromChainResolution, fromChainResolutionMeth
 import { recordTerminalVerdict } from "../modules/submissions/verdict.js";
 import { exportAttestation } from "../modules/attestations/export.js";
 import { escalateToFullReplay, topUpAssignments } from "../modules/reexecutors/assignment.js";
-import { dispatchWebhook } from "../modules/webhooks/dispatcher.js";
+import { dispatchWebhook, retryWebhooksOnce } from "../modules/webhooks/dispatcher.js";
 import type { ChainTxStatus } from "../modules/submissions/supersede.js";
 import { adoptSubmission, maybeEarlyFinalize } from "./indexer.js";
 import { decideDraftPurge } from "./draft-purge.js";
@@ -737,6 +737,7 @@ export function startScheduler(intervalMs = 10000): { stop: () => void } {
     await step("expire-challenges", expireChallengesOnce);
     await step("settle", settleOnce);
     await step("purge-drafts", purgeDraftsOnce);
+    await step("retry-webhooks", retryWebhooksOnce);
     if (!stopped) timer = setTimeout(tick, intervalMs);
   };
   timer = setTimeout(tick, intervalMs);
