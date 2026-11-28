@@ -305,6 +305,24 @@ describe("reconcileChallengeDecision", () => {
     });
     assert.deepEqual(decision, { action: "none" });
   });
+
+  it("closes an open DB challenge as expired when the chain record says it expired", () => {
+    const decision = reconcileChallengeDecision({
+      submissionId,
+      status: "disputed",
+      existingChallenge: { id: "chal-1", resolved_at: null },
+      chainChallenge: {
+        ...openChainChallenge,
+        resolution: { tag: "Expired", values: undefined },
+        resolution_method: { tag: "WindowElapsed", values: undefined },
+      },
+      now,
+    });
+    assert.deepEqual(decision, {
+      action: "update",
+      values: { resolution: "expired", resolution_method: undefined, resolved_at: now },
+    });
+  });
 });
 
 describe("isReadyToSettle", () => {

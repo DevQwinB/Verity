@@ -782,12 +782,20 @@ fn unresolvable_challenge_expires_and_returns_both_bonds() {
     e.ledger().with_mut(|l| l.timestamp += 3599);
     assert_eq!(w.client.finalize(&id), Verdict::Pending);
     assert_eq!(w.token.balance(&agent), 950 * XLM);
+    assert_eq!(
+        w.client.get_challenge(&id).unwrap().resolution,
+        Resolution::None
+    );
 
     e.ledger().with_mut(|l| l.timestamp += 1);
     assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
     assert_eq!(w.token.balance(&agent), 1000 * XLM);
     assert_eq!(w.token.balance(&challenger), 1000 * XLM);
     assert_eq!(w.token.balance(&w.client.address), 600 * XLM);
+    // The challenge record says how it ended, instead of looking open forever.
+    let closed = w.client.get_challenge(&id).unwrap();
+    assert_eq!(closed.resolution, Resolution::Expired);
+    assert_eq!(closed.resolution_method, ResolutionMethod::WindowElapsed);
 
     // Terminal and idempotent like every other verdict; nobody is slashable.
     assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
@@ -796,6 +804,202 @@ fn unresolvable_challenge_expires_and_returns_both_bonds() {
         ResolutionMethod::WindowElapsed
     );
     assert_eq!(w.client.try_slash(&rex, &id), Err(Ok(Error::NotSlashable)));
+}
+
+// ---- an expired challenge is recorded and announced ----
+
+mod expired_challenge {
+    use super::*;
+    use crate::events::{ChallengeExpired, ChallengeResolved, Finalized};
+    use soroban_sdk::xdr::ToXdr as _;
+
+    /// A challenged submission with one vote, which is short of a quorum, so
+    /// no consensus can form. The challenge window is 3600 seconds.
+    fn challenged(w: &World) -> (u64, Address) {
+        let agent = Address::generate(&w.e);
+        let id = submit_default(w, &agent);
+        let challenger = Address::generate(&w.e);
+        fund(w, &challenger, 1000 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        let rex = Address::generate(&w.e);
+        register_rex(w, &rex);
+        w.client
+            .attest_replay(&rex, &id, &BytesN::from_array(&w.e, &[3u8; 32]), &true);
+        (id, challenger)
+    }
+
+    fn expired_event(w: &World, id: u64) -> soroban_sdk::xdr::ContractEvent {
+        ChallengeExpired { submission_id: id }.to_xdr(&w.e, &w.client.address)
+    }
+
+    #[test]
+    fn finalize_records_the_expiry_and_publishes_challenge_expired() {
+        let e = Env::default();
+        let w = setup(&e);
+        let (id, challenger) = challenged(&w);
+        let opened = w.client.get_challenge(&id).unwrap();
+        assert_eq!(opened.resolution, Resolution::None);
+        assert_eq!(opened.resolution_method, ResolutionMethod::None);
+
+        e.ledger().with_mut(|l| l.timestamp += 3600);
+        assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+        // Read before any other call replaces the events of this one.
+        let events = e.events().all();
+        assert!(events.events().contains(&expired_event(&w, id)));
+        let finalized = Finalized {
+            submission_id: id,
+            verdict: Verdict::ExpiredUnverified,
+        }
+        .to_xdr(&e, &w.client.address);
+        assert!(events.events().contains(&finalized));
+
+        // Only the outcome changed on the record.
+        let closed = w.client.get_challenge(&id).unwrap();
+        assert_eq!(closed.resolution, Resolution::Expired);
+        assert_eq!(closed.resolution_method, ResolutionMethod::WindowElapsed);
+        assert_eq!(closed.challenger, challenger);
+        assert_eq!(closed.bond, opened.bond);
+        assert_eq!(closed.opened_at, opened.opened_at);
+        // Both bonds went back, as before.
+        assert_eq!(w.token.balance(&challenger), 1000 * XLM);
+    }
+
+    #[test]
+    fn a_challenge_inside_its_window_stays_open_and_announces_nothing() {
+        let e = Env::default();
+        let w = setup(&e);
+        let (id, _) = challenged(&w);
+        let before = w.client.get_challenge(&id).unwrap().to_xdr(&e);
+
+        e.ledger().with_mut(|l| l.timestamp += 3599);
+        assert_eq!(w.client.finalize(&id), Verdict::Pending);
+        assert!(e.events().all().events().is_empty());
+        assert_eq!(w.client.get_challenge(&id).unwrap().to_xdr(&e), before);
+    }
+
+    #[test]
+    fn finalizing_again_after_the_expiry_writes_and_announces_nothing() {
+        let e = Env::default();
+        let w = setup(&e);
+        let (id, _) = challenged(&w);
+        e.ledger().with_mut(|l| l.timestamp += 3600);
+        assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+        let closed = w.client.get_challenge(&id).unwrap().to_xdr(&e);
+
+        e.ledger().with_mut(|l| l.timestamp += 100_000);
+        assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+        assert!(e.events().all().events().is_empty());
+        assert_eq!(w.client.get_challenge(&id).unwrap().to_xdr(&e), closed);
+    }
+
+    #[test]
+    fn an_expired_challenge_cannot_be_resolved_afterwards() {
+        let e = Env::default();
+        let w = setup(&e);
+        let (id, _) = challenged(&w);
+        e.ledger().with_mut(|l| l.timestamp += 3600);
+        assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+
+        // Late votes that would have made a quorum change nothing now.
+        assert_eq!(
+            w.client
+                .try_resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+            Err(Ok(Error::ChallengeAlreadyResolved))
+        );
+        let closed = w.client.get_challenge(&id).unwrap();
+        assert_eq!(closed.resolution, Resolution::Expired);
+        assert_eq!(
+            w.client.get_submission(&id).unwrap().verdict,
+            Verdict::ExpiredUnverified
+        );
+    }
+
+    #[test]
+    fn a_challenge_resolved_by_consensus_is_not_reported_as_expired() {
+        // Upheld: three mismatch votes.
+        let e = Env::default();
+        let w = setup(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let challenger = Address::generate(&e);
+        fund(&w, &challenger, 1000 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        for _ in 0..3 {
+            let rex = Address::generate(&e);
+            register_rex(&w, &rex);
+            w.client
+                .attest_replay(&rex, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+        }
+        assert_eq!(
+            w.client
+                .resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+            Verdict::Slashed
+        );
+        let events = e.events().all();
+        assert!(!events.events().contains(&expired_event(&w, id)));
+        let resolved = ChallengeResolved {
+            submission_id: id,
+            resolution: Resolution::Upheld,
+            method: ResolutionMethod::ReexecutionConsensus,
+        }
+        .to_xdr(&e, &w.client.address);
+        assert!(events.events().contains(&resolved));
+
+        // Long after the window, finalize still reports the resolved outcome.
+        e.ledger().with_mut(|l| l.timestamp += 100_000);
+        assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+        assert!(!e.events().all().events().contains(&expired_event(&w, id)));
+        assert_eq!(
+            w.client.get_challenge(&id).unwrap().resolution,
+            Resolution::Upheld
+        );
+    }
+
+    #[test]
+    fn a_window_that_closes_on_an_unchallenged_submission_announces_no_challenge() {
+        let e = Env::default();
+        let w = setup(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        // One mismatch vote and no challenge: the submission expires
+        // unverified, but there is no challenge to close.
+        let rex = Address::generate(&e);
+        register_rex(&w, &rex);
+        w.client
+            .attest_replay(&rex, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+
+        e.ledger().with_mut(|l| l.timestamp += 3600);
+        assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+        assert!(!e.events().all().events().contains(&expired_event(&w, id)));
+        assert!(w.client.get_challenge(&id).is_none());
+    }
+
+    #[test]
+    fn a_challenge_with_a_consensus_is_not_expired_by_finalize() {
+        let e = Env::default();
+        let w = setup(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let challenger = Address::generate(&e);
+        fund(&w, &challenger, 1000 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        for _ in 0..3 {
+            let rex = Address::generate(&e);
+            register_rex(&w, &rex);
+            w.client
+                .attest_replay(&rex, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+        }
+
+        // The window is over but a consensus exists: finalize waits for
+        // resolve_challenge and must not write the record off as expired.
+        e.ledger().with_mut(|l| l.timestamp += 100_000);
+        assert_eq!(w.client.finalize(&id), Verdict::Pending);
+        assert!(e.events().all().events().is_empty());
+        assert_eq!(
+            w.client.get_challenge(&id).unwrap().resolution,
+            Resolution::None
+        );
+    }
 }
 
 #[test]
@@ -2480,6 +2684,130 @@ fn an_agent_may_still_challenge_another_agents_submission() {
         w.client
             .try_open_challenge(&second, &second_id, &(50 * XLM)),
         Err(Ok(Error::AgentCannotChallenge))
+    );
+}
+
+/// Registers `count` re-executors and has each cast the given vote on `id`.
+fn cast_votes(w: &World, id: u64, count: usize, matched: bool) {
+    let hash = BytesN::from_array(&w.e, &[if matched { 3u8 } else { 9u8 }; 32]);
+    for _ in 0..count {
+        let rex = Address::generate(&w.e);
+        register_rex(w, &rex);
+        w.client.attest_replay(&rex, &id, &hash, &matched);
+    }
+}
+
+#[test]
+fn a_challenge_is_refused_once_a_mismatch_supermajority_decides_the_submission() {
+    let e = Env::default();
+    let w = setup(&e); // quorum 3, 66% supermajority, 20% of a slash to a challenger
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    cast_votes(&w, id, 3, false);
+
+    // The answer is already on-chain: a challenge now would risk nothing and
+    // collect a share of the slash.
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    let held = w.token.balance(&w.client.address);
+    assert_eq!(
+        w.client.try_open_challenge(&challenger, &id, &(50 * XLM)),
+        Err(Ok(Error::ConsensusAlreadyReached))
+    );
+    assert_eq!(w.token.balance(&challenger), 1000 * XLM);
+    assert_eq!(w.token.balance(&w.client.address), held);
+    assert!(w.client.get_challenge(&id).is_none());
+
+    // finalize() settles it as it stands, and the whole forfeited bond goes
+    // to the treasury: there is no challenger to pay a share to.
+    let admin_before = w.token.balance(&w.admin);
+    assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+    assert_eq!(w.token.balance(&w.admin), admin_before + 50 * XLM);
+    assert_eq!(w.token.balance(&challenger), 1000 * XLM);
+}
+
+#[test]
+fn a_challenge_is_refused_once_a_match_supermajority_decides_the_submission() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    cast_votes(&w, id, 3, true);
+
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    assert_eq!(
+        w.client.try_open_challenge(&challenger, &id, &(50 * XLM)),
+        Err(Ok(Error::ConsensusAlreadyReached))
+    );
+    assert_eq!(w.token.balance(&challenger), 1000 * XLM);
+    assert!(w.client.get_challenge(&id).is_none());
+
+    assert_eq!(w.client.finalize(&id), Verdict::Verified);
+    assert_eq!(w.token.balance(&agent), 1000 * XLM);
+}
+
+#[test]
+fn a_challenge_is_still_accepted_while_the_votes_decide_nothing() {
+    // Below the quorum of three, whichever way the votes point.
+    for (matches, mismatches) in [(0, 1), (0, 2), (1, 0), (2, 0), (1, 1)] {
+        let e = Env::default();
+        let w = setup(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        cast_votes(&w, id, matches, true);
+        cast_votes(&w, id, mismatches, false);
+
+        let challenger = Address::generate(&e);
+        fund(&w, &challenger, 1000 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        assert_eq!(
+            w.client.get_challenge(&id).unwrap().challenger,
+            challenger,
+            "{matches} match, {mismatches} mismatch"
+        );
+    }
+
+    // A quorum, but split evenly: no side has 66% of the bonded weight.
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    cast_votes(&w, id, 2, true);
+    cast_votes(&w, id, 2, false);
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    w.client.open_challenge(&challenger, &id, &(50 * XLM));
+    assert_eq!(w.token.balance(&challenger), 950 * XLM);
+    assert_eq!(w.client.get_challenge(&id).unwrap().bond, 50 * XLM);
+}
+
+#[test]
+fn votes_cast_after_a_challenge_is_opened_can_still_decide_it() {
+    // The consensus check is made when the challenge is opened, not after:
+    // resolve_challenge depends on the votes that follow.
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    cast_votes(&w, id, 2, false);
+
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    w.client.open_challenge(&challenger, &id, &(50 * XLM));
+
+    // The third mismatch vote completes the supermajority.
+    cast_votes(&w, id, 1, false);
+    assert_eq!(
+        w.client
+            .resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+        Verdict::Slashed
+    );
+    // This challenger took the risk before the outcome was known, and is paid.
+    assert_eq!(w.token.balance(&challenger), 1000 * XLM + 10 * XLM);
+    assert_eq!(
+        w.client.get_challenge(&id).unwrap().resolution,
+        Resolution::Upheld
     );
 }
 
