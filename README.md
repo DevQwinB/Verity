@@ -620,12 +620,13 @@ whose timestamp is outside a tolerance window (for example 5 minutes) to stop
 replays, and use the delivery id to deduplicate. A valid HMAC shows that a
 holder of the shared secret authenticated these bytes; it does not prove the
 verdict or other payload data is correct. Any holder of the secret can
-generate signatures. This minimal Node.js receiver verifies the
-header using a constant-time comparison:
+generate signatures.
+
+The official TypeScript SDK (`@verity/sdk`) exports `verifyWebhook` to verify headers, enforce timestamp tolerance, and parse the payload:
 
 ```js
 import { createServer } from "node:http";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { verifyWebhook } from "@verity/sdk";
 
 const secret = process.env.VERITY_WEBHOOK_SECRET;
 if (!secret || secret.length < 8) throw new Error("Set VERITY_WEBHOOK_SECRET");
@@ -638,32 +639,23 @@ createServer(async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const rawBody = Buffer.concat(chunks);
-  const provided = req.headers["x-verity-signature"];
-  const timestamp = req.headers["x-verity-timestamp"];
-  const deliveryId = req.headers["x-verity-delivery"];
-  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
-  if (typeof timestamp !== "string" || typeof deliveryId !== "string" || !(age <= 300)) {
-    res.writeHead(401).end();
-    return;
-  }
-  const expected = createHmac("sha256", secret)
-    .update(`${timestamp}.${deliveryId}.`)
-    .update(rawBody)
-    .digest();
 
-  const valid = typeof provided === "string"
-    && /^[0-9a-f]{64}$/.test(provided)
-    && timingSafeEqual(Buffer.from(provided, "hex"), expected);
-  if (!valid) {
-    res.writeHead(401).end();
-    return;
+  try {
+    const message = verifyWebhook({
+      rawBody,
+      headers: req.headers,
+      secret,
+      toleranceS: 300,
+    });
+    console.log(message.event, message.data);
+    res.writeHead(204).end();
+  } catch (err) {
+    res.writeHead(401, { "content-type": "text/plain" }).end(err.message);
   }
-
-  const message = JSON.parse(rawBody.toString("utf8"));
-  console.log(message.event, message.data);
-  res.writeHead(204).end();
 }).listen(8080);
 ```
+
+*Without the SDK:* compute `createHmac("sha256", secret).update(`${timestamp}.${deliveryId}.`).update(rawBody).digest()` and verify against `x-verity-signature` using a constant-time comparison (`timingSafeEqual`), rejecting deliveries whose timestamp age exceeds tolerance (e.g. 300s).
 
 **URL rule: public addresses only.** Use a publicly reachable `http:` or
 `https:` receiver URL whose host resolves. At registration, an unresolvable
@@ -756,12 +748,12 @@ Select the **trusted deployment configuration for the specific submission**,
 not one supplied by an untrusted API. A valid signature alone does not
 prove that the attestation concerns the UUID or contract you requested.
 
+The official TypeScript SDK (`@verity/sdk`) packages these checks into `verifyAttestation`:
+
 ```bash
 SUBMISSION_ID=00000000-0000-0000-0000-000000000000 node --input-type=module <<'JS'
 import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
-const require = createRequire(new URL("./backend/package.json", import.meta.url));
-const { Keypair } = require("@stellar/stellar-sdk");
+import { verifyAttestation } from "@verity/sdk";
 
 const API = process.env.API ?? "http://localhost:3001";
 const id = process.env.SUBMISSION_ID;
@@ -772,45 +764,19 @@ const deployment = JSON.parse(readFileSync(
 const response = await fetch(`${API}/v1/submissions/${encodeURIComponent(id)}/attestation`);
 if (!response.ok) throw new Error(`Attestation HTTP ${response.status}: ${await response.text()}`);
 const att = await response.json();
-if (att.signature_algorithm !== "ed25519") throw new Error("Unexpected algorithm");
-const trustedSigner = process.env.TRUSTED_KEEPER_PUBLIC_KEY ?? deployment.keeper_public_key;
-if (!trustedSigner || att.signer !== trustedSigner)
-  throw new Error("Unexpected keeper signer");
-const key = Keypair.fromPublicKey(att.signer);
-const signature = Buffer.from(att.signature, "base64");
-// Mirror backend/src/chain/canonical.ts; compare before trusting att.payload.
-function canonicalJson(value) {
-  if (value === undefined) return "null";
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(",")}}`;
-}
-if (typeof att.canonical !== "string" || canonicalJson(att.payload) !== att.canonical)
-  throw new Error("Attestation payload does not match signed canonical bytes");
-if (att.payload?.attestor?.stellar_account !== att.signer)
-  throw new Error("Attestation signer does not match attestor");
-const message = Buffer.from(att.canonical, "utf8");
-if (signature.length !== 64 || !key.verify(message, signature))
-  throw new Error("Invalid attestation signature");
-if (key.verify(Buffer.concat([message, Buffer.from(" ")]), signature))
-  throw new Error("Tampered canonical string unexpectedly verified");
-// Bind the authenticated bytes to this request and the selected deployment.
-if (att.payload?.schema !== "verity.attestation.v2")
-  throw new Error("Unexpected attestation schema");
-if (att.payload?.subject?.submission_id !== id)
-  throw new Error("Attestation does not belong to the requested submission");
-if (typeof deployment.network_passphrase !== "string" ||
-    !deployment.network_passphrase ||
-    att.payload.network_passphrase !== deployment.network_passphrase)
-  throw new Error("Attestation network does not match the trusted deployment");
-if (typeof deployment.escrow_gate_contract_id !== "string" ||
-    !deployment.escrow_gate_contract_id ||
-    att.payload.escrow_gate_contract_id !== deployment.escrow_gate_contract_id)
-  throw new Error("Attestation contract does not match the trusted deployment");
-console.log("Signature valid; signer, submission and deployment context verified");
+
+const payload = verifyAttestation(att, {
+  trustedSigner: process.env.TRUSTED_KEEPER_PUBLIC_KEY ?? deployment.keeper_public_key,
+  networkPassphrase: deployment.network_passphrase,
+  escrowGateContractId: deployment.escrow_gate_contract_id,
+  submissionId: id,
+});
+
+console.log("Signature valid; signer, submission and deployment context verified:", payload.claim?.verdict);
 JS
 ```
+
+*Without the SDK:* verify `att.signature_algorithm === "ed25519"`, verify that `att.signer` matches your trusted keeper key and `att.payload.attestor.stellar_account`, verify `canonicalJson(att.payload) === att.canonical`, verify the ed25519 signature over UTF-8 `att.canonical`, and assert that `schema === "verity.attestation.v2"`, `subject.submission_id === id`, `network_passphrase === deployment.network_passphrase`, and `escrow_gate_contract_id === deployment.escrow_gate_contract_id`.
 
 A valid signature shows that Verity's keeper key attested to these verdict
 record bytes; it is not a cryptographic proof of correctness. Check the

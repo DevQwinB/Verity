@@ -1,0 +1,30 @@
+{
+  "name": "@verity/sdk",
+  "version": "0.1.0",
+  "description": "Official TypeScript SDK for submitting work and verifying verdicts with Verity EscrowGate on Stellar",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^17.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.3",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}
