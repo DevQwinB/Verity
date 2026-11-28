@@ -22,7 +22,7 @@ const LINKS = [
 
 export function Nav() {
   const pathname = usePathname();
-  const { account, connecting, networkOk, problem, login, logout, dismissProblem } = useWallet();
+  const { status, account, connecting, networkOk, problem, login, logout, dismissProblem } = useWallet();
   const [menuOpen, setMenuOpen] = useState(false);
   const persistentProblem = problem?.code === "wrong-network" && !networkOk;
 
@@ -61,6 +61,13 @@ export function Nav() {
         </div>
         <div className="flex items-center gap-2 sm:gap-3">
           <ThemeToggle />
+          {status === "restoring" ? (
+            // Neutral and inert: the session is still being checked, so offering
+            // "Connect wallet" here would start a sign-in nobody needs.
+            <Button variant="secondary" disabled>
+              Checking session...
+            </Button>
+          ) : account ? (
           <LiveStatus message={connecting ? "Connecting..." : ""} />
           {account ? (
             <div className="flex items-center gap-2">

@@ -42,6 +42,7 @@ export function OpenChallengeButton({
   bondAsset?: BondAsset | "native";
 }) {
   const router = useRouter();
+  const { status, account, connecting, networkOk, problem, login, reportWrongNetwork } = useWallet();
   const { account, connecting, networkOk, problem, login, reportWrongNetwork } = useWallet();
   const asset = resolveBondAsset(bondAsset);
   // Keep null until the visitor edits the field so a later refresh filling in
@@ -180,6 +181,14 @@ export function OpenChallengeButton({
         The challenge window has closed. This submission is waiting to be finalized and can no
         longer be challenged.
       </p>
+    );
+  }
+
+  if (status === "restoring") {
+    return (
+      <Button variant="secondary" disabled>
+        Checking session...
+      </Button>
     );
   }
 

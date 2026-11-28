@@ -57,7 +57,7 @@ const ESCROW_REF_MAX_LENGTH = 128;
  * window shown here are the ones EscrowGate will actually apply. */
 export function NewSubmissionForm({ config }: { config: GateConfig }) {
   const router = useRouter();
-  const { account, connecting, networkOk, problem, login, reportWrongNetwork } = useWallet();
+  const { status, account, connecting, networkOk, problem, login, reportWrongNetwork } = useWallet();
   const taskTypeId = useId();
   const asset = resolveBondAsset(config.bond_asset);
   // One key for this form: retrying after a declined signature reuses the
@@ -475,6 +475,25 @@ export function NewSubmissionForm({ config }: { config: GateConfig }) {
         </div>
       )}
 
+      {status === "restoring" ? (
+        <Button variant="secondary" disabled>
+          Checking session...
+        </Button>
+      ) : account ? (
+        <Button onClick={handleSubmit} disabled={busy || !networkOk || !escrowRefTrimmed || !inputContent || !outputContent}>
+          {step === "checking"
+            ? "Checking Freighter..."
+            : step === "uploading"
+              ? "Uploading artifacts..."
+              : step === "building"
+                ? "Building transaction..."
+                : step === "signing"
+                  ? "Awaiting signature in Freighter..."
+                  : step === "relaying"
+                    ? "Submitting to testnet..."
+                    : step === "done"
+                      ? "Confirmed. Opening the submission..."
+                      : "Submit for verification"}
       <LiveStatus message={busy ? stepLabel : ""} />
 
       {account ? (

@@ -73,9 +73,16 @@ export async function logout() {
   if (!res.ok) throw new Error(`Sign-out failed: ${res.status}`);
 }
 
+export interface SessionInfo {
+  account: string | null;
+  /** The token's `exp`, in milliseconds since the epoch; null when it carries
+   * none. Unverified: for display and for the expiry timer only. */
+  expires_at: number | null;
+}
+
 export async function getSession() {
   const res = await fetch("/api/session", { cache: "no-store" });
-  return json<{ account: string | null }>(res);
+  return json<SessionInfo>(res);
 }
 
 export async function getConfig() {

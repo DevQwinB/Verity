@@ -7,6 +7,10 @@ import { fundTestnetAccount } from "../lib/client-api";
 import { isTestnetPassphrase, NETWORK_PASSPHRASE } from "../lib/config";
 import type { BondAsset } from "../lib/types";
 
+/** Asks the testnet faucet for test XLM for the connected account. Bonds and
+ * stakes need a balance, and a new Freighter account starts with none. */
+export function FundAccountButton() {
+  const { status, account, connecting, login } = useWallet();
 /** Asks the testnet faucet for test XLM for the connected account. On a
  * non-native bond deployment, Friendbot only covers XLM transaction fees;
  * bonds and stakes require a trustline and balance in the bond asset.
@@ -39,6 +43,14 @@ export function FundAccountButton({
     } finally {
       setBusy(false);
     }
+  }
+
+  if (status === "restoring") {
+    return (
+      <Button variant="secondary" disabled>
+        Checking session...
+      </Button>
+    );
   }
 
   if (!account) {
