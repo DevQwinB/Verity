@@ -1409,6 +1409,7 @@ fn update_config_publishes_config_updated_event() {
         window_tier_large_s: 172_800,
         slash_split_challenger_bps: 5000,
         reexecutor_slash_bps: 2500,
+        voter_reward_bps: 0,
         reexecutor_allowlist: true,
     };
     w.client.update_config(&w.admin, &cfg);

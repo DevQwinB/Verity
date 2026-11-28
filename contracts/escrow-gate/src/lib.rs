@@ -10,9 +10,10 @@ mod events;
 mod storage;
 
 use events::{
-    AdminChanged, AdminProposed, AttestationLockReleased, BondSettled, ChallengeExpired, ChallengeOpened, ChallengeResolved, ConfigUpdated,
-    Finalized, ReexecutorApprovalChanged, ReexecutorRegistered, ReexecutorStakeWithdrawn,
-    ReplayAttested, Slashed, SubmissionCreated, TreasuryChanged, VoterRewarded,
+    AdminChanged, AdminProposed, AttestationLockReleased, BondSettled, ChallengeExpired,
+    ChallengeOpened, ChallengeResolved, ConfigUpdated, Finalized, ReexecutorApprovalChanged,
+    ReexecutorRegistered, ReexecutorStakeWithdrawn, ReplayAttested, Slashed, SubmissionCreated,
+    TreasuryChanged, VoterRewarded,
 };
 use soroban_sdk::{contract, contractimpl, panic_with_error, Address, BytesN, Env};
 use verity_common::{
@@ -233,7 +234,6 @@ fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(i128, i128, i128), Error> 
     match sub.verdict {
         Verdict::Verified => {
             let forfeited = challenge.as_ref().map(|c| c.bond).unwrap_or(0);
-<<<<<<< HEAD
             let reward = set_aside_reward(e, sub, forfeited)?;
             let total = sub
                 .bond_amount
@@ -241,13 +241,7 @@ fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(i128, i128, i128), Error> 
                 .ok_or(Error::Overflow)?
                 .checked_sub(reward)
                 .ok_or(Error::Overflow)?;
-=======
-            let total = sub
-                .bond_amount
-                .checked_add(forfeited)
-                .ok_or(Error::Overflow)?;
             to_agent = total;
->>>>>>> d48ef03 (feat(contracts): emit config, lock release and bond settlement events in EscrowGate)
             pay(&sub.agent, total);
         }
         Verdict::Slashed => {
@@ -262,19 +256,6 @@ fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(i128, i128, i128), Error> 
                     .ok_or(Error::Overflow)?
                     .checked_sub(reward)
                     .ok_or(Error::Overflow)?;
-<<<<<<< HEAD
-                let to_challenger = chal.bond.checked_add(challenger_share).ok_or(Error::Overflow)?;
-                pay(&chal.challenger, to_challenger);
-                pay(&treasury, remainder);
-            } else {
-                // Pure replay-consensus slash: no challenger exists to reward,
-                // so the forfeited agent bond, less the voters' share, goes to
-                // the treasury.
-                pay(
-                    &treasury,
-                    sub.bond_amount.checked_sub(reward).ok_or(Error::Overflow)?,
-                );
-=======
                 let to_challenger_amt = chal
                     .bond
                     .checked_add(challenger_share)
@@ -282,11 +263,10 @@ fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(i128, i128, i128), Error> 
                 to_challenger = to_challenger_amt;
                 to_treasury = remainder;
                 pay(&chal.challenger, to_challenger_amt);
-                pay(&admin, remainder);
+                pay(&treasury, remainder);
             } else {
-                to_treasury = sub.bond_amount;
-                pay(&admin, sub.bond_amount);
->>>>>>> d48ef03 (feat(contracts): emit config, lock release and bond settlement events in EscrowGate)
+                to_treasury = sub.bond_amount.checked_sub(reward).ok_or(Error::Overflow)?;
+                pay(&treasury, to_treasury);
             }
         }
         Verdict::ExpiredUnverified => {
@@ -355,16 +335,11 @@ fn apply_slash(
         Some(_) => checked_bps(amount, sub.cfg_slash_split_challenger_bps)?,
         None => 0,
     };
-<<<<<<< HEAD
     let reward = set_aside_reward(e, sub, amount)?;
     let remainder = amount
         .checked_sub(challenger_share)
         .ok_or(Error::Overflow)?
         .checked_sub(reward)
-=======
-    let remainder = amount
-        .checked_sub(challenger_share)
->>>>>>> d48ef03 (feat(contracts): emit config, lock release and bond settlement events in EscrowGate)
         .ok_or(Error::Overflow)?;
     if let Some(challenger) = prevailing_challenger {
         if challenger_share > 0 {

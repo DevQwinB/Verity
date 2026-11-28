@@ -23,8 +23,16 @@ fn reference_outcome(votes: &[(i128, bool)]) -> Option<Verdict> {
     if total_votes < QUORUM_MIN {
         return None;
     }
-    let matched_weight: i64 = votes.iter().filter(|(_, m)| *m).map(|(s, _)| *s as i64).sum();
-    let mismatched_weight: i64 = votes.iter().filter(|(_, m)| !*m).map(|(s, _)| *s as i64).sum();
+    let matched_weight: i64 = votes
+        .iter()
+        .filter(|(_, m)| *m)
+        .map(|(s, _)| *s as i64)
+        .sum();
+    let mismatched_weight: i64 = votes
+        .iter()
+        .filter(|(_, m)| !*m)
+        .map(|(s, _)| *s as i64)
+        .sum();
     let total = matched_weight + mismatched_weight;
     if total <= 0 {
         return None;
@@ -94,7 +102,10 @@ fn run_case(votes: Vec<(i64, bool)>) {
         Some(v) => {
             assert_eq!(actual, v, "votes={:?}", recorded_votes);
             assert_eq!(
-                client.get_submission(&submission_id).unwrap().resolution_method,
+                client
+                    .get_submission(&submission_id)
+                    .unwrap()
+                    .resolution_method,
                 ResolutionMethod::ReexecutionConsensus
             );
         }
@@ -113,15 +124,26 @@ fn run_case(votes: Vec<(i64, bool)>) {
             let defaulted = client.finalize(&submission_id);
             assert_eq!(
                 defaulted,
-                if any_mismatch { Verdict::ExpiredUnverified } else { Verdict::Verified },
+                if any_mismatch {
+                    Verdict::ExpiredUnverified
+                } else {
+                    Verdict::Verified
+                },
                 "votes={:?}",
                 recorded_votes
             );
             assert_eq!(
-                client.get_submission(&submission_id).unwrap().resolution_method,
+                client
+                    .get_submission(&submission_id)
+                    .unwrap()
+                    .resolution_method,
                 ResolutionMethod::WindowElapsed
             );
-            assert_eq!(token.balance(&agent), 1000 * XLM, "bond must come back on a default");
+            assert_eq!(
+                token.balance(&agent),
+                1000 * XLM,
+                "bond must come back on a default"
+            );
         }
     }
     let _ = token; // silence unused warning if a future edit drops balance assertions
