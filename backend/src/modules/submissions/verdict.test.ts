@@ -48,6 +48,7 @@ interface FakeChallengeRow {
   id: string;
   submission_id: string;
   resolved_at: Date | null;
+  resolution?: string | null;
 }
 
 interface RecordedDelivery {
@@ -113,11 +114,12 @@ function createHarness(initial: {
         return { rows: [] };
       }
 
-      if (sql.startsWith('update "challenge" set "resolved_at" = $1 where "submission_id" = $2 and "resolved_at" is null')) {
-        const [resolvedAt, submissionId] = parameters as [Date, string];
+      if (sql.startsWith('update "challenge" set "resolved_at" = $1, "resolution" = $2 where "submission_id" = $3 and "resolved_at" is null')) {
+        const [resolvedAt, resolution, submissionId] = parameters as [Date, string, string];
         for (const ch of challenges) {
           if (ch.submission_id === submissionId && ch.resolved_at === null) {
             ch.resolved_at = resolvedAt;
+            ch.resolution = resolution;
           }
         }
         return { rows: [] };
@@ -286,6 +288,7 @@ test("expired_unverified without txHash sends tx_hash: null, fills resolution_me
   assert.equal(harness.submissions[0]!.resolution_method, "window_elapsed");
   assert.equal(harness.submissions[0]!.finalize_tx_hash, null);
   assert.ok(harness.challenges[0]!.resolved_at instanceof Date);
+  assert.equal(harness.challenges[0]!.resolution, "expired");
 });
 
 test("verified and slashed continue to dispatch with the same payload shape", async () => {

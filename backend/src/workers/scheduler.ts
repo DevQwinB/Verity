@@ -13,6 +13,7 @@ import {
   releaseAttestationLockOnChain,
   resolveChallengeOnChain,
 } from "../chain/actions.js";
+import type { ChallengeResolution } from "@verity/db";
 import { challengeResolutionMethod, fromChainResolution, fromChainResolutionMethod, fromChainVerdict } from "../chain/mappers.js";
 import { recordTerminalVerdict } from "../modules/submissions/verdict.js";
 import { exportAttestation } from "../modules/attestations/export.js";
@@ -496,7 +497,7 @@ export type ChallengeDecision =
         challenger_bond: string;
         opened_at: Date;
         chain_tx_hash: null;
-        resolution?: "upheld" | "rejected";
+        resolution?: ChallengeResolution;
         resolution_method?: "reexecution_consensus" | "zk_proof";
         resolved_at?: Date;
       };
@@ -506,7 +507,7 @@ export type ChallengeDecision =
   | {
       action: "update";
       values: {
-        resolution: "upheld" | "rejected";
+        resolution: ChallengeResolution;
         resolution_method?: "reexecution_consensus" | "zk_proof";
         resolved_at: Date;
       };
@@ -531,7 +532,7 @@ export function reconcileChallengeDecision(input: ChallengeDecisionInput): Chall
       challenger_bond: string;
       opened_at: Date;
       chain_tx_hash: null;
-      resolution?: "upheld" | "rejected";
+      resolution?: ChallengeResolution;
       resolution_method?: "reexecution_consensus" | "zk_proof";
       resolved_at?: Date;
     } = {
