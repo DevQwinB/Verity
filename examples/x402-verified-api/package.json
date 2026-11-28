@@ -1,0 +1,21 @@
+{
+  "name": "@verity/example-x402-verified-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/index.test.ts",
+    "seller": "tsx src/seller.ts",
+    "buyer": "tsx src/buyer.ts"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^17.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.3",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}

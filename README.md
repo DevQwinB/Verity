@@ -821,6 +821,13 @@ indexer is missing votes, settlement waits up to 600 seconds, then may issue
 the record with incomplete evidence. Read the on-chain submission for the
 full tally.
 
+## Integrations
+
+### x402 Paid Agent APIs (Verify-then-Pay)
+AI agents paying for API calls over HTTP 402 in USDC on Stellar can gain recourse against dishonest sellers through Verity. The seller bonds each paid response and binds it to the x402 payment hash (`escrow_ref`); re-executors replay the task and slash dishonest sellers on mismatch.
+
+See the complete working seller, buyer, and verification guide in [examples/x402-verified-api/](examples/x402-verified-api/).
+
 ## Known limits
 
 - **Testnet only. Contracts are unaudited.** See [`docs/MAINNET.md`](docs/MAINNET.md)
