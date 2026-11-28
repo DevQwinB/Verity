@@ -29,6 +29,7 @@ fn default_config() -> ConfigRecord {
         window_tier_large_s: 86_400,
         slash_split_challenger_bps: 2000,
         reexecutor_slash_bps: 1000,
+        voter_reward_bps: 0,
         reexecutor_allowlist: false,
     }
 }
@@ -781,12 +782,20 @@ fn unresolvable_challenge_expires_and_returns_both_bonds() {
     e.ledger().with_mut(|l| l.timestamp += 3599);
     assert_eq!(w.client.finalize(&id), Verdict::Pending);
     assert_eq!(w.token.balance(&agent), 950 * XLM);
+    assert_eq!(
+        w.client.get_challenge(&id).unwrap().resolution,
+        Resolution::None
+    );
 
     e.ledger().with_mut(|l| l.timestamp += 1);
     assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
     assert_eq!(w.token.balance(&agent), 1000 * XLM);
     assert_eq!(w.token.balance(&challenger), 1000 * XLM);
     assert_eq!(w.token.balance(&w.client.address), 600 * XLM);
+    // The challenge record says how it ended, instead of looking open forever.
+    let closed = w.client.get_challenge(&id).unwrap();
+    assert_eq!(closed.resolution, Resolution::Expired);
+    assert_eq!(closed.resolution_method, ResolutionMethod::WindowElapsed);
 
     // Terminal and idempotent like every other verdict; nobody is slashable.
     assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
@@ -795,6 +804,202 @@ fn unresolvable_challenge_expires_and_returns_both_bonds() {
         ResolutionMethod::WindowElapsed
     );
     assert_eq!(w.client.try_slash(&rex, &id), Err(Ok(Error::NotSlashable)));
+}
+
+// ---- an expired challenge is recorded and announced ----
+
+mod expired_challenge {
+    use super::*;
+    use crate::events::{ChallengeExpired, ChallengeResolved, Finalized};
+    use soroban_sdk::xdr::ToXdr as _;
+
+    /// A challenged submission with one vote, which is short of a quorum, so
+    /// no consensus can form. The challenge window is 3600 seconds.
+    fn challenged(w: &World) -> (u64, Address) {
+        let agent = Address::generate(&w.e);
+        let id = submit_default(w, &agent);
+        let challenger = Address::generate(&w.e);
+        fund(w, &challenger, 1000 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        let rex = Address::generate(&w.e);
+        register_rex(w, &rex);
+        w.client
+            .attest_replay(&rex, &id, &BytesN::from_array(&w.e, &[3u8; 32]), &true);
+        (id, challenger)
+    }
+
+    fn expired_event(w: &World, id: u64) -> soroban_sdk::xdr::ContractEvent {
+        ChallengeExpired { submission_id: id }.to_xdr(&w.e, &w.client.address)
+    }
+
+    #[test]
+    fn finalize_records_the_expiry_and_publishes_challenge_expired() {
+        let e = Env::default();
+        let w = setup(&e);
+        let (id, challenger) = challenged(&w);
+        let opened = w.client.get_challenge(&id).unwrap();
+        assert_eq!(opened.resolution, Resolution::None);
+        assert_eq!(opened.resolution_method, ResolutionMethod::None);
+
+        e.ledger().with_mut(|l| l.timestamp += 3600);
+        assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+        // Read before any other call replaces the events of this one.
+        let events = e.events().all();
+        assert!(events.events().contains(&expired_event(&w, id)));
+        let finalized = Finalized {
+            submission_id: id,
+            verdict: Verdict::ExpiredUnverified,
+        }
+        .to_xdr(&e, &w.client.address);
+        assert!(events.events().contains(&finalized));
+
+        // Only the outcome changed on the record.
+        let closed = w.client.get_challenge(&id).unwrap();
+        assert_eq!(closed.resolution, Resolution::Expired);
+        assert_eq!(closed.resolution_method, ResolutionMethod::WindowElapsed);
+        assert_eq!(closed.challenger, challenger);
+        assert_eq!(closed.bond, opened.bond);
+        assert_eq!(closed.opened_at, opened.opened_at);
+        // Both bonds went back, as before.
+        assert_eq!(w.token.balance(&challenger), 1000 * XLM);
+    }
+
+    #[test]
+    fn a_challenge_inside_its_window_stays_open_and_announces_nothing() {
+        let e = Env::default();
+        let w = setup(&e);
+        let (id, _) = challenged(&w);
+        let before = w.client.get_challenge(&id).unwrap().to_xdr(&e);
+
+        e.ledger().with_mut(|l| l.timestamp += 3599);
+        assert_eq!(w.client.finalize(&id), Verdict::Pending);
+        assert!(e.events().all().events().is_empty());
+        assert_eq!(w.client.get_challenge(&id).unwrap().to_xdr(&e), before);
+    }
+
+    #[test]
+    fn finalizing_again_after_the_expiry_writes_and_announces_nothing() {
+        let e = Env::default();
+        let w = setup(&e);
+        let (id, _) = challenged(&w);
+        e.ledger().with_mut(|l| l.timestamp += 3600);
+        assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+        let closed = w.client.get_challenge(&id).unwrap().to_xdr(&e);
+
+        e.ledger().with_mut(|l| l.timestamp += 100_000);
+        assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+        assert!(e.events().all().events().is_empty());
+        assert_eq!(w.client.get_challenge(&id).unwrap().to_xdr(&e), closed);
+    }
+
+    #[test]
+    fn an_expired_challenge_cannot_be_resolved_afterwards() {
+        let e = Env::default();
+        let w = setup(&e);
+        let (id, _) = challenged(&w);
+        e.ledger().with_mut(|l| l.timestamp += 3600);
+        assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+
+        // Late votes that would have made a quorum change nothing now.
+        assert_eq!(
+            w.client
+                .try_resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+            Err(Ok(Error::ChallengeAlreadyResolved))
+        );
+        let closed = w.client.get_challenge(&id).unwrap();
+        assert_eq!(closed.resolution, Resolution::Expired);
+        assert_eq!(
+            w.client.get_submission(&id).unwrap().verdict,
+            Verdict::ExpiredUnverified
+        );
+    }
+
+    #[test]
+    fn a_challenge_resolved_by_consensus_is_not_reported_as_expired() {
+        // Upheld: three mismatch votes.
+        let e = Env::default();
+        let w = setup(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let challenger = Address::generate(&e);
+        fund(&w, &challenger, 1000 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        for _ in 0..3 {
+            let rex = Address::generate(&e);
+            register_rex(&w, &rex);
+            w.client
+                .attest_replay(&rex, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+        }
+        assert_eq!(
+            w.client
+                .resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+            Verdict::Slashed
+        );
+        let events = e.events().all();
+        assert!(!events.events().contains(&expired_event(&w, id)));
+        let resolved = ChallengeResolved {
+            submission_id: id,
+            resolution: Resolution::Upheld,
+            method: ResolutionMethod::ReexecutionConsensus,
+        }
+        .to_xdr(&e, &w.client.address);
+        assert!(events.events().contains(&resolved));
+
+        // Long after the window, finalize still reports the resolved outcome.
+        e.ledger().with_mut(|l| l.timestamp += 100_000);
+        assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+        assert!(!e.events().all().events().contains(&expired_event(&w, id)));
+        assert_eq!(
+            w.client.get_challenge(&id).unwrap().resolution,
+            Resolution::Upheld
+        );
+    }
+
+    #[test]
+    fn a_window_that_closes_on_an_unchallenged_submission_announces_no_challenge() {
+        let e = Env::default();
+        let w = setup(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        // One mismatch vote and no challenge: the submission expires
+        // unverified, but there is no challenge to close.
+        let rex = Address::generate(&e);
+        register_rex(&w, &rex);
+        w.client
+            .attest_replay(&rex, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+
+        e.ledger().with_mut(|l| l.timestamp += 3600);
+        assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+        assert!(!e.events().all().events().contains(&expired_event(&w, id)));
+        assert!(w.client.get_challenge(&id).is_none());
+    }
+
+    #[test]
+    fn a_challenge_with_a_consensus_is_not_expired_by_finalize() {
+        let e = Env::default();
+        let w = setup(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let challenger = Address::generate(&e);
+        fund(&w, &challenger, 1000 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        for _ in 0..3 {
+            let rex = Address::generate(&e);
+            register_rex(&w, &rex);
+            w.client
+                .attest_replay(&rex, &id, &BytesN::from_array(&e, &[9u8; 32]), &false);
+        }
+
+        // The window is over but a consensus exists: finalize waits for
+        // resolve_challenge and must not write the record off as expired.
+        e.ledger().with_mut(|l| l.timestamp += 100_000);
+        assert_eq!(w.client.finalize(&id), Verdict::Pending);
+        assert!(e.events().all().events().is_empty());
+        assert_eq!(
+            w.client.get_challenge(&id).unwrap().resolution,
+            Resolution::None
+        );
+    }
 }
 
 #[test]
@@ -1790,6 +1995,7 @@ fn update_config_by_the_admin_replaces_every_field() {
         window_tier_large_s: 172_800,
         slash_split_challenger_bps: 5000,
         reexecutor_slash_bps: 2500,
+        voter_reward_bps: 1500,
         reexecutor_allowlist: true,
     };
 
@@ -2478,6 +2684,130 @@ fn an_agent_may_still_challenge_another_agents_submission() {
         w.client
             .try_open_challenge(&second, &second_id, &(50 * XLM)),
         Err(Ok(Error::AgentCannotChallenge))
+    );
+}
+
+/// Registers `count` re-executors and has each cast the given vote on `id`.
+fn cast_votes(w: &World, id: u64, count: usize, matched: bool) {
+    let hash = BytesN::from_array(&w.e, &[if matched { 3u8 } else { 9u8 }; 32]);
+    for _ in 0..count {
+        let rex = Address::generate(&w.e);
+        register_rex(w, &rex);
+        w.client.attest_replay(&rex, &id, &hash, &matched);
+    }
+}
+
+#[test]
+fn a_challenge_is_refused_once_a_mismatch_supermajority_decides_the_submission() {
+    let e = Env::default();
+    let w = setup(&e); // quorum 3, 66% supermajority, 20% of a slash to a challenger
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    cast_votes(&w, id, 3, false);
+
+    // The answer is already on-chain: a challenge now would risk nothing and
+    // collect a share of the slash.
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    let held = w.token.balance(&w.client.address);
+    assert_eq!(
+        w.client.try_open_challenge(&challenger, &id, &(50 * XLM)),
+        Err(Ok(Error::ConsensusAlreadyReached))
+    );
+    assert_eq!(w.token.balance(&challenger), 1000 * XLM);
+    assert_eq!(w.token.balance(&w.client.address), held);
+    assert!(w.client.get_challenge(&id).is_none());
+
+    // finalize() settles it as it stands, and the whole forfeited bond goes
+    // to the treasury: there is no challenger to pay a share to.
+    let admin_before = w.token.balance(&w.admin);
+    assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+    assert_eq!(w.token.balance(&w.admin), admin_before + 50 * XLM);
+    assert_eq!(w.token.balance(&challenger), 1000 * XLM);
+}
+
+#[test]
+fn a_challenge_is_refused_once_a_match_supermajority_decides_the_submission() {
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    cast_votes(&w, id, 3, true);
+
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    assert_eq!(
+        w.client.try_open_challenge(&challenger, &id, &(50 * XLM)),
+        Err(Ok(Error::ConsensusAlreadyReached))
+    );
+    assert_eq!(w.token.balance(&challenger), 1000 * XLM);
+    assert!(w.client.get_challenge(&id).is_none());
+
+    assert_eq!(w.client.finalize(&id), Verdict::Verified);
+    assert_eq!(w.token.balance(&agent), 1000 * XLM);
+}
+
+#[test]
+fn a_challenge_is_still_accepted_while_the_votes_decide_nothing() {
+    // Below the quorum of three, whichever way the votes point.
+    for (matches, mismatches) in [(0, 1), (0, 2), (1, 0), (2, 0), (1, 1)] {
+        let e = Env::default();
+        let w = setup(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        cast_votes(&w, id, matches, true);
+        cast_votes(&w, id, mismatches, false);
+
+        let challenger = Address::generate(&e);
+        fund(&w, &challenger, 1000 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        assert_eq!(
+            w.client.get_challenge(&id).unwrap().challenger,
+            challenger,
+            "{matches} match, {mismatches} mismatch"
+        );
+    }
+
+    // A quorum, but split evenly: no side has 66% of the bonded weight.
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    cast_votes(&w, id, 2, true);
+    cast_votes(&w, id, 2, false);
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    w.client.open_challenge(&challenger, &id, &(50 * XLM));
+    assert_eq!(w.token.balance(&challenger), 950 * XLM);
+    assert_eq!(w.client.get_challenge(&id).unwrap().bond, 50 * XLM);
+}
+
+#[test]
+fn votes_cast_after_a_challenge_is_opened_can_still_decide_it() {
+    // The consensus check is made when the challenge is opened, not after:
+    // resolve_challenge depends on the votes that follow.
+    let e = Env::default();
+    let w = setup(&e);
+    let agent = Address::generate(&e);
+    let id = submit_default(&w, &agent);
+    cast_votes(&w, id, 2, false);
+
+    let challenger = Address::generate(&e);
+    fund(&w, &challenger, 1000 * XLM);
+    w.client.open_challenge(&challenger, &id, &(50 * XLM));
+
+    // The third mismatch vote completes the supermajority.
+    cast_votes(&w, id, 1, false);
+    assert_eq!(
+        w.client
+            .resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+        Verdict::Slashed
+    );
+    // This challenger took the risk before the outcome was known, and is paid.
+    assert_eq!(w.token.balance(&challenger), 1000 * XLM + 10 * XLM);
+    assert_eq!(
+        w.client.get_challenge(&id).unwrap().resolution,
+        Resolution::Upheld
     );
 }
 
@@ -3172,6 +3502,408 @@ mod admin_and_treasury {
             }
             assert_eq!(instance_ttl(&w), 500_000, "{entrypoint}");
         }
+    }
+}
+
+// ---- voter rewards ----
+
+mod voter_rewards {
+    use super::*;
+    use crate::events::VoterRewarded;
+
+    /// 10% of anything forfeited on a consensus verdict goes to the winning
+    /// voters; the challenger's share stays 20% and a wrong vote costs 10%.
+    fn rewards_on(e: &Env) -> World<'_> {
+        setup_with(
+            e,
+            ConfigRecord {
+                voter_reward_bps: 1000,
+                ..default_config()
+            },
+        )
+    }
+
+    /// Registers a re-executor with `stake` and has it vote on `id`.
+    fn vote(w: &World, id: u64, stake: i128, matched: bool) -> Address {
+        let rex = Address::generate(&w.e);
+        fund(w, &rex, stake);
+        w.client.register_reexecutor(&rex, &stake);
+        let hash = BytesN::from_array(&w.e, &[if matched { 3u8 } else { 9u8 }; 32]);
+        w.client.attest_replay(&rex, &id, &hash, &matched);
+        rex
+    }
+
+    #[test]
+    fn the_remainder_after_voter_rewards_goes_to_the_treasury() {
+        let e = Env::default();
+        let w = rewards_on(&e);
+        let vault = Address::generate(&e);
+        w.client.set_treasury(&w.admin, &vault);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        vote(&w, id, 600 * XLM, false);
+        vote(&w, id, 600 * XLM, false);
+        vote(&w, id, 600 * XLM, false);
+
+        assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+        assert_eq!(w.client.get_reward_pool(&id), 5 * XLM);
+        assert_eq!(w.token.balance(&vault), 45 * XLM);
+        assert_eq!(w.token.balance(&w.admin), 0);
+    }
+
+    #[test]
+    fn a_consensus_slash_pays_the_winning_voters_by_the_weight_they_voted_with() {
+        let e = Env::default();
+        let w = rewards_on(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let small = vote(&w, id, 600 * XLM, false);
+        let other = vote(&w, id, 600 * XLM, false);
+        let large = vote(&w, id, 1200 * XLM, false);
+
+        assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+        // 10% of the 50 XLM bond is held back; the treasury gets the rest.
+        assert_eq!(w.client.get_reward_pool(&id), 5 * XLM);
+        assert_eq!(w.token.balance(&w.admin), 45 * XLM);
+        assert_eq!(w.token.balance(&w.client.address), 2400 * XLM + 5 * XLM);
+
+        w.client.release_attestation_lock(&id, &small);
+        let events = e.events().all();
+        assert!(events.events().contains(
+            &VoterRewarded {
+                submission_id: id,
+                reexecutor: small.clone(),
+                amount: 5 * XLM / 4
+            }
+            .to_xdr(&e, &w.client.address)
+        ));
+        w.client.release_attestation_lock(&id, &other);
+        w.client.release_attestation_lock(&id, &large);
+
+        // 600 : 600 : 1200 of the 5 XLM pool.
+        assert_eq!(w.token.balance(&small), 5 * XLM / 4);
+        assert_eq!(w.token.balance(&other), 5 * XLM / 4);
+        assert_eq!(w.token.balance(&large), 5 * XLM / 2);
+        // Nothing of the pool is left, and the stakes were not touched.
+        assert_eq!(w.token.balance(&w.client.address), 2400 * XLM);
+        assert_eq!(
+            w.client.reexecutor_info(&large).unwrap().stake_amount,
+            1200 * XLM
+        );
+    }
+
+    #[test]
+    fn a_rejected_challenge_shares_the_challengers_bond_with_the_voters() {
+        let e = Env::default();
+        let w = rewards_on(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let challenger = Address::generate(&e);
+        fund(&w, &challenger, 50 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        let voters = [
+            vote(&w, id, 600 * XLM, true),
+            vote(&w, id, 600 * XLM, true),
+            vote(&w, id, 600 * XLM, true),
+        ];
+
+        assert_eq!(
+            w.client
+                .resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+            Verdict::Verified
+        );
+        // The agent gets its bond back and the challenger's bond less 10%.
+        assert_eq!(w.token.balance(&agent), 1000 * XLM + 45 * XLM);
+        assert_eq!(w.token.balance(&challenger), 0);
+        assert_eq!(w.client.get_reward_pool(&id), 5 * XLM);
+
+        for rex in &voters {
+            w.client.release_attestation_lock(&id, rex);
+            assert_eq!(w.token.balance(rex), 5 * XLM / 3);
+        }
+        // 5 XLM does not divide by three: two stroops are left in the contract.
+        assert_eq!(w.token.balance(&w.client.address), 1800 * XLM + 2);
+    }
+
+    #[test]
+    fn an_upheld_challenge_pays_the_challenger_the_voters_and_the_treasury() {
+        let e = Env::default();
+        let w = rewards_on(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let challenger = Address::generate(&e);
+        fund(&w, &challenger, 50 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        let voters = [
+            vote(&w, id, 600 * XLM, false),
+            vote(&w, id, 600 * XLM, false),
+            vote(&w, id, 600 * XLM, false),
+        ];
+
+        assert_eq!(
+            w.client
+                .resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus),
+            Verdict::Slashed
+        );
+        // Of the agent's 50 XLM: 20% to the challenger, 10% to the voters.
+        assert_eq!(w.token.balance(&challenger), 50 * XLM + 10 * XLM);
+        assert_eq!(w.token.balance(&w.admin), 35 * XLM);
+        assert_eq!(w.client.get_reward_pool(&id), 5 * XLM);
+        assert_eq!(w.token.balance(&agent), 950 * XLM);
+        for rex in &voters {
+            w.client.release_attestation_lock(&id, rex);
+            assert_eq!(w.token.balance(rex), 5 * XLM / 3);
+        }
+    }
+
+    #[test]
+    fn a_wrong_voters_slash_joins_the_pool_and_a_claim_pays_what_it_added() {
+        let e = Env::default();
+        let w = rewards_on(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let early = vote(&w, id, 600 * XLM, false);
+        let second = vote(&w, id, 600 * XLM, false);
+        let third = vote(&w, id, 600 * XLM, false);
+        let wrong = vote(&w, id, 600 * XLM, true);
+        assert_eq!(w.client.finalize(&id), Verdict::Slashed);
+
+        // Released before the wrong voter is slashed: a third of 5 XLM.
+        w.client.release_attestation_lock(&id, &early);
+        assert_eq!(w.token.balance(&early), 5 * XLM / 3);
+
+        // The wrong vote costs 60 XLM. 10% of it joins the pool, the rest goes
+        // to the treasury, and the wrong voter is paid nothing.
+        w.client.release_attestation_lock(&id, &wrong);
+        assert_eq!(w.client.get_reward_pool(&id), 11 * XLM);
+        assert_eq!(w.token.balance(&w.admin), 45 * XLM + 54 * XLM);
+        assert_eq!(w.token.balance(&wrong), 0);
+        assert_eq!(w.client.claim_voter_reward(&id, &wrong), 0);
+
+        // The early voter claims the difference, once.
+        let top_up = 11 * XLM / 3 - 5 * XLM / 3;
+        assert_eq!(w.client.claim_voter_reward(&id, &early), top_up);
+        assert_eq!(w.token.balance(&early), 11 * XLM / 3);
+        assert_eq!(w.client.claim_voter_reward(&id, &early), 0);
+
+        // The other two are paid in full when they release.
+        w.client.release_attestation_lock(&id, &second);
+        w.client.release_attestation_lock(&id, &third);
+        assert_eq!(w.token.balance(&second), 11 * XLM / 3);
+        assert_eq!(w.token.balance(&third), 11 * XLM / 3);
+        assert_eq!(w.client.claim_voter_reward(&id, &third), 0);
+
+        // What the contract still holds is the stakes and the rounding dust.
+        let stakes = 3 * 600 * XLM + 540 * XLM;
+        let dust = 11 * XLM - 3 * (11 * XLM / 3);
+        assert_eq!(w.token.balance(&w.client.address), stakes + dust);
+    }
+
+    #[test]
+    fn slashing_through_slash_also_feeds_the_pool() {
+        let e = Env::default();
+        let w = rewards_on(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        vote(&w, id, 600 * XLM, false);
+        vote(&w, id, 600 * XLM, false);
+        vote(&w, id, 600 * XLM, false);
+        let wrong = vote(&w, id, 600 * XLM, true);
+        w.client.finalize(&id);
+
+        assert_eq!(w.client.slash(&wrong, &id), 60 * XLM);
+        assert_eq!(w.client.get_reward_pool(&id), 11 * XLM);
+    }
+
+    #[test]
+    fn a_verdict_the_window_set_pays_no_reward() {
+        let e = Env::default();
+        let w = rewards_on(&e);
+
+        // One mismatch vote and no quorum: expires unverified.
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let lone = vote(&w, id, 600 * XLM, false);
+        e.ledger().with_mut(|l| l.timestamp += 3600);
+        assert_eq!(w.client.finalize(&id), Verdict::ExpiredUnverified);
+        w.client.release_attestation_lock(&id, &lone);
+        assert_eq!(w.client.get_reward_pool(&id), 0);
+        assert_eq!(w.token.balance(&lone), 0);
+        assert_eq!(w.client.claim_voter_reward(&id, &lone), 0);
+
+        // One match vote and no quorum: verified by default.
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let lone = vote(&w, id, 600 * XLM, true);
+        e.ledger().with_mut(|l| l.timestamp += 3600);
+        assert_eq!(w.client.finalize(&id), Verdict::Verified);
+        w.client.release_attestation_lock(&id, &lone);
+        assert_eq!(w.client.get_reward_pool(&id), 0);
+        assert_eq!(w.token.balance(&lone), 0);
+        assert_eq!(w.token.balance(&agent), 1000 * XLM);
+    }
+
+    #[test]
+    fn a_consensus_with_nothing_forfeited_pays_no_reward() {
+        let e = Env::default();
+        let w = rewards_on(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let voters = [
+            vote(&w, id, 600 * XLM, true),
+            vote(&w, id, 600 * XLM, true),
+            vote(&w, id, 600 * XLM, true),
+        ];
+        assert_eq!(w.client.finalize(&id), Verdict::Verified);
+        assert_eq!(w.client.get_reward_pool(&id), 0);
+        assert_eq!(w.token.balance(&agent), 1000 * XLM);
+        for rex in &voters {
+            w.client.release_attestation_lock(&id, rex);
+            assert_eq!(w.token.balance(rex), 0);
+        }
+    }
+
+    #[test]
+    fn a_reward_is_shared_by_the_stake_at_the_vote_not_at_the_payment() {
+        let e = Env::default();
+        let w = rewards_on(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let topped_up = vote(&w, id, 600 * XLM, false);
+        let other = vote(&w, id, 600 * XLM, false);
+        let third = vote(&w, id, 600 * XLM, false);
+        // Ten times the stake, added after the vote was counted.
+        fund(&w, &topped_up, 5400 * XLM);
+        w.client.register_reexecutor(&topped_up, &(5400 * XLM));
+
+        w.client.finalize(&id);
+        w.client.release_attestation_lock(&id, &topped_up);
+        w.client.release_attestation_lock(&id, &other);
+        w.client.release_attestation_lock(&id, &third);
+        assert_eq!(w.token.balance(&topped_up), 5 * XLM / 3);
+        assert_eq!(w.token.balance(&other), 5 * XLM / 3);
+    }
+
+    #[test]
+    fn claiming_needs_a_finalized_submission_and_pays_only_a_voter() {
+        let e = Env::default();
+        let w = rewards_on(&e);
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let voter = vote(&w, id, 600 * XLM, false);
+        vote(&w, id, 600 * XLM, false);
+        assert_eq!(
+            w.client.try_claim_voter_reward(&id, &voter),
+            Err(Ok(Error::SubmissionNotFinalized))
+        );
+        assert_eq!(
+            w.client.try_claim_voter_reward(&99, &voter),
+            Err(Ok(Error::SubmissionNotFound))
+        );
+
+        vote(&w, id, 600 * XLM, false);
+        w.client.finalize(&id);
+        let stranger = Address::generate(&e);
+        assert_eq!(w.client.claim_voter_reward(&id, &stranger), 0);
+        assert_eq!(w.token.balance(&stranger), 0);
+        // A claim before the lock is released pays the same share.
+        assert_eq!(w.client.claim_voter_reward(&id, &voter), 5 * XLM / 3);
+        w.client.release_attestation_lock(&id, &voter);
+        assert_eq!(w.token.balance(&voter), 5 * XLM / 3);
+    }
+
+    #[test]
+    fn the_share_is_the_one_in_force_when_the_work_was_submitted() {
+        let e = Env::default();
+        let w = setup(&e); // rewards off
+        let agent = Address::generate(&e);
+        let before = submit_default(&w, &agent);
+        w.client.update_config(
+            &w.admin,
+            &ConfigRecord {
+                voter_reward_bps: 1000,
+                ..default_config()
+            },
+        );
+        let agent2 = Address::generate(&e);
+        let after = submit_default(&w, &agent2);
+        assert_eq!(
+            w.client
+                .get_submission(&before)
+                .unwrap()
+                .cfg_voter_reward_bps,
+            0
+        );
+        assert_eq!(
+            w.client
+                .get_submission(&after)
+                .unwrap()
+                .cfg_voter_reward_bps,
+            1000
+        );
+
+        for id in [before, after] {
+            vote(&w, id, 600 * XLM, false);
+            vote(&w, id, 600 * XLM, false);
+            vote(&w, id, 600 * XLM, false);
+            w.client.finalize(&id);
+        }
+        assert_eq!(w.client.get_reward_pool(&before), 0);
+        assert_eq!(w.client.get_reward_pool(&after), 5 * XLM);
+    }
+
+    #[test]
+    fn the_two_shares_together_cannot_exceed_the_whole() {
+        let e = Env::default();
+        let w = setup(&e);
+        let with = |split: u32, reward: u32| ConfigRecord {
+            slash_split_challenger_bps: split,
+            voter_reward_bps: reward,
+            ..default_config()
+        };
+        assert_eq!(
+            w.client.try_update_config(&w.admin, &with(2000, 8001)),
+            Err(Ok(Error::InvalidConfig))
+        );
+        assert_eq!(
+            w.client.try_update_config(&w.admin, &with(0, 10_001)),
+            Err(Ok(Error::InvalidConfig))
+        );
+        assert_eq!(
+            w.client
+                .try_update_config(&w.admin, &with(u32::MAX, u32::MAX)),
+            Err(Ok(Error::InvalidConfig))
+        );
+        // Exactly the whole is allowed, and so is no reward at all.
+        w.client.update_config(&w.admin, &with(2000, 8000));
+        w.client.update_config(&w.admin, &with(0, 10_000));
+        w.client.update_config(&w.admin, &with(2000, 0));
+    }
+
+    #[test]
+    fn with_the_whole_bond_shared_out_the_treasury_gets_nothing() {
+        let e = Env::default();
+        let w = setup_with(
+            &e,
+            ConfigRecord {
+                slash_split_challenger_bps: 2000,
+                voter_reward_bps: 8000,
+                ..default_config()
+            },
+        );
+        let agent = Address::generate(&e);
+        let id = submit_default(&w, &agent);
+        let challenger = Address::generate(&e);
+        fund(&w, &challenger, 50 * XLM);
+        w.client.open_challenge(&challenger, &id, &(50 * XLM));
+        vote(&w, id, 600 * XLM, false);
+        vote(&w, id, 600 * XLM, false);
+        vote(&w, id, 600 * XLM, false);
+        w.client
+            .resolve_challenge(&id, &ResolutionMethod::ReexecutionConsensus);
+        assert_eq!(w.token.balance(&challenger), 60 * XLM);
+        assert_eq!(w.client.get_reward_pool(&id), 40 * XLM);
+        assert_eq!(w.token.balance(&w.admin), 0);
     }
 }
 

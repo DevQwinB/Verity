@@ -53,6 +53,9 @@ pub enum Resolution {
     None,
     Upheld,
     Rejected,
+    /// Nobody resolved the challenge before it lapsed, and both bonds went
+    /// back. Written by `finalize`, never chosen by a caller.
+    Expired,
 }
 
 #[contracttype]
@@ -78,6 +81,12 @@ pub struct ConfigRecord {
     /// consensus proves their vote wrong. Set on-chain so the amount is never
     /// a caller's choice; 0 disables re-executor slashing.
     pub reexecutor_slash_bps: u32,
+    /// Share of every amount forfeited on a consensus verdict (an agent's
+    /// bond, a losing challenger's bond, a wrong voter's slash) that is set
+    /// aside for the re-executors who voted on the winning side. Together
+    /// with slash_split_challenger_bps it may not exceed 10000; 0 pays no
+    /// rewards.
+    pub voter_reward_bps: u32,
     /// When true, only re-executors the admin has approved may attest. Meant
     /// for networks where stake is free (testnet), where an open voter set
     /// can be captured at no cost.
@@ -117,6 +126,7 @@ pub struct SubmissionRecord {
     pub cfg_slash_split_challenger_bps: u32,
     pub cfg_challenger_bond_min_bps: u32,
     pub cfg_reexecutor_slash_bps: u32,
+    pub cfg_voter_reward_bps: u32,
 }
 
 #[contracttype]

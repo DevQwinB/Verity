@@ -66,6 +66,16 @@ pub struct ChallengeResolved {
     pub method: ResolutionMethod,
 }
 
+/// The challenge lapsed with no resolution: no quorum reached a consensus in
+/// the window after it was opened, and both bonds were returned. `finalize`
+/// publishes it, because nothing else closes such a challenge.
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChallengeExpired {
+    #[topic]
+    pub submission_id: u64,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finalized {
@@ -105,4 +115,16 @@ pub struct TreasuryChanged {
     #[topic]
     pub new_treasury: Address,
     pub old_treasury: Address,
+}
+
+/// A re-executor that voted with the consensus was paid its share of the
+/// submission's reward pool. `amount` is what this payment moved; a voter
+/// can be paid more than once when the pool grows after its first payment.
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoterRewarded {
+    #[topic]
+    pub submission_id: u64,
+    pub reexecutor: Address,
+    pub amount: i128,
 }

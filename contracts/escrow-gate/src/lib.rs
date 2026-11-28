@@ -10,9 +10,9 @@ mod events;
 mod storage;
 
 use events::{
-    AdminChanged, AdminProposed, ChallengeOpened, ChallengeResolved, Finalized,
+    AdminChanged, AdminProposed, ChallengeExpired, ChallengeOpened, ChallengeResolved, Finalized,
     ReexecutorApprovalChanged, ReexecutorRegistered, ReexecutorStakeWithdrawn, ReplayAttested,
-    Slashed, SubmissionCreated, TreasuryChanged,
+    Slashed, SubmissionCreated, TreasuryChanged, VoterRewarded,
 };
 use soroban_sdk::{contract, contractimpl, panic_with_error, Address, BytesN, Env};
 use verity_common::{
@@ -65,6 +65,14 @@ fn validate_config(cfg: &ConfigRecord) -> Result<(), Error> {
     if cfg.reexecutor_slash_bps > ConfigRecord::MAX_BPS {
         return Err(Error::InvalidConfig);
     }
+    // The challenger's share and the voters' share come out of the same
+    // forfeited amount, so together they cannot be more than all of it.
+    // u64, so that two values near u32::MAX cannot wrap past the check.
+    if cfg.slash_split_challenger_bps as u64 + cfg.voter_reward_bps as u64
+        > ConfigRecord::MAX_BPS as u64
+    {
+        return Err(Error::InvalidConfig);
+    }
     if cfg.quorum_min_reexecutors == 0 {
         return Err(Error::InvalidConfig);
     }
@@ -115,10 +123,87 @@ fn consensus_outcome(sub: &SubmissionRecord) -> Result<Option<Verdict>, Error> {
     Ok(None)
 }
 
+/// Sets aside cfg_voter_reward_bps of an amount that was just forfeited, for
+/// the re-executors who voted with the consensus, and returns that share so
+/// the caller pays out only the rest. Nothing is set aside unless a bonded
+/// consensus set the verdict: a window that merely elapsed was settled by
+/// nobody's vote, so nobody is paid for one.
+fn set_aside_reward(e: &Env, sub: &SubmissionRecord, forfeited: i128) -> Result<i128, Error> {
+    if sub.resolution_method != ResolutionMethod::ReexecutionConsensus {
+        return Ok(0);
+    }
+    let share = checked_bps(forfeited, sub.cfg_voter_reward_bps)?;
+    if share <= 0 {
+        return Ok(0);
+    }
+    let pool = storage::get_reward_pool(e, sub.id)
+        .checked_add(share)
+        .ok_or(Error::Overflow)?;
+    storage::set_reward_pool(e, sub.id, pool);
+    Ok(share)
+}
+
+/// Pays `reexecutor` whatever it is owed from the submission's reward pool
+/// and has not drawn yet, and returns the amount. A voter is owed
+/// `pool * its vote's weight / the winning side's weight`, rounded down, where
+/// the weight is the stake the vote was tallied with. The winning weights add
+/// up to the winning side's total, so the payments can never add up to more
+/// than the pool; what rounding leaves over stays in the contract.
+///
+/// The pool can grow after a voter was first paid, when a wrong voter is
+/// slashed later, so the amount already drawn is recorded and only the
+/// difference is paid. One voter per call: nothing here loops over voters.
+fn pay_voter_reward(
+    e: &Env,
+    sub: &SubmissionRecord,
+    reexecutor: &Address,
+    recorded_vote: bool,
+) -> Result<i128, Error> {
+    // wrong_vote() is None unless a consensus finalized the submission.
+    if wrong_vote(sub) != Some(!recorded_vote) {
+        return Ok(0);
+    }
+    let winning_weight = if recorded_vote {
+        sub.bonded_weight_matched
+    } else {
+        sub.bonded_weight_mismatched
+    };
+    let weight = storage::get_vote_weight(e, sub.id, reexecutor);
+    let pool = storage::get_reward_pool(e, sub.id);
+    if winning_weight <= 0 || weight <= 0 || pool <= 0 {
+        return Ok(0);
+    }
+    let owed = pool
+        .checked_mul(weight)
+        .ok_or(Error::Overflow)?
+        .checked_div(winning_weight)
+        .ok_or(Error::Overflow)?;
+    let paid = storage::get_reward_paid(e, sub.id, reexecutor);
+    let due = owed.checked_sub(paid).ok_or(Error::Overflow)?;
+    if due <= 0 {
+        return Ok(0);
+    }
+    storage::set_reward_paid(e, sub.id, reexecutor, owed);
+    let bond_asset = storage::get_bond_asset(e).ok_or(Error::NotInitialized)?;
+    soroban_sdk::token::TokenClient::new(e, &bond_asset).transfer(
+        &e.current_contract_address(),
+        reexecutor.clone(),
+        &due,
+    );
+    VoterRewarded {
+        submission_id: sub.id,
+        reexecutor: reexecutor.clone(),
+        amount: due,
+    }
+    .publish(e);
+    Ok(due)
+}
+
 /// Moves every bond this submission holds to where the terminal verdict says
 /// it belongs. After this runs the contract custodies nothing for the
-/// submission: both the agent's bond and (if a challenge was opened) the
-/// challenger's bond have been paid out.
+/// submission but its reward pool: both the agent's bond and (if a challenge
+/// was opened) the challenger's bond have been paid out, less the share of a
+/// forfeited bond that a consensus verdict sets aside for the winning voters.
 ///
 /// - Verified: the agent's bond is returned. A challenger who disputed it
 ///   and lost forfeits their bond to the agent they wrongly accused — that
@@ -143,25 +228,38 @@ fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(), Error> {
     match sub.verdict {
         Verdict::Verified => {
             let forfeited = challenge.as_ref().map(|c| c.bond).unwrap_or(0);
-            let total = sub.bond_amount.checked_add(forfeited).ok_or(Error::Overflow)?;
+            let reward = set_aside_reward(e, sub, forfeited)?;
+            let total = sub
+                .bond_amount
+                .checked_add(forfeited)
+                .ok_or(Error::Overflow)?
+                .checked_sub(reward)
+                .ok_or(Error::Overflow)?;
             pay(&sub.agent, total);
         }
         Verdict::Slashed => {
             let treasury = storage::get_treasury(e).ok_or(Error::NotInitialized)?;
+            let reward = set_aside_reward(e, sub, sub.bond_amount)?;
             if let Some(chal) = challenge {
                 let challenger_share =
                     checked_bps(sub.bond_amount, sub.cfg_slash_split_challenger_bps)?;
                 let remainder = sub
                     .bond_amount
                     .checked_sub(challenger_share)
+                    .ok_or(Error::Overflow)?
+                    .checked_sub(reward)
                     .ok_or(Error::Overflow)?;
                 let to_challenger = chal.bond.checked_add(challenger_share).ok_or(Error::Overflow)?;
                 pay(&chal.challenger, to_challenger);
                 pay(&treasury, remainder);
             } else {
                 // Pure replay-consensus slash: no challenger exists to reward,
-                // so the whole forfeited agent bond goes to the treasury.
-                pay(&treasury, sub.bond_amount);
+                // so the forfeited agent bond, less the voters' share, goes to
+                // the treasury.
+                pay(
+                    &treasury,
+                    sub.bond_amount.checked_sub(reward).ok_or(Error::Overflow)?,
+                );
             }
         }
         Verdict::ExpiredUnverified => {
@@ -225,7 +323,12 @@ fn apply_slash(
         Some(_) => checked_bps(amount, sub.cfg_slash_split_challenger_bps)?,
         None => 0,
     };
-    let remainder = amount.checked_sub(challenger_share).ok_or(Error::Overflow)?;
+    let reward = set_aside_reward(e, sub, amount)?;
+    let remainder = amount
+        .checked_sub(challenger_share)
+        .ok_or(Error::Overflow)?
+        .checked_sub(reward)
+        .ok_or(Error::Overflow)?;
     if let Some(challenger) = prevailing_challenger {
         if challenger_share > 0 {
             token.transfer(&contract_address, challenger, &challenger_share);
@@ -444,6 +547,7 @@ impl EscrowGate {
             cfg_slash_split_challenger_bps: cfg.slash_split_challenger_bps,
             cfg_challenger_bond_min_bps: cfg.challenger_bond_min_bps,
             cfg_reexecutor_slash_bps: cfg.reexecutor_slash_bps,
+            cfg_voter_reward_bps: cfg.voter_reward_bps,
         };
         storage::set_submission(&e, id, &record);
 
@@ -596,6 +700,9 @@ impl EscrowGate {
         }
 
         storage::mark_attested(&e, submission_id, &reexecutor, matched);
+        // The stake this vote is tallied with below. A reward is shared by
+        // this weight, not by whatever the stake is when it is paid.
+        storage::set_vote_weight(&e, submission_id, &reexecutor, info.stake_amount);
         info.open_attestations = info.open_attestations.saturating_add(1);
         storage::set_reexecutor(&e, &reexecutor, &info);
         storage::bump_instance(&e);
@@ -654,6 +761,9 @@ impl EscrowGate {
         {
             apply_slash(&e, &sub, &reexecutor, &mut info)?;
         }
+        // A vote on the winning side of a consensus is paid its share of the
+        // pool as it stands. claim_voter_reward() pays what is added later.
+        pay_voter_reward(&e, &sub, &reexecutor, recorded_vote)?;
         info.open_attestations = info.open_attestations.saturating_sub(1);
         storage::set_reexecutor(&e, &reexecutor, &info);
         storage::mark_released(&e, submission_id, &reexecutor);
@@ -688,6 +798,18 @@ impl EscrowGate {
         }
         if storage::get_challenge(&e, submission_id).is_some() {
             return Err(Error::ChallengeAlreadyOpen);
+        }
+        // A challenge is a bet against an outcome that is still open. Once the
+        // bonded votes already decide the submission, in either direction, a
+        // challenger adds no information and takes no risk: after a mismatch
+        // consensus they would collect the challenger's share of a slash that
+        // was already certain. finalize() settles such a submission as it is.
+        //
+        // This is checked when the challenge is opened and not again: votes
+        // cast afterwards still count, and may form the consensus that
+        // resolve_challenge needs.
+        if consensus_outcome(&sub)?.is_some() {
+            return Err(Error::ConsensusAlreadyReached);
         }
         let min_bond = checked_bps(sub.escrow_value, sub.cfg_challenger_bond_min_bps)?;
         // Mirrors submit(): the proportional minimum rounds down to zero for
@@ -781,17 +903,30 @@ impl EscrowGate {
             return Ok(sub.verdict);
         }
 
-        let (verdict, method) = if let Some(chal) = storage::get_challenge(&e, submission_id) {
+        let (verdict, method) = if let Some(mut chal) = storage::get_challenge(&e, submission_id) {
             match chal.resolution {
                 Resolution::None => {
                     let deadline = chal.opened_at.saturating_add(sub.challenge_window_s);
                     if e.ledger().timestamp() < deadline || consensus_outcome(&sub)?.is_some() {
                         return Ok(Verdict::Pending);
                     }
+                    // Nobody resolved it in time. The record says so before
+                    // anything is settled, so get_challenge() no longer
+                    // shows an open challenge on a finalized submission.
+                    chal.resolution = Resolution::Expired;
+                    chal.resolution_method = ResolutionMethod::WindowElapsed;
+                    storage::set_challenge(&e, submission_id, &chal);
+                    ChallengeExpired { submission_id }.publish(&e);
                     (Verdict::ExpiredUnverified, ResolutionMethod::WindowElapsed)
                 }
                 Resolution::Upheld => (Verdict::Slashed, chal.resolution_method),
                 Resolution::Rejected => (Verdict::Verified, chal.resolution_method),
+                // Only the branch above writes this, in the call that also
+                // marks the submission finalized, so the early return has
+                // already answered. The arm keeps the match total.
+                Resolution::Expired => {
+                    (Verdict::ExpiredUnverified, ResolutionMethod::WindowElapsed)
+                }
             }
         } else {
             let now = e.ledger().timestamp();
@@ -857,6 +992,35 @@ impl EscrowGate {
         storage::set_reexecutor(&e, &reexecutor, &info);
         storage::bump_instance(&e);
         Ok(amount)
+    }
+
+    /// Pays a winning voter what it is owed from the reward pool and has not
+    /// drawn yet, and returns the amount (0 when there is nothing to pay).
+    /// release_attestation_lock() already pays the share of the pool as it
+    /// stands then; this is for what a later slash of a wrong voter adds.
+    /// Permissionless: the money only ever goes to the voter, and every
+    /// input is state the contract already holds.
+    pub fn claim_voter_reward(
+        e: Env,
+        submission_id: u64,
+        reexecutor: Address,
+    ) -> Result<i128, Error> {
+        let sub = storage::get_submission(&e, submission_id).ok_or(Error::SubmissionNotFound)?;
+        if !sub.finalized {
+            return Err(Error::SubmissionNotFinalized);
+        }
+        let recorded_vote = match storage::get_attestation(&e, submission_id, &reexecutor) {
+            Some(vote) => vote,
+            None => return Ok(0),
+        };
+        let paid = pay_voter_reward(&e, &sub, &reexecutor, recorded_vote)?;
+        storage::bump_instance(&e);
+        Ok(paid)
+    }
+
+    /// What has been set aside for the winning voters of a submission so far.
+    pub fn get_reward_pool(e: Env, id: u64) -> i128 {
+        storage::get_reward_pool(&e, id)
     }
 
     pub fn get_submission(e: Env, id: u64) -> Option<SubmissionRecord> {
