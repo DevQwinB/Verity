@@ -10,9 +10,10 @@ mod events;
 mod storage;
 
 use events::{
-    AdminChanged, AdminProposed, ChallengeExpired, ChallengeOpened, ChallengeResolved, Finalized,
-    ReexecutorApprovalChanged, ReexecutorRegistered, ReexecutorStakeWithdrawn, ReplayAttested,
-    Slashed, SubmissionCreated, TreasuryChanged, VoterRewarded,
+    AdminChanged, AdminProposed, AttestationLockReleased, BondSettled, ChallengeExpired,
+    ChallengeOpened, ChallengeResolved, ConfigUpdated, Finalized, ReexecutorApprovalChanged,
+    ReexecutorRegistered, ReexecutorStakeWithdrawn, ReplayAttested, Slashed, SubmissionCreated,
+    TreasuryChanged, VoterRewarded,
 };
 use soroban_sdk::{contract, contractimpl, panic_with_error, Address, BytesN, Env};
 use verity_common::{
@@ -215,11 +216,16 @@ fn pay_voter_reward(
 ///   challenge, or a window that closed without quorum while a re-executor
 ///   had reported a mismatch — so nobody was proven wrong and every bond
 ///   goes back to its owner.
-fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(), Error> {
+///
+/// Returns (to_agent, to_challenger, to_treasury).
+fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(i128, i128, i128), Error> {
     let bond_asset = storage::get_bond_asset(e).ok_or(Error::NotInitialized)?;
     let token = soroban_sdk::token::TokenClient::new(e, &bond_asset);
     let contract_address = e.current_contract_address();
     let challenge = storage::get_challenge(e, sub.id);
+    let mut to_agent = 0i128;
+    let mut to_challenger = 0i128;
+    let mut to_treasury = 0i128;
     let pay = |to: &Address, amount: i128| {
         if amount > 0 {
             token.transfer(&contract_address, to.clone(), &amount);
@@ -235,6 +241,7 @@ fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(), Error> {
                 .ok_or(Error::Overflow)?
                 .checked_sub(reward)
                 .ok_or(Error::Overflow)?;
+            to_agent = total;
             pay(&sub.agent, total);
         }
         Verdict::Slashed => {
@@ -249,28 +256,30 @@ fn settle(e: &Env, sub: &SubmissionRecord) -> Result<(), Error> {
                     .ok_or(Error::Overflow)?
                     .checked_sub(reward)
                     .ok_or(Error::Overflow)?;
-                let to_challenger = chal.bond.checked_add(challenger_share).ok_or(Error::Overflow)?;
-                pay(&chal.challenger, to_challenger);
+                let to_challenger_amt = chal
+                    .bond
+                    .checked_add(challenger_share)
+                    .ok_or(Error::Overflow)?;
+                to_challenger = to_challenger_amt;
+                to_treasury = remainder;
+                pay(&chal.challenger, to_challenger_amt);
                 pay(&treasury, remainder);
             } else {
-                // Pure replay-consensus slash: no challenger exists to reward,
-                // so the forfeited agent bond, less the voters' share, goes to
-                // the treasury.
-                pay(
-                    &treasury,
-                    sub.bond_amount.checked_sub(reward).ok_or(Error::Overflow)?,
-                );
+                to_treasury = sub.bond_amount.checked_sub(reward).ok_or(Error::Overflow)?;
+                pay(&treasury, to_treasury);
             }
         }
         Verdict::ExpiredUnverified => {
+            to_agent = sub.bond_amount;
             pay(&sub.agent, sub.bond_amount);
             if let Some(chal) = challenge {
+                to_challenger = chal.bond;
                 pay(&chal.challenger, chal.bond);
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok((to_agent, to_challenger, to_treasury))
 }
 
 /// Which side of a consensus verdict was proven wrong: `Some(true)` means the
@@ -306,7 +315,10 @@ fn apply_slash(
         return Ok(0);
     }
     let cfg = storage::get_config(e).ok_or(Error::NotInitialized)?;
-    info.stake_amount = info.stake_amount.checked_sub(amount).ok_or(Error::Overflow)?;
+    info.stake_amount = info
+        .stake_amount
+        .checked_sub(amount)
+        .ok_or(Error::Overflow)?;
     info.active = info.stake_amount >= cfg.min_stake_floor;
     storage::mark_slashed(e, sub.id, reexecutor);
 
@@ -338,7 +350,14 @@ fn apply_slash(
         token.transfer(&contract_address, treasury, &remainder);
     }
 
-    Slashed { submission_id: sub.id, reexecutor: reexecutor.clone(), amount }.publish(e);
+    Slashed {
+        submission_id: sub.id,
+        reexecutor: reexecutor.clone(),
+        amount,
+        to_challenger: challenger_share,
+        to_treasury: remainder,
+    }
+    .publish(e);
     Ok(amount)
 }
 
@@ -367,6 +386,10 @@ impl EscrowGate {
         storage::set_treasury(&e, &admin);
         storage::set_bond_asset(&e, &bond_asset);
         storage::set_config(&e, &config);
+        ConfigUpdated {
+            config: config.clone(),
+        }
+        .publish(&e);
     }
 
     /// Admin-gated, additive capability change only (which knobs future
@@ -383,6 +406,10 @@ impl EscrowGate {
         validate_config(&config)?;
         storage::set_config(&e, &config);
         storage::bump_instance(&e);
+        ConfigUpdated {
+            config: config.clone(),
+        }
+        .publish(&e);
         Ok(())
     }
 
@@ -404,12 +431,17 @@ impl EscrowGate {
         if admin != stored_admin {
             return Err(Error::NotAdmin);
         }
-        let mut info = storage::get_reexecutor(&e, &reexecutor).ok_or(Error::ReexecutorNotActive)?;
+        let mut info =
+            storage::get_reexecutor(&e, &reexecutor).ok_or(Error::ReexecutorNotActive)?;
         info.approved = approved;
         storage::set_reexecutor(&e, &reexecutor, &info);
         storage::bump_instance(&e);
 
-        ReexecutorApprovalChanged { reexecutor, approved }.publish(&e);
+        ReexecutorApprovalChanged {
+            reexecutor,
+            approved,
+        }
+        .publish(&e);
         Ok(())
     }
 
@@ -564,7 +596,11 @@ impl EscrowGate {
     }
 
     /// Also serves as a stake top-up for an already-registered reexecutor.
-    pub fn register_reexecutor(e: Env, reexecutor: Address, stake_amount: i128) -> Result<(), Error> {
+    pub fn register_reexecutor(
+        e: Env,
+        reexecutor: Address,
+        stake_amount: i128,
+    ) -> Result<(), Error> {
         reexecutor.require_auth();
         if stake_amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -574,10 +610,17 @@ impl EscrowGate {
 
         let existing = storage::get_reexecutor(&e, &reexecutor);
         let (prior_stake, joined_at, open_attestations, approved) = match &existing {
-            Some(info) => (info.stake_amount, info.joined_at, info.open_attestations, info.approved),
+            Some(info) => (
+                info.stake_amount,
+                info.joined_at,
+                info.open_attestations,
+                info.approved,
+            ),
             None => (0, e.ledger().timestamp(), 0, false),
         };
-        let new_stake = prior_stake.checked_add(stake_amount).ok_or(Error::Overflow)?;
+        let new_stake = prior_stake
+            .checked_add(stake_amount)
+            .ok_or(Error::Overflow)?;
 
         let contract_address = e.current_contract_address();
         let token = soroban_sdk::token::TokenClient::new(&e, &bond_asset);
@@ -615,9 +658,13 @@ impl EscrowGate {
         }
         let cfg = storage::get_config(&e).ok_or(Error::NotInitialized)?;
         let bond_asset = storage::get_bond_asset(&e).ok_or(Error::NotInitialized)?;
-        let mut info = storage::get_reexecutor(&e, &reexecutor).ok_or(Error::ReexecutorNotActive)?;
+        let mut info =
+            storage::get_reexecutor(&e, &reexecutor).ok_or(Error::ReexecutorNotActive)?;
 
-        let new_stake = info.stake_amount.checked_sub(amount).ok_or(Error::Overflow)?;
+        let new_stake = info
+            .stake_amount
+            .checked_sub(amount)
+            .ok_or(Error::Overflow)?;
         if new_stake < 0 {
             return Err(Error::InvalidAmount);
         }
@@ -634,7 +681,12 @@ impl EscrowGate {
         let token = soroban_sdk::token::TokenClient::new(&e, &bond_asset);
         token.transfer(&contract_address, reexecutor.clone(), &amount);
 
-        ReexecutorStakeWithdrawn { reexecutor, new_stake, active: info.active }.publish(&e);
+        ReexecutorStakeWithdrawn {
+            reexecutor,
+            new_stake,
+            active: info.active,
+        }
+        .publish(&e);
         Ok(())
     }
 
@@ -658,7 +710,8 @@ impl EscrowGate {
         matched: bool,
     ) -> Result<(), Error> {
         reexecutor.require_auth();
-        let mut info = storage::get_reexecutor(&e, &reexecutor).ok_or(Error::ReexecutorNotActive)?;
+        let mut info =
+            storage::get_reexecutor(&e, &reexecutor).ok_or(Error::ReexecutorNotActive)?;
         let cfg = storage::get_config(&e).ok_or(Error::NotInitialized)?;
         if !info.active || info.stake_amount < cfg.min_stake_floor {
             return Err(Error::ReexecutorNotActive);
@@ -669,7 +722,8 @@ impl EscrowGate {
         if storage::get_attestation(&e, submission_id, &reexecutor).is_some() {
             return Err(Error::AlreadyAttested);
         }
-        let mut sub = storage::get_submission(&e, submission_id).ok_or(Error::SubmissionNotFound)?;
+        let mut sub =
+            storage::get_submission(&e, submission_id).ok_or(Error::SubmissionNotFound)?;
         if sub.finalized {
             return Err(Error::ChallengeWindowClosed);
         }
@@ -768,6 +822,12 @@ impl EscrowGate {
         storage::set_reexecutor(&e, &reexecutor, &info);
         storage::mark_released(&e, submission_id, &reexecutor);
         storage::bump_instance(&e);
+        AttestationLockReleased {
+            submission_id,
+            reexecutor: reexecutor.clone(),
+            open_attestations: info.open_attestations,
+        }
+        .publish(&e);
         Ok(())
     }
 
@@ -832,7 +892,12 @@ impl EscrowGate {
         };
         storage::set_challenge(&e, submission_id, &chal);
 
-        ChallengeOpened { submission_id, challenger, bond }.publish(&e);
+        ChallengeOpened {
+            submission_id,
+            challenger,
+            bond,
+        }
+        .publish(&e);
         Ok(())
     }
 
@@ -859,13 +924,11 @@ impl EscrowGate {
         }
 
         let resolution = match method {
-            ResolutionMethod::ReexecutionConsensus => {
-                match consensus_outcome(&sub)? {
-                    Some(Verdict::Verified) => Resolution::Rejected,
-                    Some(Verdict::Slashed) => Resolution::Upheld,
-                    _ => return Err(Error::InsufficientConsensus),
-                }
-            }
+            ResolutionMethod::ReexecutionConsensus => match consensus_outcome(&sub)? {
+                Some(Verdict::Verified) => Resolution::Rejected,
+                Some(Verdict::Slashed) => Resolution::Upheld,
+                _ => return Err(Error::InsufficientConsensus),
+            },
             _ => return Err(Error::InvalidResolutionMethod),
         };
 
@@ -873,7 +936,12 @@ impl EscrowGate {
         chal.resolution_method = method;
         storage::set_challenge(&e, submission_id, &chal);
 
-        ChallengeResolved { submission_id, resolution, method }.publish(&e);
+        ChallengeResolved {
+            submission_id,
+            resolution,
+            method,
+        }
+        .publish(&e);
 
         Self::finalize(e, submission_id)
     }
@@ -898,7 +966,8 @@ impl EscrowGate {
     /// than freezing the agent's and challenger's funds forever. While a
     /// consensus does exist, the only way out is resolve_challenge().
     pub fn finalize(e: Env, submission_id: u64) -> Result<Verdict, Error> {
-        let mut sub = storage::get_submission(&e, submission_id).ok_or(Error::SubmissionNotFound)?;
+        let mut sub =
+            storage::get_submission(&e, submission_id).ok_or(Error::SubmissionNotFound)?;
         if sub.finalized {
             return Ok(sub.verdict);
         }
@@ -944,10 +1013,21 @@ impl EscrowGate {
         sub.verdict = verdict;
         sub.finalized = true;
         sub.resolution_method = method;
-        settle(&e, &sub)?;
+        let (to_agent, to_challenger, to_treasury) = settle(&e, &sub)?;
         storage::set_submission(&e, submission_id, &sub);
         storage::bump_instance(&e);
-        Finalized { submission_id, verdict: sub.verdict }.publish(&e);
+        Finalized {
+            submission_id,
+            verdict: sub.verdict,
+        }
+        .publish(&e);
+        BondSettled {
+            submission_id,
+            to_agent,
+            to_challenger,
+            to_treasury,
+        }
+        .publish(&e);
         Ok(sub.verdict)
     }
 

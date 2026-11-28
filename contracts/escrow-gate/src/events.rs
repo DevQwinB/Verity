@@ -1,5 +1,5 @@
 use soroban_sdk::{contractevent, Address, BytesN};
-use verity_common::{Resolution, ResolutionMethod, Verdict};
+use verity_common::{ConfigRecord, Resolution, ResolutionMethod, Verdict};
 
 #[contractevent]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,11 +86,38 @@ pub struct Finalized {
 
 #[contractevent]
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigUpdated {
+    pub config: ConfigRecord,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttestationLockReleased {
+    #[topic]
+    pub submission_id: u64,
+    pub reexecutor: Address,
+    pub open_attestations: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BondSettled {
+    #[topic]
+    pub submission_id: u64,
+    pub to_agent: i128,
+    pub to_challenger: i128,
+    pub to_treasury: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Slashed {
     #[topic]
     pub submission_id: u64,
     pub reexecutor: Address,
     pub amount: i128,
+    pub to_challenger: i128,
+    pub to_treasury: i128,
 }
 
 #[contractevent]
