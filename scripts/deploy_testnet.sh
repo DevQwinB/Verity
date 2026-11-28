@@ -97,7 +97,7 @@ else
 fi
 GATE_CONFIG="${VERITY_GATE_CONFIG:-}"
 if [ -z "$GATE_CONFIG" ]; then
-  GATE_CONFIG='{"min_stake_floor":"5000000000","quorum_min_reexecutors":3,"quorum_supermajority_bps":6600,"agent_bond_min_bps":500,"challenger_bond_min_bps":500,"window_tier_small_ceiling":"1000000000000","window_tier_small_s":'"$WINDOW_SMALL_S"',"window_tier_large_s":'"$WINDOW_LARGE_S"',"slash_split_challenger_bps":2000,"reexecutor_slash_bps":1000,"reexecutor_allowlist":true}'
+  GATE_CONFIG='{"min_stake_floor":"5000000000","quorum_min_reexecutors":3,"quorum_supermajority_bps":6600,"agent_bond_min_bps":500,"challenger_bond_min_bps":500,"window_tier_small_ceiling":"1000000000000","window_tier_small_s":'"$WINDOW_SMALL_S"',"window_tier_large_s":'"$WINDOW_LARGE_S"',"slash_split_challenger_bps":2000,"reexecutor_slash_bps":1000,"voter_reward_bps":1000,"reexecutor_allowlist":true}'
 fi
 
 # The dev deployment also needs a challenger for the smoke test.
