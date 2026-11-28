@@ -45,7 +45,7 @@ Every verdict records how it was reached, and the dashboard shows it:
 
 Anyone can open a bonded challenge inside the window. If the challenge is
 upheld, the challenger gets their bond back plus 20% of the agent's, and the
-rest of the agent's bond goes to the admin/treasury account. If it is rejected,
+rest of the agent's bond goes to the treasury. If it is rejected,
 the challenger's bond goes to the agent. The agent cannot challenge its own
 submission: the contract refuses the address that submitted. It cannot tell
 when a different address belongs to the same agent, so that is not prevented
@@ -384,9 +384,21 @@ configured by its constructor in the same transaction that deploys it. If the
 interface changes, regenerate the TypeScript bindings under
 `backend/src/chain/generated/` with `scripts/generate_bindings.sh`.
 
-The admin (the deploying account) can change the configuration future
-submissions use, and decides which staked accounts may vote while
-`reexecutor_allowlist` is on. It cannot set, change or override a verdict.
+The admin (the deploying account, until it hands the role on) can change the
+configuration future submissions use, and decides which staked accounts may
+vote while `reexecutor_allowlist` is on. It cannot set, change or override a
+verdict.
+
+The admin role moves in two steps. The admin calls `propose_admin` with the new
+address, and that address calls `accept_admin`. Nothing changes until it
+accepts, so a mistyped address cannot take the role. ZkVerifierRegistry has the
+same two calls.
+
+Forfeited agent bonds and slashed stake are paid to the treasury. It starts as
+the admin, the admin changes it with `set_treasury`, and it does not move when
+the admin role does. It has to be an account that can receive the bond asset:
+a settlement that cannot pay it fails. See
+[docs/DEPLOY.md](docs/DEPLOY.md) for the commands.
 
 ### Gating a marketplace's escrow
 

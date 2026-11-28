@@ -10,6 +10,8 @@ pub enum Error {
     InvalidConfig = 4,
     Overflow = 5,
     InvalidAmount = 6,
+    NoPendingAdmin = 7,
+    NotPendingAdmin = 8,
 
     SubmissionNotFound = 10,
     BondTooLow = 11,

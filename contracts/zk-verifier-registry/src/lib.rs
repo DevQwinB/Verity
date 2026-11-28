@@ -2,7 +2,9 @@
 
 mod events;
 
-use events::{ProofVerified, VerifierDeregistered, VerifierRegistered};
+use events::{
+    AdminChanged, AdminProposed, ProofVerified, VerifierDeregistered, VerifierRegistered,
+};
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Bytes, Env, IntoVal, Symbol, Vec};
 use verity_common::Error;
 
@@ -10,6 +12,7 @@ use verity_common::Error;
 #[derive(Clone)]
 enum DataKey {
     Admin,
+    PendingAdmin,
     Verifier(Symbol),
     VerifierList,
 }
@@ -128,6 +131,62 @@ impl ZkVerifierRegistry {
             ProofVerified { proof_system, submission_id }.publish(&e);
         }
         Ok(accepted)
+    }
+
+    /// First half of handing the admin role to another address, as in
+    /// EscrowGate. Nothing changes hands until that address calls
+    /// `accept_admin`, and a later proposal replaces this one.
+    pub fn propose_admin(e: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
+        Self::require_admin(&e, &admin)?;
+        e.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        bump_instance(&e);
+
+        AdminProposed {
+            proposed_admin: new_admin,
+            admin,
+        }
+        .publish(&e);
+        Ok(())
+    }
+
+    /// Second half: the proposed address takes the role. Only that address
+    /// can call this, and it has to sign.
+    pub fn accept_admin(e: Env, new_admin: Address) -> Result<(), Error> {
+        let old_admin: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        let pending: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdmin)?;
+        new_admin.require_auth();
+        if new_admin != pending {
+            return Err(Error::NotPendingAdmin);
+        }
+        e.storage().instance().set(&DataKey::Admin, &new_admin);
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        bump_instance(&e);
+
+        AdminChanged {
+            new_admin,
+            old_admin,
+        }
+        .publish(&e);
+        Ok(())
+    }
+
+    pub fn get_admin(e: Env) -> Option<Address> {
+        e.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// The address a `propose_admin` is waiting on, if there is one.
+    pub fn get_pending_admin(e: Env) -> Option<Address> {
+        e.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     pub fn is_registered(e: Env, proof_system: Symbol) -> bool {

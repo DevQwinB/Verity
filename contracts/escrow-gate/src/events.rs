@@ -93,6 +93,30 @@ pub struct Slashed {
     pub amount: i128,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminProposed {
+    #[topic]
+    pub proposed_admin: Address,
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminChanged {
+    #[topic]
+    pub new_admin: Address,
+    pub old_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreasuryChanged {
+    #[topic]
+    pub new_treasury: Address,
+    pub old_treasury: Address,
+}
+
 /// A re-executor that voted with the consensus was paid its share of the
 /// submission's reward pool. `amount` is what this payment moved; a voter
 /// can be paid more than once when the pool grows after its first payment.
